@@ -75,6 +75,9 @@ sdd impact --base origin/main --head HEAD --format json
 # 先编译并审查 dry-run 输出，再发布 backlog。
 sdd backlog compile --repo . --version v1 --dry-run
 sdd backlog publish --repo . --version v1
+
+# 检查产品仓库与平台模板/workflows 是否存在漂移（只读）。
+sdd sync --check
 ```
 
 所有修改状态的命令都必须支持可审查的 dry-run，或者提供等价的预览命令。Backlog

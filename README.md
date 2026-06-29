@@ -76,6 +76,9 @@ sdd impact --base origin/main --head HEAD --format json
 # Compile first; publish only after reviewing the dry-run output.
 sdd backlog compile --repo . --version v1 --dry-run
 sdd backlog publish --repo . --version v1
+
+# Report drift from the platform templates and workflows (read-only).
+sdd sync --check
 ```
 
 All mutating commands must support a reviewable dry-run or have an equivalent preview command.
