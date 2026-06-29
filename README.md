@@ -8,22 +8,24 @@ templates, and reusable GitHub Actions workflows used by generated product repos
 > **Status:** bootstrap phase. The repository and target interface exist, but the CLI and
 > automation described below are not implemented yet.
 
+Implementation sequencing, gates, and acceptance scenarios are maintained in the
+[single-repo implementation runbook](docs/sdd/single-repo-implementation-runbook.md).
+
 ## Repository roles
 
-The first supported topology uses three repositories:
+The first supported topology uses two active repositories:
 
 ```text
-sdd-platform        Shared tooling and automation (this repository)
-sdd-agent-starter   GitHub template for the product-control/root skeleton
-<product-repo>      Generated single-product monorepo
+sdd-platform    Shared tooling, root/component templates, and automation (this repository)
+<product-repo>  Generated single-product monorepo
 ```
 
-`sdd-agent-starter` remains an independent, reusable GitHub Template. `sdd-platform` pins a
-specific template commit when it creates a product repository, so generation is reproducible.
+The existing `sdd-agent-starter` repository is a historical reference and optional manual
+GitHub Template. It is not a runtime or generation dependency of `sdd-platform`.
 
 ## Planned capabilities
 
-- Create a product repository from a fixed `sdd-agent-starter` revision.
+- Create a product repository from the root template in a fixed `sdd-platform` revision.
 - Configure repository labels, CODEOWNERS, environments, rulesets, and workflows.
 - Validate `projects.yaml`, task, and impact documents against versioned schemas.
 - Scaffold Backend, Web, iOS, and Android components after Architecture Gate approval.
@@ -89,7 +91,7 @@ sdd-platform/
 │   ├── task.schema.json
 │   └── impact.schema.json
 ├── templates/
-│   ├── catalog.yaml          # external root-template ref and component templates
+│   ├── monorepo-root/
 │   ├── spring-boot/
 │   ├── web/
 │   ├── ios-tuist/
@@ -101,9 +103,8 @@ sdd-platform/
     └── android.yml
 ```
 
-The root product template is not duplicated under `templates/`; `templates/catalog.yaml` will
-reference a fixed `sdd-agent-starter` commit. Component templates remain here because the
-Factory renders them into an already-created product repository.
+The root and component templates are versioned with the Factory. A product's `template.lock`
+records the `sdd-platform` release/commit and template checksums used for generation.
 
 ## Development
 
