@@ -1,5 +1,7 @@
 # sdd-platform
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 Shared control plane for creating and operating Spec-Driven Development (SDD) projects.
 
 `sdd-platform` will provide the CLI, repository factory, backlog compiler, schemas, component
