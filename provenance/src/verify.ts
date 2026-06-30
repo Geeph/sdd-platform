@@ -103,7 +103,9 @@ export async function verifyGateApproval(input: VerifyInput): Promise<VerifyResu
         reason: `artifact '${artifactPath}' was removed in PR #${pr.number}`,
       };
     }
-    // status must be added or modified
+    // Only added/modified count as CODEOWNER-approved content for this path.
+    // 'renamed'/'changed' are rejected (fail closed): a path that merely
+    // appeared via rename was not content-reviewed at this location.
     if (fileInPr.status !== 'added' && fileInPr.status !== 'modified') {
       return {
         ok: false,
@@ -119,7 +121,9 @@ export async function verifyGateApproval(input: VerifyInput): Promise<VerifyResu
         reason: `worktree is dirty for '${artifactPath}'`,
       };
     }
-    // Compare against both head SHA and merge commit SHA (either should match)
+    // The CODEOWNER approved the PR head; the merge commit is what actually
+    // landed on protected main. Accept either: a clean/squash merge makes the
+    // two identical, and downstream consumers read the on-main (merge) version.
     const prHeadBlob = await git.blobAt(headSha, artifactPath);
     const mergeBlob = await git.blobAt(mergeCommitSha, artifactPath);
     const localBlob = await git.blobWorktree(artifactPath);

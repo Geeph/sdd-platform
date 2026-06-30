@@ -64,13 +64,6 @@ export interface OctokitLike {
         repo: string;
         branch: string;
       }) => Promise<{ data: BranchData }>;
-      listCommitStatusesForRef: (params: {
-        owner: string;
-        repo: string;
-        ref: string;
-        per_page?: number;
-        page?: number;
-      }) => Promise<{ data: { statuses: unknown[] } }>;
       listPullRequestsAssociatedWithCommit: (params: {
         owner: string;
         repo: string;

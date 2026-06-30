@@ -111,9 +111,6 @@ function fakeOctokit(
             commit: { sha: 'basesha' },
           },
         }),
-        listCommitStatusesForRef: async () => ({
-          data: { statuses: [] },
-        }),
         listPullRequestsAssociatedWithCommit: async () => ({
           data: prsForCommit,
         }),
@@ -589,9 +586,6 @@ describe('verifyGateApproval', () => {
             repos: {
               getBranch: async () => ({
                 data: { name: 'main', protected: true, commit: { sha: 'b' } },
-              }),
-              listCommitStatusesForRef: async () => ({
-                data: { statuses: [] },
               }),
               listPullRequestsAssociatedWithCommit: async () => ({
                 data: [],
