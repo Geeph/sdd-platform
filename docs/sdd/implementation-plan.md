@@ -5,8 +5,8 @@
 > 真实进度只存在于 GitHub Issues。落地目标 = 手册 §14「第一版完成定义」，按 §12
 > 验收场景验证。
 >
-> 本版据评审修正 5 处：新增 Gate 授权溯源机制；M2 加入最小 CI Gate；`sdd impact`
-> 分两阶段交付；`sdd sync --check` 补上里程碑并标注优先级；M1 固定包管理/构建/测试工具链。
+> 本版据评审修正：新增 Gate 授权溯源机制；M2 加入最小 CI Gate 和 SDD 产物模板；
+> `sdd impact` 分两阶段交付；限定 `sdd sync --check` 的托管范围；M1 固定完整工具链。
 
 ## 0. 技术选型
 
@@ -15,7 +15,7 @@
   - GitHub 写操作用 [`octokit`](https://github.com/octokit)（含 Git Data API，用于 §5.2 的快照 bootstrap 与 §4.5 的 Issue upsert）。
   - Schema 校验用 `ajv`，直接消费 `schemas/*.json`。
 - **工具链（M1 固定，保证首个里程碑即可复现）**：包管理 `pnpm`（workspace）、构建
-  `tsup`、测试 `vitest`、CLI 框架 `oclif`（多命令更顺手，亦可 `commander`）。
+  `tsup`、测试 `vitest`、CLI 框架 `oclif`。
 - 平台仓库组织成 pnpm workspace，包目录对应手册 §4.1：
 
   ```text
@@ -38,17 +38,21 @@
 流程，没有定义识别与强制机制。缺这一层，`scaffold` / `publish` 可能消费**未合并的本地
 文件**。本机制贯穿 M1–M5：
 
-- **记录**：每个 Gate（Spec / Architecture / Design / Plan）的 PR 经人工 review + 合并后，
-  由 gate-merge 自动化把 `{gate, approved_commit（合并 commit SHA）, pr, approved_at}`
-  写入产品仓库的 gate 账本（建议 `specs/<version>/gates.yaml`，单写者、可审计）。
+- **权威来源**：GitHub 上合入受保护 `main` 的 Gate PR 及其 review/merge 元数据是唯一
+  授权事实来源，不在仓库内维护一个可由后续 commit 改写的自证账本。Gate PR 使用
+  `gate:spec` / `gate:architecture` / `gate:design` / `gate:plan` 标签和版本标识；ruleset
+  开启 stale review dismissal，并要求对应 CODEOWNER 批准，确保批准绑定最终 head SHA。
+- **批准记录**：记录 `{gate, version, pr, approved_head_sha, merge_commit_sha, approved_at}`；
+  CLI 运行时从 GitHub API 读取并验证。生成的 dry-run、Issue marker 和审计报告保存这组
+  不可混淆的 provenance，而不是信任工作区里的声明文件。
 - **校验库**（M1 交付，被 scaffold / compile / publish 复用）：
-  1. 工作区 clean，且操作对象取自已合并的 `approved_commit`，而非本地未提交/未合并改动；
-  2. 被消费的产物（`projects.yaml` / `spec.md` / `plan.md`）确实位于其 Gate 的
-     `approved_commit`；
-  3. 校验不通过则命令直接失败——与 §14「自动化写操作可审查、可追踪」一致。
-- **落点**：机制与校验库在 **M1** 定义；记录写入在 **M2** 接入 gate-merge；强制校验在
-  **M3**（scaffold）与 **M5**（compile / publish）。
-- 账本的具体形态（账本文件 / git tag / 读 GitHub PR review 状态）见 §5 待决。
+  1. PR 已合入预期仓库的受保护 `main`，最终 head SHA 获所需 CODEOWNER 批准；
+  2. 工作区 clean，且被消费产物的 Git blob 与该 Gate `merge_commit_sha` 中的 blob 一致；
+  3. 后续 Gate 沿用的产物必须能追溯到相应 Gate 的批准记录；
+  4. GitHub API 不可用、证据不完整或校验失败时，任何写操作 fail closed。
+- **落点**：机制与校验库在 **M1** 定义；Gate labels、CODEOWNERS、ruleset 和 PR hygiene 在
+  **M2** 配置；强制校验在 **M3**（scaffold）与 **M5**（publish）。`compile --dry-run`
+  可用于 Gate 评审，但必须醒目标注未批准输入，且不得产生 GitHub 写操作。
 
 ## 2. 里程碑
 
@@ -67,14 +71,19 @@
 
 - `monorepo-root` 模板：`specs/_template/`、`contracts/`、`design/tokens/`、
   `projects.yaml`（`components: []`）、`template.lock`、`AGENTS.md`、`.github/`。
+- `specs/_template/` 提供 `spec.md`、`architecture.md`、`design.md`、`plan.md` 模板；
+  `.github/` 提供 Intake Issue Form、Gate PR template 与 CODEOWNERS 映射，Factory 配置
+  Gate labels。
+  Commander 或人工从这些版本化模板创建 Intake 和各 Gate PR；模板明确稳定 requirement /
+  screen / operation ID、上游批准 commit 引用、跳过 Design Gate 的理由等必填字段。
 - `sdd product init --dry-run` → 真建仓：**解析并固定 `sdd-platform` release/commit，
   校验模板 checksum，再用 Git Data/Contents API 把 `monorepo-root` 快照写成初始
   commit 建立 `main`**（按改写后的 §5.2，不走 GitHub Template 功能）。
 - 配置 labels / teams / 初始 ruleset；创建 Bootstrap PR。
 - **最小 root / no-op CI Gate + PR hygiene**：Bootstrap PR 必须产生真实的 `CI Gate`、
   `PR hygiene` check context，绿后才把它们加入 required checks（§5.2、§12.1）。此版只
-  聚合根骨架，**平台矩阵留到 M4 扩展**。
-- 接入 gate-merge：把 Gate 批准 commit 写入 gate 账本（§1 记录）。
+  聚合根骨架，**平台矩阵留到 M4 扩展**。PR hygiene 同时校验 Gate 类型/版本、必需产物、
+  稳定 ID、上游批准引用和对应 CODEOWNER；合并后的授权状态由 §1 的 GitHub 元数据判定。
 - 依据：§5。
 - 验收：12.1、12.2、12.4（根骨架 CI Gate 绿）。
 
@@ -84,8 +93,8 @@
   lint/typecheck/test/build + CI wiring。
 - `sdd product scaffold --dry-run` → 真生成；**只生成 `projects.yaml` 中获批的目录**，
   未列出的平台不得生成。
-- **强制授权校验**（§1）：只对**已批准、已合并**的 `projects.yaml` 的 `approved_commit`
-  执行；工作区脏或本地未合并则拒绝。
+- **强制授权校验**（§1）：只对**已批准、已合并**的 `projects.yaml` 执行；其 Git blob
+  必须与 Architecture Gate 的 `merge_commit_sha` 一致，工作区脏或本地未合并则拒绝。
 - 依据：§6.3–6.4、§6.2。
 - 验收：12.3。
 
@@ -140,9 +149,11 @@
 
 ### M8 — `sdd sync --check`（漂移报告，只读）— 非关键路径
 
-- 只读检测产品仓库与平台之间的漂移：模板（经 `template.lock`）、reusable workflows、
-  共享文件（AGENTS、安全规则），输出需要的**显式同步 PR** 清单；**不自动覆盖**
-  （§4.6、§13）。
+- 只读检测**平台持续托管的表面**：reusable workflow 固定 revision、AGENTS/安全规则等
+  明确登记的共享文件，以及平台发布的定向安全更新；输出需要的**显式同步 PR**清单，
+  **不自动覆盖**（§4.6、§13）。
+- `template.lock` 只用于审计生成来源和判断某项定向安全更新是否适用；不得把一次性生成的
+  `apps/*` 与当前模板做通用 diff，也不得把正常业务修改报告为漂移。
 - 依赖 `template.lock`（M2）与平台模板（M3）；技术上 M3 之后任意时点可做。
 - **不在 §14 关键路径，§12 未覆盖**：当前定为 Phase 1 末位、低优先；若资源紧张可延后，
   但延后须显式记为"移出 Phase 1"，不能像之前那样悬空。
@@ -150,6 +161,8 @@
 
 ### M9 — 纵向切片 + DoD 验收
 
+- 使用 M2 的 Intake/Gate 模板跑通 Intake → Spec → Architecture → Design（或有据可查地
+  跳过）→ Plan，并核验每个批准记录都能由 §1 的校验库复算。
 - 在 demo-product 跑通至少一个功能：Issue → 四平台 PR → CI → 独立 Review → 合并（§7）。
 - 过 §12 全部 16 个场景，签 §14。
 
@@ -163,7 +176,7 @@
 ## 4. 关键风险（手册中容易做错的点）
 
 - **授权校验要校验"合并态"而非"文件存在"**（§1、§6.2）：只检查文件存在等于没校验，
-  必须把产物绑定到 Gate 的 `approved_commit` 并拒绝本地未合并改动。
+  必须把产物 Git blob 绑定到 Gate PR 的 `merge_commit_sha` 并拒绝本地未合并改动。
 - **task ID 必须稳定**（§13）：不能由标题或数组下标推导，否则 Compiler 反复建重复 Issue。
 - **锁与 upsert 缺一不可**（§6.8）：lock 防并发写，upsert 防失败重试收敛为 no-op。
 - **CI Gate 的 check context 命名**（§13）：ruleset 里 required check 名要与 workflow
@@ -175,8 +188,6 @@
 
 ## 5. 待决事项
 
-- Gate 授权账本的具体形态：账本文件（`specs/<version>/gates.yaml`）/ git tag / 读
-  GitHub PR review 状态。建议账本文件为主，必要时叠加 API 校验（M1 前定）。
 - OpenAPI 工具链（lint / breaking diff / client 生成）的最终选型（M6 前确认）。
 - 本仓库 runbook 与 `sdd-agent-starter` 源文件在 bootstrap 机制上的分叉、以及权威归属
   （独立未决项，不阻塞实现）。
