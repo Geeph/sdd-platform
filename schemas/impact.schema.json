@@ -29,6 +29,7 @@
           "items": { "type": "string" }
         }
       },
+      "required": ["requirements", "screens", "operations"],
       "additionalProperties": false
     },
     "platforms": {
@@ -58,7 +59,7 @@
       }
     }
   },
-  "required": ["base", "head", "breaking"],
+  "required": ["base", "head", "changed", "platforms", "breaking"],
   "additionalProperties": false,
   "$defs": {
     "affectedIssue": {

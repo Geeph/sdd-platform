@@ -1,6 +1,10 @@
 base: abc123
 head: def456
 breaking: false
+changed:
+  requirements: []
+  screens: []
+  operations: []
 platforms:
   backend: true
   web: false

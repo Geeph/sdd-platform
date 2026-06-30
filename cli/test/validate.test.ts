@@ -45,6 +45,7 @@ describe('sdd validate', () => {
       const result = await runCli(['validate', '--repo', join(fixturesDir, 'repo-valid')]);
       expect(result.code).toBe(0);
       expect(result.stdout).toMatch(/ok/);
+      expect(result.stderr).toBe('');
     });
 
     it('returns non-zero for duplicate component IDs', async () => {
@@ -82,6 +83,7 @@ describe('sdd validate', () => {
         join(fixturesDir, 'task-valid.yaml'),
       ]);
       expect(result.code).toBe(0);
+      expect(result.stderr).toBe('');
     });
   });
 
@@ -94,6 +96,7 @@ describe('sdd validate', () => {
         join(fixturesDir, 'impact-valid.yaml'),
       ]);
       expect(result.code).toBe(0);
+      expect(result.stderr).toBe('');
     });
   });
 

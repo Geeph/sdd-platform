@@ -1,13 +1,13 @@
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { Args, Command, Flags } from '@oclif/core';
+import type { SDDProjects } from '@sdd/schemas';
 import {
   validateImpactDocument,
   validateProjectsDocument,
   validateTaskDocument,
 } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
-import type { ProjectsDocument } from '../semantics.js';
 import { semanticValidateProjects } from '../semantics.js';
 
 export default class Validate extends Command {
@@ -89,7 +89,7 @@ export default class Validate extends Command {
       throw new ValidationFailed(messages);
     }
 
-    const semanticErrors = semanticValidateProjects(data as ProjectsDocument);
+    const semanticErrors = semanticValidateProjects(data as SDDProjects);
     if (semanticErrors.length > 0) {
       throw new ValidationFailed(semanticErrors);
     }

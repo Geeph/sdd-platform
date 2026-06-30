@@ -12,9 +12,10 @@
     "test": "pnpm -r test",
     "lint": "pnpm -r lint",
     "generate": "pnpm -r generate",
-    "clean": "pnpm -r clean"
+    "clean": "pnpm -r run clean"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.0.0"
+    "@biomejs/biome": "^2.0.0",
+    "rimraf": "^6.0.0"
   }
 }

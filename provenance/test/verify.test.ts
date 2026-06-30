@@ -64,6 +64,8 @@ function fakeGit(overrides: Partial<GitReader> = {}): GitReader {
     blobAt: async (_commit, _path) => 'local-blob-sha',
     blobWorktree: async (_path) => 'local-blob-sha',
     isClean: async (_path) => true,
+    // CODEOWNERS is evaluated at base commit; default returns a rule
+    // that matches projects.yaml with @codeowner as the owner.
     codeownersAt: async (_commit) => [{ pattern: '/projects.yaml', owners: ['@codeowner'] }],
     ...overrides,
   };
@@ -77,6 +79,7 @@ function fakeOctokit(
     branchProtected?: boolean;
     checks?: CheckRun[];
     prsForCommit?: PullData[];
+    teamMembers?: Record<string, string[]>;
     throwOn?: string;
   } = {},
 ): OctokitLike {
@@ -86,6 +89,7 @@ function fakeOctokit(
   const branchProtected = overrides.branchProtected ?? true;
   const checks = overrides.checks ?? [];
   const prsForCommit = overrides.prsForCommit ?? [pr];
+  const teamMembers = overrides.teamMembers ?? {};
 
   return {
     rest: {
@@ -111,6 +115,16 @@ function fakeOctokit(
       },
       checks: {
         listForRef: async () => ({ data: { check_runs: checks } }),
+      },
+      teams: {
+        getByName: async (params: { org: string; team_slug: string }) => ({
+          data: { id: 1, slug: params.team_slug },
+        }),
+        listMembersInOrg: async (params: { org: string; team_slug: string }) => ({
+          data: (teamMembers[`${params.org}/${params.team_slug}`] ?? []).map((login) => ({
+            login,
+          })),
+        }),
       },
     },
   } as OctokitLike;
@@ -216,7 +230,143 @@ describe('verifyGateApproval', () => {
     );
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toMatch(/no approval/);
+      expect(result.reason).toMatch(/CODEOWNER/);
+    }
+  });
+
+  it('resolves @org/team owners to their team members', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          reviews: [fakeReview({ user: { login: 'team-member' } })],
+          teamMembers: { 'demo-org/spec-approvers': ['team-member'] },
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@demo-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects team member who is not currently in the team', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          reviews: [fakeReview({ user: { login: 'former-member' } })],
+          teamMembers: { 'demo-org/spec-approvers': ['other-member'] },
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@demo-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/CODEOWNER/);
+    }
+  });
+
+  it('uses only the last matching CODEOWNERS rule (last-match-wins)', async () => {
+    // First rule assigns @first-owner, second rule overrides to @second-owner.
+    // If approval is from @first-owner only, it must be rejected because the
+    // effective owner is @second-owner.
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          reviews: [fakeReview({ user: { login: 'first-owner' } })],
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@first-owner'] },
+            { pattern: '*.yaml', owners: ['@second-owner'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/CODEOWNER/);
+    }
+  });
+
+  it('fails when approval is later revoked by the same reviewer', async () => {
+    // Same reviewer first APPROVED, then CHANGES_REQUESTED — latest state wins.
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          reviews: [
+            fakeReview({
+              id: 1,
+              state: 'APPROVED',
+              submitted_at: '2026-06-01T00:00:00Z',
+            }),
+            fakeReview({
+              id: 2,
+              state: 'CHANGES_REQUESTED',
+              submitted_at: '2026-06-01T01:00:00Z',
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/CODEOWNER/);
+    }
+  });
+
+  it('reads CODEOWNERS at base commit, not head', async () => {
+    // Git reader must be called with the PR's base.sha, not head.sha.
+    let codeownersCommit = '';
+    const result = await verifyGateApproval(
+      baseInput({
+        git: fakeGit({
+          codeownersAt: async (commit) => {
+            codeownersCommit = commit;
+            return [{ pattern: '/projects.yaml', owners: ['@codeowner'] }];
+          },
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
+    expect(codeownersCommit).toBe('base111'); // pr.base.sha, NOT 'head111'
+  });
+
+  it('accepts approval for any artifact path via the matching CODEOWNERS rule', async () => {
+    // Verify that the CODEOWNERS matching uses the artifact path, not
+    // a hardcoded file. The default fake CODEOWNERS matches projects.yaml.
+    const result = await verifyGateApproval(
+      baseInput({
+        artifactPath: 'projects.yaml',
+        octokit: fakeOctokit({
+          files: [fakeFile({ filename: 'projects.yaml', status: 'added' })],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('fails when no CODEOWNERS rule matches the artifact path', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        artifactPath: 'specs/v1/spec.md',
+        octokit: fakeOctokit({
+          files: [fakeFile({ filename: 'specs/v1/spec.md', status: 'added' })],
+        }),
+        git: fakeGit({
+          // Only rule is for projects.yaml; won't match spec.md
+          codeownersAt: async () => [{ pattern: '/projects.yaml', owners: ['@codeowner'] }],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/no CODEOWNERS rule matches/);
     }
   });
 
@@ -334,6 +484,10 @@ describe('verifyGateApproval', () => {
             },
             checks: {
               listForRef: async () => ({ data: { check_runs: [] } }),
+            },
+            teams: {
+              getByName: async () => ({ data: { id: 1, slug: 't' } }),
+              listMembersInOrg: async () => ({ data: [] }),
             },
           },
         } as OctokitLike,

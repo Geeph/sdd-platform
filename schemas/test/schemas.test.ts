@@ -133,4 +133,21 @@ describe('impact.schema.json', () => {
     const result = await validateImpactDocument(data);
     expect(result.ok).toBe(false);
   });
+
+  it('rejects impact missing changed field', async () => {
+    const data = { base: 'abc', head: 'def', breaking: false };
+    const result = await validateImpactDocument(data);
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects impact missing platforms field', async () => {
+    const data = {
+      base: 'abc',
+      head: 'def',
+      breaking: false,
+      changed: { requirements: [], screens: [], operations: [] },
+    };
+    const result = await validateImpactDocument(data);
+    expect(result.ok).toBe(false);
+  });
 });

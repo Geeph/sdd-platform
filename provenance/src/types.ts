@@ -87,6 +87,18 @@ export interface OctokitLike {
         page?: number;
       }) => Promise<{ data: { check_runs: CheckRun[] } }>;
     };
+    teams: {
+      getByName: (params: {
+        org: string;
+        team_slug: string;
+      }) => Promise<{ data: { id: number; slug: string } }>;
+      listMembersInOrg: (params: {
+        org: string;
+        team_slug: string;
+        per_page?: number;
+        page?: number;
+      }) => Promise<{ data: TeamMember[] }>;
+    };
   };
 }
 
@@ -136,6 +148,10 @@ export interface CheckRun {
 export interface CodeownersEntry {
   pattern: string;
   owners: string[];
+}
+
+export interface TeamMember {
+  login: string;
 }
 
 // --- Git reader abstraction ---

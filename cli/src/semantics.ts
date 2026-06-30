@@ -1,15 +1,5 @@
 import { isAbsolute, normalize } from 'node:path';
-
-export interface ProjectsComponent {
-  id: string;
-  path: string;
-  template: string;
-  ci: string;
-}
-
-export interface ProjectsDocument {
-  components: ProjectsComponent[];
-}
+import type { SDDProjects } from '@sdd/schemas';
 
 const TEMPLATE_CI_PAIRS: Record<string, string> = {
   'spring-boot': 'java',
@@ -23,7 +13,7 @@ const TEMPLATE_CI_PAIRS: Record<string, string> = {
  * schema cannot express (unique ids, non-overlapping paths, template/ci
  * pairings).
  */
-export function semanticValidateProjects(doc: ProjectsDocument): string[] {
+export function semanticValidateProjects(doc: SDDProjects): string[] {
   const errors: string[] = [];
   const components = doc.components ?? [];
 

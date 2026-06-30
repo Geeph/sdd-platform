@@ -69,8 +69,20 @@ export async function verifyGateApproval(input: VerifyInput): Promise<VerifyResu
       }
     }
 
-    // Step 4: Verify CODEOWNER approval on final head SHA
-    const approval_ = await getCodeownerApproval(octokit, git, owner, name, pr, headSha);
+    // Step 4: Verify CODEOWNER approval on final head SHA.
+    // CODEOWNERS is evaluated at the PR base commit (the commit the branch
+    // diverged from), not the head — a PR can't grant its own ownership.
+    // Use the last matching rule (Git's semantics), and resolve @org/team
+    // members via the GitHub Teams API.
+    const approval_ = await getCodeownerApproval(
+      octokit,
+      git,
+      owner,
+      name,
+      pr,
+      headSha,
+      artifactPath,
+    );
     if (!approval_.ok) {
       return { ok: false, reason: approval_.reason ?? 'approval check failed' };
     }
@@ -251,6 +263,19 @@ interface ApprovalResult {
   reason?: string;
 }
 
+/**
+ * Check that the PR has a valid CODEOWNER approval for the artifact path.
+ *
+ * Correctness rules:
+ *   1. CODEOWNERS is read at the PR's BASE commit (a PR cannot grant itself
+ *      ownership by modifying CODEOWNERS in the head).
+ *   2. Only the LAST matching pattern applies (Git's actual semantics).
+ *   3. @org/team entries are resolved via the Teams API to their member
+ *      logins; team ownership only counts if the reviewer is a current member.
+ *   4. For each reviewer, only their LATEST review state on the final head SHA
+ *      counts — a prior APPROVED is superseded by a later CHANGES_REQUESTED,
+ *      COMMENTED, or DISMISSED.
+ */
 async function getCodeownerApproval(
   octokit: VerifyInput['octokit'],
   git: VerifyInput['git'],
@@ -258,38 +283,148 @@ async function getCodeownerApproval(
   repo: string,
   pr: PullData,
   headSha: string,
+  artifactPath: string,
 ): Promise<ApprovalResult> {
-  const codeowners = await git.codeownersAt(headSha);
+  const baseSha = pr.base.sha;
+  const codeowners = await git.codeownersAt(baseSha);
   const reviews = await listAllReviews(octokit, owner, repo, pr.number);
 
-  // Find approved reviews on the final head SHA
-  const approvalsOnHead = reviews.filter((r) => r.state === 'APPROVED' && r.commit_id === headSha);
-  if (approvalsOnHead.length === 0) {
-    return { ok: false, reason: 'no approval review on final head SHA' };
+  // Determine the applicable owners using LAST-MATCH-WINS semantics.
+  const owningEntry = findLastMatchingCodeownersEntry(codeowners, artifactPath);
+  if (!owningEntry) {
+    return {
+      ok: false,
+      reason: `no CODEOWNERS rule matches '${artifactPath}' at base commit`,
+    };
   }
 
-  // Each approval must be from a CODEOWNER for the artifact path
-  const codeownerLogins = new Set<string>();
-  for (const entry of codeowners) {
-    if (matchCodeownersPattern(entry.pattern, 'projects.yaml')) {
-      for (const o of entry.owners) {
-        codeownerLogins.add(normalizeLogin(o));
-      }
+  // Resolve all owners (individuals + team members) to a set of normalized logins.
+  const codeownerLogins = await resolveOwnersToLogins(octokit, owner, owningEntry.owners);
+  if (codeownerLogins.size === 0) {
+    return {
+      ok: false,
+      reason: `CODEOWNERS rule for '${artifactPath}' has no resolvable owners`,
+    };
+  }
+
+  // Group reviews by reviewer and compute each reviewer's LATEST state on headSha.
+  const latestStateByReviewer = computeLatestReviewStatePerReviewer(reviews, headSha);
+
+  // A valid approval is a reviewer whose latest state on headSha is APPROVED
+  // AND who is in the resolved CODEOWNER set.
+  let foundApprover = false;
+  for (const [login, state] of latestStateByReviewer) {
+    if (state === 'APPROVED' && codeownerLogins.has(login)) {
+      foundApprover = true;
+      break;
     }
   }
 
-  const validApprovals = approvalsOnHead.filter((r) => {
-    if (!r.user) return false;
-    return codeownerLogins.has(normalizeLogin(r.user.login));
-  });
-
-  if (validApprovals.length === 0) {
+  if (!foundApprover) {
     return {
       ok: false,
-      reason: 'no approval from a CODEOWNER for the artifact',
+      reason: 'no CODEOWNER approval on final head SHA (considering latest state per reviewer)',
     };
   }
   return { ok: true };
+}
+
+/**
+ * Find the last CODEOWNERS entry whose pattern matches the given file path.
+ * Git uses last-match-wins: later rules override earlier ones.
+ */
+function findLastMatchingCodeownersEntry(
+  entries: CodeownersEntry[],
+  filePath: string,
+): CodeownersEntry | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry && matchCodeownersPattern(entry.pattern, filePath)) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a list of CODEOWNERS owner strings to a set of normalized logins.
+ * Plain users (e.g. `@alice`) resolve directly; team entries (e.g. `@org/team`)
+ * are expanded via the Teams API.
+ */
+async function resolveOwnersToLogins(
+  octokit: VerifyInput['octokit'],
+  org: string,
+  owners: string[],
+): Promise<Set<string>> {
+  const logins = new Set<string>();
+  for (const raw of owners) {
+    const owner = normalizeLogin(raw);
+    if (!owner) continue;
+    const slashIdx = owner.indexOf('/');
+    if (slashIdx === -1) {
+      // Plain user login
+      logins.add(owner);
+      continue;
+    }
+    // Team entry: @<teamOrg>/<teamSlug>
+    const teamOrg = owner.slice(0, slashIdx);
+    const teamSlug = owner.slice(slashIdx + 1);
+    const effectiveOrg = teamOrg || org;
+    const members = await listAllTeamMembers(octokit, effectiveOrg, teamSlug);
+    for (const m of members) {
+      logins.add(normalizeLogin(m.login));
+    }
+  }
+  return logins;
+}
+
+async function listAllTeamMembers(
+  octokit: VerifyInput['octokit'],
+  org: string,
+  teamSlug: string,
+): Promise<{ login: string }[]> {
+  const all: { login: string }[] = [];
+  let page = 1;
+  while (true) {
+    const { data } = await octokit.rest.teams.listMembersInOrg({
+      org,
+      team_slug: teamSlug,
+      per_page: 100,
+      page,
+    });
+    if (data.length === 0) break;
+    all.push(...data);
+    if (data.length < 100) break;
+    page++;
+  }
+  return all;
+}
+
+/**
+ * For each reviewer with reviews on the given head SHA, compute their LATEST
+ * state (by submitted_at) on that SHA. A subsequent non-APPROVED state
+ * supersedes an earlier APPROVED.
+ */
+function computeLatestReviewStatePerReviewer(
+  reviews: PullReview[],
+  headSha: string,
+): Map<string, string> {
+  const latest = new Map<string, { state: string; ts: string }>();
+  for (const r of reviews) {
+    if (r.commit_id !== headSha) continue;
+    if (!r.user) continue;
+    const login = normalizeLogin(r.user.login);
+    const ts = r.submitted_at ?? '';
+    const cur = latest.get(login);
+    if (!cur || ts > cur.ts) {
+      latest.set(login, { state: r.state, ts });
+    }
+  }
+  const result = new Map<string, string>();
+  for (const [login, { state }] of latest) {
+    result.set(login, state);
+  }
+  return result;
 }
 
 /** Normalize a GitHub login (strip leading @ and lowercase). */

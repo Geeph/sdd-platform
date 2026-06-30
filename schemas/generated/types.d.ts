@@ -6,12 +6,12 @@
 export interface SDDImpact {
   base: string;
   head: string;
-  changed?: {
-    requirements?: string[];
-    screens?: string[];
-    operations?: string[];
+  changed: {
+    requirements: string[];
+    screens: string[];
+    operations: string[];
   };
-  platforms?: {
+  platforms: {
     backend: boolean;
     web: boolean;
     ios: boolean;
