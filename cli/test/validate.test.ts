@@ -40,6 +40,13 @@ describe('sdd validate', () => {
     }
   });
 
+  it('shows help without command-discovery warnings', async () => {
+    const result = await runCli(['--help']);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('validate');
+    expect(result.stderr).toBe('');
+  });
+
   describe('projects.yaml', () => {
     it('returns 0 for a valid projects.yaml', async () => {
       const result = await runCli(['validate', '--repo', join(fixturesDir, 'repo-valid')]);

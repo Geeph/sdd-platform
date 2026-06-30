@@ -132,6 +132,7 @@ verifyGateApproval(input: {
 }): Promise<
   | { ok: true; provenance: {
       gate; version; pr; approved_head_sha; merge_commit_sha; approved_at;
+      authorization_policy: 'current-codeowners';
       required_checks: Array<{ name: string; head_sha: string; conclusion: 'success' }>;
     } }
   | { ok: false; reason: string }
@@ -147,13 +148,16 @@ verifyGateApproval(input: {
 3. **确认 `artifactPath` 确由该 PR 审批**：它必须在该 PR 的 changed files 中（相对 base 为
    added/modified），而不仅是 merge tree 继承的历史文件——否则任意后续 Gate PR 都"包含"它
    却从未审批它；
-4. 校验本地 `artifactPath` 的 git blob 等于该 PR head/merge 版本的同路径 blob，且要求
+4. 按 `current-codeowners` 策略验证批准者当前仍是有效 CODEOWNER：个人或同组织可见团队
+   必须对仓库有显式 write 权限，团队成员关系分页读取；权限或成员资格被移除即撤销后续
+   scaffold/publish 授权；
+5. 校验本地 `artifactPath` 的 git blob 等于该 PR head/merge 版本的同路径 blob，且要求
    worktree 对该路径 clean；
-5. 当 `gate='contract'` 时，读取该 PR 最终 head SHA 的 check runs，要求稳定命名的
+6. 当 `gate='contract'` 时，读取该 PR 最终 head SHA 的 check runs，要求稳定命名的
    `Contract Gate` 存在且 conclusion 为 `success`；旧 SHA 上的成功、缺失、skipped、failure
    或 cancelled 均失败，并把成功 evidence 写入 `required_checks`；其他 Gate 的
    `required_checks` 可为空；
-6. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
+7. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
    中止任何 GitHub 写操作。
 
 > 配套（非 M1 强制）：另设一个解析步骤 `listGateApprovals({ gate, version })`，按 label +

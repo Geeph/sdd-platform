@@ -46,7 +46,9 @@
   标识；ruleset 开启 stale review dismissal，并要求对应 CODEOWNER 批准，确保批准绑定最终
   head SHA。
 - **批准记录**：记录 `{gate, version, pr, approved_head_sha, merge_commit_sha, approved_at,
-  required_checks}`；CLI 运行时从 GitHub API 读取并验证。Contract Gate 额外要求
+  authorization_policy, required_checks}`；CLI 运行时从 GitHub API 读取并验证。当前采用
+  `current-codeowners` 可撤销授权策略：执行 scaffold/publish 时重新确认用户或同组织可见团队
+  仍具有仓库 write 权限；成员或权限被移除会立即撤销后续写操作授权。Contract Gate 额外要求
   `required_checks` 包含同一 `approved_head_sha` 上成功的 `Contract Gate` check。生成的
   dry-run、Issue marker 和审计报告保存这组不可混淆的 provenance，而不是信任工作区里的
   声明文件。

@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "lint": "biome check .",
-    "clean": "rimraf dist generated"
+    "clean": "rimraf dist"
   },
   "dependencies": {
     "ajv": "^8.17.1",

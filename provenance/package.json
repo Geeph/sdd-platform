@@ -22,7 +22,8 @@
     "clean": "rimraf dist"
   },
   "dependencies": {
-    "@octokit/rest": "^21.0.0"
+    "@octokit/rest": "^21.0.0",
+    "ignore": "^7.0.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

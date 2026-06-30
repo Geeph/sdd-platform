@@ -1,3 +1,4 @@
+import createIgnore from 'ignore';
 import type {
   CheckRun,
   CodeownersEntry,
@@ -150,6 +151,7 @@ export async function verifyGateApproval(input: VerifyInput): Promise<VerifyResu
         approved_head_sha: headSha,
         merge_commit_sha: mergeCommitSha,
         approved_at: pr.merged_at ?? '',
+        authorization_policy: 'current-codeowners',
         required_checks,
       },
     };
@@ -299,7 +301,7 @@ async function getCodeownerApproval(
   }
 
   // Resolve all owners (individuals + team members) to a set of normalized logins.
-  const codeownerLogins = await resolveOwnersToLogins(octokit, owner, owningEntry.owners);
+  const codeownerLogins = await resolveOwnersToLogins(octokit, owner, repo, owningEntry.owners);
   if (codeownerLogins.size === 0) {
     return {
       ok: false,
@@ -347,13 +349,14 @@ function findLastMatchingCodeownersEntry(
 }
 
 /**
- * Resolve a list of CODEOWNERS owner strings to a set of normalized logins.
- * Plain users (e.g. `@alice`) resolve directly; team entries (e.g. `@org/team`)
- * are expanded via the Teams API.
+ * Resolve CODEOWNERS using GitHub's validity rules at verification time.
+ * This is intentionally a revocable policy: removing current write access or
+ * team membership revokes authorization for later scaffold/publish actions.
  */
 async function resolveOwnersToLogins(
   octokit: VerifyInput['octokit'],
   org: string,
+  repo: string,
   owners: string[],
 ): Promise<Set<string>> {
   const logins = new Set<string>();
@@ -362,20 +365,49 @@ async function resolveOwnersToLogins(
     if (!owner) continue;
     const slashIdx = owner.indexOf('/');
     if (slashIdx === -1) {
-      // Plain user login
-      logins.add(owner);
+      const { data } = await octokit.rest.repos.getCollaboratorPermissionLevel({
+        owner: org,
+        repo,
+        username: owner,
+      });
+      if (hasWritePermission(data.permission)) {
+        logins.add(owner);
+      }
       continue;
     }
     // Team entry: @<teamOrg>/<teamSlug>
     const teamOrg = owner.slice(0, slashIdx);
     const teamSlug = owner.slice(slashIdx + 1);
-    const effectiveOrg = teamOrg || org;
-    const members = await listAllTeamMembers(octokit, effectiveOrg, teamSlug);
+    if (!teamOrg || !teamSlug || teamOrg.toLowerCase() !== org.toLowerCase()) {
+      continue;
+    }
+    const { data: team } = await octokit.rest.teams.getByName({
+      org,
+      team_slug: teamSlug,
+    });
+    if (team.privacy !== 'closed') {
+      continue;
+    }
+    const { data: teamRepository } = await octokit.rest.teams.checkPermissionsForRepoInOrg({
+      org,
+      team_slug: teamSlug,
+      owner: org,
+      repo,
+      headers: { accept: 'application/vnd.github.v3.repository+json' },
+    });
+    if (!teamRepository?.permissions?.push) {
+      continue;
+    }
+    const members = await listAllTeamMembers(octokit, org, teamSlug);
     for (const m of members) {
       logins.add(normalizeLogin(m.login));
     }
   }
   return logins;
+}
+
+function hasWritePermission(permission: string): boolean {
+  return permission === 'admin' || permission === 'write';
 }
 
 async function listAllTeamMembers(
@@ -401,23 +433,25 @@ async function listAllTeamMembers(
 }
 
 /**
- * For each reviewer with reviews on the given head SHA, compute their LATEST
- * state (by submitted_at) on that SHA. A subsequent non-APPROVED state
- * supersedes an earlier APPROVED.
+ * For each reviewer, compute the latest decisive state on the head SHA.
+ * COMMENTED is non-decisive and does not revoke an approval;
+ * CHANGES_REQUESTED and DISMISSED do.
  */
 function computeLatestReviewStatePerReviewer(
   reviews: PullReview[],
   headSha: string,
 ): Map<string, string> {
-  const latest = new Map<string, { state: string; ts: string }>();
+  const decisiveStates = new Set(['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']);
+  const latest = new Map<string, { state: string; ts: string; id: number }>();
   for (const r of reviews) {
     if (r.commit_id !== headSha) continue;
     if (!r.user) continue;
+    if (!decisiveStates.has(r.state)) continue;
     const login = normalizeLogin(r.user.login);
     const ts = r.submitted_at ?? '';
     const cur = latest.get(login);
-    if (!cur || ts > cur.ts) {
-      latest.set(login, { state: r.state, ts });
+    if (!cur || ts > cur.ts || (ts === cur.ts && r.id > cur.id)) {
+      latest.set(login, { state: r.state, ts, id: r.id });
     }
   }
   const result = new Map<string, string>();
@@ -434,29 +468,16 @@ function normalizeLogin(login: string): string {
 
 /** Match a CODEOWNERS pattern against a file path. */
 function matchCodeownersPattern(pattern: string, filePath: string): boolean {
-  // Normalize: strip leading slash if present
-  const normalizedPattern = pattern.startsWith('/') ? pattern.slice(1) : pattern;
   const normalizedPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;
-
-  // Convert CODEOWNERS pattern to regex
-  let regex = normalizedPattern
-    .replace(/\./g, '\\.')
-    .replace(/\*\*/g, '{{GLOBSTAR}}')
-    .replace(/\*/g, '[^/]*')
-    .replace(/\{\{GLOBSTAR\}\}/g, '.*');
-
-  // If pattern ends with /, match directory prefix
-  if (normalizedPattern.endsWith('/')) {
-    regex = regex.replace(/\/$/, '(/.*)?$');
-  } else if (!normalizedPattern.includes('*')) {
-    // Literal pattern matches as prefix
-    regex = `${regex}(/.*)?$`;
-  } else {
-    // Full regex match
-    regex = `^${regex}$`;
+  if (!normalizedPath || normalizedPath.startsWith('../') || normalizedPath.includes('/../')) {
+    return false;
   }
-
-  return new RegExp(`^${regex}`).test(normalizedPath);
+  // CODEOWNERS does not support gitignore negation or character ranges. Treat
+  // those entries as invalid instead of interpreting them with other semantics.
+  if (pattern.startsWith('!') || pattern.includes('[') || pattern.includes(']')) {
+    return false;
+  }
+  return createIgnore().add(pattern).ignores(normalizedPath);
 }
 
 async function verifyContractGateCheck(

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
   CheckRun,
-  CodeownersEntry,
   GitReader,
   OctokitLike,
   PullData,
@@ -80,6 +79,9 @@ function fakeOctokit(
     checks?: CheckRun[];
     prsForCommit?: PullData[];
     teamMembers?: Record<string, string[]>;
+    teamPrivacy?: Record<string, string>;
+    teamHasWrite?: Record<string, boolean>;
+    userPermissions?: Record<string, string>;
     throwOn?: string;
   } = {},
 ): OctokitLike {
@@ -90,6 +92,9 @@ function fakeOctokit(
   const checks = overrides.checks ?? [];
   const prsForCommit = overrides.prsForCommit ?? [pr];
   const teamMembers = overrides.teamMembers ?? {};
+  const teamPrivacy = overrides.teamPrivacy ?? {};
+  const teamHasWrite = overrides.teamHasWrite ?? {};
+  const userPermissions = overrides.userPermissions ?? {};
 
   return {
     rest: {
@@ -112,13 +117,32 @@ function fakeOctokit(
         listPullRequestsAssociatedWithCommit: async () => ({
           data: prsForCommit,
         }),
+        getCollaboratorPermissionLevel: async (params: { username: string }) => ({
+          data: {
+            permission: userPermissions[params.username] ?? 'write',
+            role_name: userPermissions[params.username] ?? 'write',
+          },
+        }),
       },
       checks: {
         listForRef: async () => ({ data: { check_runs: checks } }),
       },
       teams: {
         getByName: async (params: { org: string; team_slug: string }) => ({
-          data: { id: 1, slug: params.team_slug },
+          data: {
+            id: 1,
+            slug: params.team_slug,
+            privacy: teamPrivacy[`${params.org}/${params.team_slug}`] ?? 'closed',
+          },
+        }),
+        checkPermissionsForRepoInOrg: async (params: { org: string; team_slug: string }) => ({
+          data: {
+            permissions: {
+              admin: false,
+              pull: true,
+              push: teamHasWrite[`${params.org}/${params.team_slug}`] ?? true,
+            },
+          },
         }),
         listMembersInOrg: async (params: { org: string; team_slug: string }) => ({
           data: (teamMembers[`${params.org}/${params.team_slug}`] ?? []).map((login) => ({
@@ -155,6 +179,7 @@ describe('verifyGateApproval', () => {
       expect(result.provenance.pr).toBe(1);
       expect(result.provenance.approved_head_sha).toBe('head111');
       expect(result.provenance.merge_commit_sha).toBe('merge111');
+      expect(result.provenance.authorization_policy).toBe('current-codeowners');
     }
   });
 
@@ -271,6 +296,66 @@ describe('verifyGateApproval', () => {
     }
   });
 
+  it('rejects a plain user CODEOWNER without current write permission', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({ userPermissions: { codeowner: 'read' } }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/no resolvable owners/);
+  });
+
+  it('rejects a CODEOWNER team from a different organization', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@other-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/no resolvable owners/);
+  });
+
+  it('rejects a secret CODEOWNER team', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          teamMembers: { 'demo-org/spec-approvers': ['codeowner'] },
+          teamPrivacy: { 'demo-org/spec-approvers': 'secret' },
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@demo-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/no resolvable owners/);
+  });
+
+  it('rejects a CODEOWNER team without write permission', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          teamMembers: { 'demo-org/spec-approvers': ['codeowner'] },
+          teamHasWrite: { 'demo-org/spec-approvers': false },
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@demo-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/no resolvable owners/);
+  });
+
   it('uses only the last matching CODEOWNERS rule (last-match-wins)', async () => {
     // First rule assigns @first-owner, second rule overrides to @second-owner.
     // If approval is from @first-owner only, it must be rejected because the
@@ -320,6 +405,20 @@ describe('verifyGateApproval', () => {
     }
   });
 
+  it('does not treat a later comment as revoking an approval', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          reviews: [
+            fakeReview({ id: 1, state: 'APPROVED', submitted_at: '2026-06-01T00:00:00Z' }),
+            fakeReview({ id: 2, state: 'COMMENTED', submitted_at: '2026-06-01T01:00:00Z' }),
+          ],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
   it('reads CODEOWNERS at base commit, not head', async () => {
     // Git reader must be called with the PR's base.sha, not head.sha.
     let codeownersCommit = '';
@@ -345,6 +444,22 @@ describe('verifyGateApproval', () => {
         artifactPath: 'projects.yaml',
         octokit: fakeOctokit({
           files: [fakeFile({ filename: 'projects.yaml', status: 'added' })],
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('matches a slashless CODEOWNERS pattern at nested paths', async () => {
+    const artifactPath = 'specs/v1/spec.md';
+    const result = await verifyGateApproval(
+      baseInput({
+        artifactPath,
+        octokit: fakeOctokit({
+          files: [fakeFile({ filename: artifactPath, status: 'added' })],
+        }),
+        git: fakeGit({
+          codeownersAt: async () => [{ pattern: '*.md', owners: ['@codeowner'] }],
         }),
       }),
     );
@@ -481,12 +596,18 @@ describe('verifyGateApproval', () => {
               listPullRequestsAssociatedWithCommit: async () => ({
                 data: [],
               }),
+              getCollaboratorPermissionLevel: async () => ({
+                data: { permission: 'write' },
+              }),
             },
             checks: {
               listForRef: async () => ({ data: { check_runs: [] } }),
             },
             teams: {
-              getByName: async () => ({ data: { id: 1, slug: 't' } }),
+              getByName: async () => ({ data: { id: 1, slug: 't', privacy: 'closed' } }),
+              checkPermissionsForRepoInOrg: async () => ({
+                data: { permissions: { admin: false, pull: true, push: true } },
+              }),
               listMembersInOrg: async () => ({ data: [] }),
             },
           },
@@ -677,6 +798,29 @@ describe('verifyGateApproval - API pagination', () => {
       return { data: { check_runs: page2 } };
     };
     const result = await verifyGateApproval(baseInput({ gate: 'contract', octokit }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('paginates through team members', async () => {
+    const octokit = fakeOctokit({
+      reviews: [fakeReview({ user: { login: 'codeowner' } })],
+    });
+    (octokit.rest.teams.listMembersInOrg as unknown) = async (params: { page?: number }) => ({
+      data:
+        (params.page ?? 1) === 1
+          ? Array.from({ length: 100 }, (_, i) => ({ login: `member-${i}` }))
+          : [{ login: 'codeowner' }],
+    });
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit,
+        git: fakeGit({
+          codeownersAt: async () => [
+            { pattern: '/projects.yaml', owners: ['@demo-org/spec-approvers'] },
+          ],
+        }),
+      }),
+    );
     expect(result.ok).toBe(true);
   });
 });

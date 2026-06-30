@@ -27,6 +27,7 @@ export interface Provenance {
   approved_head_sha: string;
   merge_commit_sha: string;
   approved_at: string;
+  authorization_policy: 'current-codeowners';
   required_checks: RequiredCheck[];
 }
 
@@ -77,6 +78,11 @@ export interface OctokitLike {
         per_page?: number;
         page?: number;
       }) => Promise<{ data: PullData[] }>;
+      getCollaboratorPermissionLevel: (params: {
+        owner: string;
+        repo: string;
+        username: string;
+      }) => Promise<{ data: { permission: string; role_name?: string } }>;
     };
     checks: {
       listForRef: (params: {
@@ -91,7 +97,25 @@ export interface OctokitLike {
       getByName: (params: {
         org: string;
         team_slug: string;
-      }) => Promise<{ data: { id: number; slug: string } }>;
+      }) => Promise<{ data: { id: number; slug: string; privacy?: string } }>;
+      checkPermissionsForRepoInOrg: (params: {
+        org: string;
+        team_slug: string;
+        owner: string;
+        repo: string;
+        headers?: { accept: string };
+      }) => Promise<{
+        data?: {
+          permissions?: {
+            admin: boolean;
+            pull: boolean;
+            triage?: boolean;
+            push: boolean;
+            maintain?: boolean;
+          };
+          role_name?: string;
+        };
+      }>;
       listMembersInOrg: (params: {
         org: string;
         team_slug: string;
