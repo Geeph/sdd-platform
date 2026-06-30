@@ -1,0 +1,21 @@
+{
+  "name": "sdd-platform",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "generate": "pnpm -r generate",
+    "clean": "pnpm -r run clean"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "rimraf": "^6.0.0"
+  }
+}

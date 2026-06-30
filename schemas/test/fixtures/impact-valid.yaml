@@ -1,0 +1,16 @@
+base: abc123
+head: def456
+breaking: false
+platforms:
+  backend: true
+  web: false
+  ios: false
+  android: false
+changed:
+  requirements:
+    - REQ-AUTH-001
+  screens: []
+  operations:
+    - loginUser
+affected_issues: []
+suggested_change_issues: []

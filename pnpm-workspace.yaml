@@ -1,0 +1,9 @@
+packages:
+  - schemas
+  - provenance
+  - cli
+  - factory
+  - backlog-compiler
+
+overrides:
+  esbuild: 0.28.1

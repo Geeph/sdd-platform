@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sdd.dev/schemas/projects.schema.json",
+  "title": "SDD Projects",
+  "description": "Product topology: components, templates, CI wiring.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "product": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "repository_mode": {
+      "type": "string",
+      "enum": ["monorepo"]
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    }
+  },
+  "required": ["schema_version", "product", "repository_mode", "components"],
+  "additionalProperties": false,
+  "$defs": {
+    "component": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^apps/[a-z0-9-]+(/[a-z0-9-]+)*$"
+        },
+        "template": {
+          "type": "string",
+          "enum": ["spring-boot", "web", "ios-tuist", "android"]
+        },
+        "template_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ci": {
+          "type": "string",
+          "enum": ["java", "web", "ios", "android"]
+        }
+      },
+      "required": ["id", "path", "template", "template_ref", "owner", "ci"],
+      "additionalProperties": false
+    }
+  }
+}

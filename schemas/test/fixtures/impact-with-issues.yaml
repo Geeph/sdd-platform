@@ -1,0 +1,23 @@
+base: abc123
+head: def456
+breaking: true
+changed:
+  requirements:
+    - REQ-AUTH-001
+  screens: []
+  operations:
+    - loginUser
+platforms:
+  backend: true
+  web: false
+  ios: false
+  android: false
+affected_issues:
+  - task_id: ios.auth.login
+    issue: 42
+    change: update
+suggested_change_issues:
+  - task_id: backend.auth.login
+    platform: backend
+    kind: change
+    reason: Breaking API change

@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sdd.dev/schemas/impact.schema.json",
+  "title": "SDD Impact",
+  "description": "Impact report produced by sdd impact.",
+  "type": "object",
+  "properties": {
+    "base": {
+      "type": "string",
+      "minLength": 1
+    },
+    "head": {
+      "type": "string",
+      "minLength": 1
+    },
+    "changed": {
+      "type": "object",
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "screens": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "operations": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["requirements", "screens", "operations"],
+      "additionalProperties": false
+    },
+    "platforms": {
+      "type": "object",
+      "properties": {
+        "backend": { "type": "boolean" },
+        "web": { "type": "boolean" },
+        "ios": { "type": "boolean" },
+        "android": { "type": "boolean" }
+      },
+      "required": ["backend", "web", "ios", "android"],
+      "additionalProperties": false
+    },
+    "breaking": {
+      "type": "boolean"
+    },
+    "affected_issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/affectedIssue"
+      }
+    },
+    "suggested_change_issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/suggestedChangeIssue"
+      }
+    }
+  },
+  "required": ["base", "head", "changed", "platforms", "breaking"],
+  "additionalProperties": false,
+  "$defs": {
+    "affectedIssue": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+        },
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "change": {
+          "type": "string",
+          "enum": ["update", "change", "migration"]
+        }
+      },
+      "required": ["task_id", "issue", "change"],
+      "additionalProperties": false
+    },
+    "suggestedChangeIssue": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["common", "backend", "web", "ios", "android"]
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["change", "migration"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["task_id", "platform", "kind", "reason"],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,12 @@
+base: abc123
+head: def456
+breaking: false
+changed:
+  requirements: []
+  screens: []
+  operations: []
+platforms:
+  backend: false
+  web: false
+  ios: false
+  android: false
