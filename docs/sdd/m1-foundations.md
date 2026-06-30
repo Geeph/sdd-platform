@@ -17,7 +17,8 @@
 - 工具链：**pnpm**（workspace）/ **tsup**（build）/ **vitest**（test）/ **oclif**（CLI）。
 - Lint / format：**biome**。
 - TS 类型：从 JSON Schema 用 **json-schema-to-typescript** 生成，不手写。
-- 授权校验库：**独立 workspace 包 `@sdd/provenance`**，供 cli / factory / backlog-compiler 共用。
+- 授权校验库：**独立 workspace 包 `@sdd/provenance`**，供 cli / factory / backlog-compiler 共用；
+  同时支持人工 Gate approval 和 Contract Gate check evidence。
 - `sdd validate` 范围：默认校验 `projects.yaml`；`--kind task|impact <file>` 校验显式文件。
 - **可复现构建**：根 `package.json` 用 `packageManager` 固定 pnpm 版本（corepack）；提交
   `pnpm-lock.yaml`；CI / 构建一律 `pnpm install --frozen-lockfile`。
@@ -124,12 +125,15 @@ verifyGateApproval(input: {
   octokit: Octokit;          // 注入，便于测试
   git: GitReader;            // 注入：读 worktree 状态与指定 commit 的 blob
   repo: { owner: string; name: string };
-  gate: 'spec' | 'architecture' | 'design' | 'plan';
+  gate: 'spec' | 'architecture' | 'design' | 'plan' | 'contract';
   version: string;           // 如 v1
   approval: { pr: number } | { mergeCommitSha: string };  // 明确目标，二选一
   artifactPath: string;      // 如 projects.yaml
 }): Promise<
-  | { ok: true; provenance: { gate; version; pr; approved_head_sha; merge_commit_sha; approved_at } }
+  | { ok: true; provenance: {
+      gate; version; pr; approved_head_sha; merge_commit_sha; approved_at;
+      required_checks: Array<{ name: string; head_sha: string; conclusion: 'success' }>;
+    } }
   | { ok: false; reason: string }
 >;
 ```
@@ -145,7 +149,11 @@ verifyGateApproval(input: {
    却从未审批它；
 4. 校验本地 `artifactPath` 的 git blob 等于该 PR head/merge 版本的同路径 blob，且要求
    worktree 对该路径 clean；
-5. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
+5. 当 `gate='contract'` 时，读取该 PR 最终 head SHA 的 check runs，要求稳定命名的
+   `Contract Gate` 存在且 conclusion 为 `success`；旧 SHA 上的成功、缺失、skipped、failure
+   或 cancelled 均失败，并把成功 evidence 写入 `required_checks`；其他 Gate 的
+   `required_checks` 可为空；
+6. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
    中止任何 GitHub 写操作。
 
 > 配套（非 M1 强制）：另设一个解析步骤 `listGateApprovals({ gate, version })`，按 label +
@@ -161,7 +169,8 @@ verifyGateApproval(input: {
 - **provenance**（mock octokit + 假 git）：指定 PR 已合并且 CODEOWNER 批准、`artifactPath`
   在该 PR changed files 中且 blob 一致 → ok；**文件仅存在于 merge tree、不在该 PR changed
   files → fail**；label 与 gate/version 不符 → fail；过期审批 / 非 CODEOWNER → fail；
-  API 抛错 → fail closed；blob 不一致 → fail。
+  API 抛错 → fail closed；blob 不一致 → fail。Contract Gate 另覆盖当前 approved head SHA 上
+  success → ok，以及 check 缺失 / 旧 SHA success / skipped / failure / cancelled → fail。
 
 ## 6. 交付文件树
 

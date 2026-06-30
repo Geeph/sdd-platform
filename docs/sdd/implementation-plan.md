@@ -30,9 +30,9 @@
   └── .github/workflows/  # reusable workflows（java / web / ios / android）
   ```
 
-- **后续确认（M6 前定，不阻塞 M1）**：OpenAPI lint（spectral）、breaking diff（oasdiff）、
-  TS/Swift/Kotlin client 生成器、provider conformance（Schemathesis，作为 CI 步骤运行，
-  与实现语言无关）。
+- **后续确认（不阻塞 M1）**：OpenAPI lint（spectral）、breaking diff（oasdiff）和
+  TS/Swift/Kotlin client 生成器在 **M4.5 前**确定；provider conformance（Schemathesis，
+  作为 CI 步骤运行，与实现语言无关）在 **M6 前**确定。
 
 ## 1. 贯穿性机制：Gate 授权溯源（approval provenance）
 
@@ -42,19 +42,24 @@
 
 - **权威来源**：GitHub 上合入受保护 `main` 的 Gate PR 及其 review/merge 元数据是唯一
   授权事实来源，不在仓库内维护一个可由后续 commit 改写的自证账本。Gate PR 使用
-  `gate:spec` / `gate:architecture` / `gate:design` / `gate:plan` 标签和版本标识；ruleset
-  开启 stale review dismissal，并要求对应 CODEOWNER 批准，确保批准绑定最终 head SHA。
-- **批准记录**：记录 `{gate, version, pr, approved_head_sha, merge_commit_sha, approved_at}`；
-  CLI 运行时从 GitHub API 读取并验证。生成的 dry-run、Issue marker 和审计报告保存这组
-  不可混淆的 provenance，而不是信任工作区里的声明文件。
+  `gate:spec` / `gate:architecture` / `gate:design` / `gate:plan` / `gate:contract` 标签和版本
+  标识；ruleset 开启 stale review dismissal，并要求对应 CODEOWNER 批准，确保批准绑定最终
+  head SHA。
+- **批准记录**：记录 `{gate, version, pr, approved_head_sha, merge_commit_sha, approved_at,
+  required_checks}`；CLI 运行时从 GitHub API 读取并验证。Contract Gate 额外要求
+  `required_checks` 包含同一 `approved_head_sha` 上成功的 `Contract Gate` check。生成的
+  dry-run、Issue marker 和审计报告保存这组不可混淆的 provenance，而不是信任工作区里的
+  声明文件。
 - **校验库**（M1 交付，被 scaffold / compile / publish 复用；目标 Gate 由**明确的 PR 号或
   merge SHA** 指定，label 只作辅助一致性核对、不用于定位）：
   1. 该 PR 已合入预期仓库的受保护 `main`，最终 head SHA 获所需 CODEOWNER 批准；
   2. **被消费产物确实由该 PR 审批**：`artifactPath` 必须在该 PR 的 changed files 中（相对
      base 为 added/modified），不能只是 merge tree 继承的历史文件；
   3. 工作区 clean，且本地产物的 Git blob 与该 PR head/merge 版本的同路径 blob 一致；
-  4. 后续 Gate 沿用的产物必须能追溯到相应 Gate 的批准记录；
-  5. GitHub API 不可用、证据不完整或校验失败时，任何写操作 fail closed。
+  4. 当 `gate=contract` 时，`Contract Gate` check 必须在该 PR 最终 head SHA 上成功；旧
+     commit、缺失、skipped、failure 或 cancelled 均不算通过；
+  5. 后续 Gate 沿用的产物必须能追溯到相应 Gate 的批准记录；
+  6. GitHub API 不可用、证据不完整或校验失败时，任何写操作 fail closed。
 - **落点**：机制与校验库在 **M1** 定义；Gate labels、CODEOWNERS、ruleset 和 PR hygiene 在
   **M2** 配置；强制校验在 **M3**（scaffold）与 **M5**（publish）。`compile --dry-run`
   可用于 Gate 评审，但必须醒目标注未批准输入，且不得产生 GitHub 写操作。
@@ -122,9 +127,12 @@
 - Contract Gate：OpenAPI lint、breaking-change diff、`$ref`/examples/operationId 完整性、
   生成 TS/Swift/Kotlin client 并编译 + 最小测试（§8.1）。由 `contracts/openapi.yaml`
   路径变化强制触发，新增与修改同规则。
+- M4 detector 增加 `contract_changed` 输出；变化时运行稳定命名的 `Contract Gate` job，
+  M4 的 `CI Gate` 将其纳入聚合。`contract_changed=true` 时，Contract Gate 为 skipped / failure /
+  cancelled 或没有在当前 head SHA 产生结果，`CI Gate` 必须失败；无合同变化时才允许 skipped。
 - **次序关键**：OpenAPI 在 Architecture 阶段就产生（§6.3），M5 会据合同编译/发布任务，
   所以合同必须在 backlog 之前通过本 Gate；M5 publish 也必须校验 contracts 来自已通过的
-  Contract Gate。
+  Contract Gate，包括当前批准 head SHA 上成功的 check evidence。
 - 依赖 M4 的 CI 装配。
 - 依据：§6.3、§8.1。
 - 验收：12.6、12.14（breaking 检测；配合 M5 的 change issue 实现"不静默覆盖客户端任务"）。
@@ -207,6 +215,7 @@
 
 ## 5. 待决事项
 
-- OpenAPI 工具链（lint / breaking diff / client 生成）的最终选型（M6 前确认）。
+- OpenAPI 工具链（lint / breaking diff / client 生成）的最终选型（M4.5 前确认）；provider
+  conformance 工具在 M6 前确认。
 - 本仓库 runbook 与 `sdd-agent-starter` 源文件在 bootstrap 机制上的分叉、以及权威归属
   （独立未决项，不阻塞实现）。
