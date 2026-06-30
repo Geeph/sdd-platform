@@ -1,0 +1,27 @@
+schema_version: 1
+repository:
+  description: Demo product monorepo
+  visibility: private
+bootstrap:
+  approvers: [platform-admins]
+owners:
+  product: product-team
+  api: api-owners
+  design: design-team
+  admins: platform-admins
+  backend: backend-team
+  web: web-team
+  ios: ios-team
+  android: android-team
+team_permissions:
+  platform-admins: maintain
+  product-team: push
+  api-owners: push
+  design-team: push
+  backend-team: push
+  web-team: push
+  ios-team: push
+  android-team: push
+environments:
+  preview: { reviewers: [product-team], prevent_self_review: true }
+required_secrets: []
