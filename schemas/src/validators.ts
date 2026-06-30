@@ -1,5 +1,6 @@
 import type { ErrorObject, ValidateFunction } from 'ajv';
 import impactSchema from '../impact.schema.json' with { type: 'json' };
+import productInitSchema from '../product-init.schema.json' with { type: 'json' };
 import projectsSchema from '../projects.schema.json' with { type: 'json' };
 import taskSchema from '../task.schema.json' with { type: 'json' };
 
@@ -14,6 +15,7 @@ let _validators: {
   projects: ValidateFunction;
   task: ValidateFunction;
   impact: ValidateFunction;
+  productInit: ValidateFunction;
 } | null = null;
 
 async function initValidators() {
@@ -40,6 +42,7 @@ async function initValidators() {
     projects: ajv.compile(projectsSchema),
     task: ajv.compile(taskSchema),
     impact: ajv.compile(impactSchema),
+    productInit: ajv.compile(productInitSchema),
   };
   return _validators;
 }
@@ -79,4 +82,10 @@ export async function validateImpactDocument(data: unknown): Promise<ValidateRes
   return { ok, errors: formatErrors(v.impact.errors) };
 }
 
-export { impactSchema, projectsSchema, taskSchema };
+export async function validateProductInitDocument(data: unknown): Promise<ValidateResult> {
+  const v = await validatorsPromise;
+  const ok = v.productInit(data) as boolean;
+  return { ok, errors: formatErrors(v.productInit.errors) };
+}
+
+export { impactSchema, productInitSchema, projectsSchema, taskSchema };

@@ -13,9 +13,11 @@ export type {
 export type { ValidateResult, ValidationError } from './validators.js';
 export {
   impactSchema,
+  productInitSchema,
   projectsSchema,
   taskSchema,
   validateImpactDocument,
+  validateProductInitDocument,
   validateProjectsDocument,
   validateTaskDocument,
 } from './validators.js';
