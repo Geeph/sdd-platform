@@ -8,6 +8,8 @@
 > 本版据评审修正 6 处：基线改 Node 24 LTS；`components[].path` 加路径安全约束；授权校验
 > 接口改为明确 PR/merge SHA；impact schema 定型（必填 + item 结构）；schema 文件移回包根；
 > 补齐可复现构建（固定 pnpm、lockfile、frozen install、typecheck/漂移检查）。
+> 二轮修正：provenance 增加"`artifactPath` 须在 Gate PR changed files 中"的校验——仅 blob
+> 匹配不足以证明该文件被该 PR 审批。
 
 ## 0. 已定决策
 
@@ -138,9 +140,12 @@ verifyGateApproval(input: {
    `merge_commit_sha`、最终 head SHA 及其 CODEOWNER 批准记录；
 2. **label 仅作辅助一致性核对**（`gate:<gate>` 与 version 必须匹配，否则判失败），绝不用
    label 去"搜索"PR——同一 version 可有多个已合并 Gate PR，且 label 可被改；
-3. 校验本地 `artifactPath` 的 git blob 等于该 `merge_commit_sha` 中同路径 blob，且要求
+3. **确认 `artifactPath` 确由该 PR 审批**：它必须在该 PR 的 changed files 中（相对 base 为
+   added/modified），而不仅是 merge tree 继承的历史文件——否则任意后续 Gate PR 都"包含"它
+   却从未审批它；
+4. 校验本地 `artifactPath` 的 git blob 等于该 PR head/merge 版本的同路径 blob，且要求
    worktree 对该路径 clean；
-4. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
+5. **fail closed**：API 不可用 / 证据不完整 / 任一校验不符 → `{ ok: false }`，调用方必须
    中止任何 GitHub 写操作。
 
 > 配套（非 M1 强制）：另设一个解析步骤 `listGateApprovals({ gate, version })`，按 label +
@@ -153,9 +158,10 @@ verifyGateApproval(input: {
   `platform`/`template`、id pattern 不符、`path` 为绝对路径或含 `..` 均失败；impact 缺
   `base`/`head`/`breaking` 失败。
 - **validate 语义**：重复 id / 重复或互为前缀的 path / `template`↔`ci` 不配对 → 非零退出。
-- **provenance**（mock octokit + 假 git）：指定 PR 已合并且 CODEOWNER 批准、blob 一致 → ok；
-  label 与 gate/version 不符 → fail；过期审批 / 非 CODEOWNER → fail；API 抛错 → fail closed；
-  blob 不一致 → fail。
+- **provenance**（mock octokit + 假 git）：指定 PR 已合并且 CODEOWNER 批准、`artifactPath`
+  在该 PR changed files 中且 blob 一致 → ok；**文件仅存在于 merge tree、不在该 PR changed
+  files → fail**；label 与 gate/version 不符 → fail；过期审批 / 非 CODEOWNER → fail；
+  API 抛错 → fail closed；blob 不一致 → fail。
 
 ## 6. 交付文件树
 
