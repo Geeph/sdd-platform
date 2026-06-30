@@ -1,0 +1,7 @@
+base: abc123
+head: def456
+breaking: false
+platforms:
+  backend: true
+  web: false
+  ios: false

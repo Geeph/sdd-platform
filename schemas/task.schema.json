@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sdd.dev/schemas/task.schema.json",
+  "title": "SDD Task",
+  "description": "A single task emitted by a platform strategy.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["common", "backend", "web", "ios", "android"]
+    },
+    "track": {
+      "type": "string",
+      "enum": ["spec", "design", "contract", "code"]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "references": {
+      "type": "object",
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^REQ-[A-Z0-9]+-\\d+$"
+          }
+        },
+        "screens": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^SCR-[A-Z0-9-]+$"
+          }
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+      }
+    }
+  },
+  "required": ["id", "platform", "track", "title"],
+  "additionalProperties": false
+}

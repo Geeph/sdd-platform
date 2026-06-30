@@ -1,0 +1,17 @@
+id: ios.auth.login-screen
+platform: ios
+track: code
+title: Implement login screen
+scope:
+  - Build the SwiftUI login flow
+acceptance:
+  - Matches design screen SCR-LOGIN
+references:
+  requirements:
+    - REQ-AUTH-001
+  screens:
+    - SCR-LOGIN
+  operations:
+    - loginUser
+depends_on:
+  - common.contract.login

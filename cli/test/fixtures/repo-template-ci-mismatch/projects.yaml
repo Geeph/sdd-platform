@@ -1,0 +1,10 @@
+schema_version: 1
+product: demo
+repository_mode: monorepo
+components:
+  - id: backend
+    path: apps/backend
+    template: spring-boot
+    template_ref: v1.0.0
+    owner: backend-team
+    ci: web

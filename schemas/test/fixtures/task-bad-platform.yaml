@@ -1,0 +1,4 @@
+id: ios.auth.login-screen
+platform: solaris
+track: code
+title: Bad platform
