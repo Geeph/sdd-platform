@@ -1,0 +1,56 @@
+name: "📥 Intake — 新功能 / 改进"
+description: "提出一个产品需求，由 SDD 工作流进入 Gate 链路。"
+title: "[intake] "
+labels: ["track:spec", "type:epic"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "问题与目标"
+      description: "用户要解决什么问题？成功是什么样子？"
+      placeholder: "作为 <角色>，我希望 <能力>，以便 <价值>。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: users-scenarios
+    attributes:
+      label: "用户与场景"
+      description: "主要用户画像与关键使用场景（至少 1 个）。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: "范围与排除项"
+      description: "本期做什么、不做什么；明确 out-of-scope。"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: platforms
+    attributes:
+      label: "平台范围"
+      description: "本需求影响哪些平台？"
+      options:
+        - label: "Backend"
+        - label: "Web"
+        - label: "iOS"
+        - label: "Android"
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "合规 / 安全 / 性能约束"
+      description: "列出任何监管、隐私、安全、性能、兼容性约束。"
+    validations:
+      required: false
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: "未决问题"
+      description: "评审中需要回答的关键问题。"
+    validations:
+      required: false
