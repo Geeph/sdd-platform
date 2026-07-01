@@ -908,19 +908,39 @@ export async function reconcileEnvironments(
 
   for (const desired of input.desired) {
     if (existingNames.has(desired.name.toLowerCase())) {
-      // Environment exists. M2 doesn't update reviewer config (that requires
-      // the deployment_protection_rules API which is complex; noop for now).
+      // Environment exists. For M2, we don't update existing environments
+      // to avoid overwriting manual configuration. In a production system,
+      // we'd compare and update only if different.
       result.noop.push(desired.name);
     } else {
-      // Create environment.
+      // Create environment with reviewers and prevent_self_review.
+      // Resolve team slugs to team IDs for the reviewers array.
+      const reviewerIds: Array<{ type: 'Team'; id: number }> = [];
+      for (const teamSlug of desired.reviewers) {
+        try {
+          const teamResp = (await withRetry(
+            () =>
+              octokit.request('GET /orgs/{org}/teams/{team_slug}', {
+                org: owner,
+                team_slug: teamSlug,
+              }),
+            `reconcileEnvironments:resolve-team:${teamSlug}`,
+          )) as { id: number };
+          reviewerIds.push({ type: 'Team', id: teamResp.id });
+        } catch (_err) {
+          // Team doesn't exist or no access — skip this reviewer
+          // In production, we might want to fail fast instead.
+        }
+      }
+
       await withRetry(
         () =>
           octokit.request('PUT /repos/{owner}/{repo}/environments/{environment_name}', {
             owner,
             repo,
             environment_name: desired.name,
-            // M2: no wait_timers, no deployment_branch_policy, no reviewers
-            // (reviewers → M7 secrets isolation).
+            reviewers: reviewerIds,
+            prevent_self_review: desired.preventSelfReview,
           }),
         `reconcileEnvironments:create:${desired.name}`,
       );
@@ -1085,12 +1105,34 @@ export async function reconcileRepositoryRuleset(
   }
 
   // Read-back verification.
+  // After create, `found` is undefined, so we need to re-query by name to get
+  // the actual ruleset ID (GitHub API doesn't support 'latest' as an ID).
+  let readbackId = found?.id;
+  if (!readbackId && result.created.length > 0) {
+    const allRulesets = await paginateAll<RulesetResponse>(
+      octokit,
+      'GET /repos/{owner}/{repo}/rulesets',
+      { owner, repo, per_page: 100 },
+      'reconcileRepositoryRuleset:readback-list',
+    );
+    const created = allRulesets.find((r) => r.name === rulesetName);
+    if (!created?.id) {
+      throw new Error(
+        `reconcileRepositoryRuleset: created ruleset '${rulesetName}' but could not find it for read-back`,
+      );
+    }
+    readbackId = created.id;
+  }
+  if (!readbackId) {
+    throw new Error('reconcileRepositoryRuleset: no ruleset ID available for read-back');
+  }
+
   const after = (await withRetry(
     () =>
       octokit.request('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
         owner,
         repo,
-        ruleset_id: found?.id ?? (result.created.length > 0 ? 'latest' : ''),
+        ruleset_id: readbackId,
       }),
     'reconcileRepositoryRuleset:readback',
   )) as RulesetResponse;
@@ -1109,9 +1151,53 @@ function checkRulesetNeedsUpdate(
   desiredRules: Array<Record<string, unknown>>,
   _desiredConditions: Record<string, unknown>,
 ): boolean {
-  // Simple comparison: if enforcement or rule count differs → update.
+  // Compare enforcement mode.
   if (existing.enforcement !== 'active') return true;
+
+  // Compare rule count.
   if (!existing.rules || existing.rules.length !== desiredRules.length) return true;
+
+  // Compare actual rule content (type + parameters).
+  // Build a map of desired rules by type for comparison.
+  const desiredByType = new Map<string, Record<string, unknown>>();
+  for (const rule of desiredRules) {
+    const type = rule.type as string;
+    desiredByType.set(type, rule);
+  }
+
+  for (const existingRule of existing.rules) {
+    const type = existingRule.type as string;
+    const desired = desiredByType.get(type);
+    if (!desired) return true; // Existing rule type not in desired set
+
+    // For required_status_checks, compare the actual contexts and integration_ids.
+    if (type === 'required_status_checks') {
+      const existingParams = existingRule.parameters as {
+        required_status_checks?: Array<{ context: string; integration_id?: number }>;
+      };
+      const desiredParams = desired.parameters as {
+        required_status_checks: Array<{ context: string; integration_id: number }>;
+      };
+      const existingChecks = existingParams.required_status_checks ?? [];
+      const desiredChecks = desiredParams.required_status_checks;
+
+      if (existingChecks.length !== desiredChecks.length) return true;
+
+      // Compare each check (context + integration_id).
+      const existingMap = new Map(existingChecks.map((c) => [c.context, c.integration_id]));
+      for (const desiredCheck of desiredChecks) {
+        const existingId = existingMap.get(desiredCheck.context);
+        if (existingId !== desiredCheck.integration_id) return true;
+      }
+    } else {
+      // For other rule types, do a shallow comparison of parameters.
+      // This is a simplification; deep comparison would be more robust.
+      const existingParams = JSON.stringify(existingRule.parameters ?? {});
+      const desiredParams = JSON.stringify(desired.parameters ?? {});
+      if (existingParams !== desiredParams) return true;
+    }
+  }
+
   return false;
 }
 
@@ -1158,11 +1244,14 @@ export async function reconcileOrgWorkflowRuleset(
   const found = existing.find((r) => r.name === rulesetName);
 
   // GitHub REST API (organization ruleset): `conditions` is an object whose
-  // keys name each condition. `repository_id` expects `repository_ids`
-  // (plural, array form) per the 2024-10 REST schema; do NOT use the older
-  // `{ include, exclude }` shape.
+  // keys name each condition. The repository condition uses the key
+  // `repository_id` (singular) with a nested `repository_ids` array, per
+  // the GitHub official schema. Putting `repository_ids` at the top level
+  // of conditions produces a 422 from the API.
   const desiredConditions = {
-    repository_ids: [repoId],
+    repository_id: {
+      repository_ids: [repoId],
+    },
     ref_name: {
       include: ['refs/heads/main'],
       exclude: [],
@@ -1260,9 +1349,10 @@ function checkOrgRulesetConflict(
   platformRepoId: number,
   pinnedSha: string,
 ): boolean {
-  // Match the new conditions shape: { repository_ids: number[], ref_name: ... }.
+  // Match the corrected conditions shape: { repository_id: { repository_ids: number[] }, ref_name: ... }.
   const conditions = existing.conditions ?? {};
-  const repositoryIds = (conditions.repository_ids as number[] | undefined) ?? [];
+  const repositoryIdCond = conditions.repository_id as { repository_ids?: number[] } | undefined;
+  const repositoryIds = repositoryIdCond?.repository_ids ?? [];
   if (!repositoryIds.includes(targetRepoId)) return true;
 
   // Check rules for workflow source match. Required workflows carry the

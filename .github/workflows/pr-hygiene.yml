@@ -26,11 +26,18 @@ on:
   pull_request:
     branches: [main]
 
-# Platform identity — kept in sync with the org ruleset's pinned SHA.
-# Update together with `reconcileOrgWorkflowRuleset` in factory.
+# Platform identity — derived from the workflow's own identity.
+# For organization required workflows, `github.workflow_sha` is the pinned
+# commit from the ruleset, and `github.workflow_ref` contains the source
+# repository. This closes the pin loop: the workflow runs from exactly the
+# commit that the ruleset pinned, not from a movable branch like `main`.
+#
+# SDD_PLATFORM_REPO is still needed because actions/checkout requires an
+# explicit repository. It MUST match the source repo configured in the
+# organization ruleset; if they drift, the workflow will fail or produce
+# incorrect results.
 env:
-  SDD_PLATFORM_REPO: Geeph/sdd-platform
-  SDD_PLATFORM_REF: main   # TODO: pin to a full 40-char commit once the first release is cut
+  SDD_PLATFORM_REPO: Geeph/sdd-platform   # MUST match org ruleset source repo
 
 permissions:
   contents: read
@@ -41,14 +48,16 @@ jobs:
     name: PR hygiene
     runs-on: ubuntu-latest
     steps:
-      # Checkout the PLATFORM repo at the pinned SHA to get the sdd CLI.
-      # This is NOT the product PR — we use explicit env so fork PRs cannot
-      # redirect the checkout (§3.6 / D10).
+      # Checkout the PLATFORM repo at the workflow's own SHA (the pinned
+      # commit from the organization ruleset). This is NOT the product PR —
+      # we use github.workflow_sha so fork PRs cannot redirect the checkout
+      # (§3.6 / D10), and so the workflow version is always tied to the
+      # ruleset pin.
       - name: checkout platform repo
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SDD_PLATFORM_REPO }}
-          ref: ${{ env.SDD_PLATFORM_REF }}
+          ref: ${{ github.workflow_sha }}
           path: platform
 
       - name: setup node

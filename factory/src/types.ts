@@ -167,11 +167,16 @@ export interface ObservedState {
   /**
    * Source identity of the org workflow ruleset (recovered during observe).
    * Used by finalize to verify the pinned workflow source has not drifted.
+   * Contains ALL workflows from the ruleset, not just the first, so we can
+   * verify both CI Gate and PR hygiene are pinned correctly.
    */
   orgWorkflowRulesetSource?: {
-    repositoryId: number;
-    path: string;
-    sha: string;
+    /** All workflows pinned in the ruleset. */
+    workflows: ReadonlyArray<{
+      repositoryId: number;
+      path: string;
+      sha: string;
+    }>;
     /** Targeted repo id; must equal `repository.id` for the ruleset to be ours. */
     targetRepoId?: number;
     /** Targeted branch pattern; expected `refs/heads/main`. */
@@ -199,6 +204,12 @@ export interface GitHubReadPort {
   resolveCommit(repo: RepoRef, ref: string): Promise<ResolvedCommit>;
   readTemplateTree(repo: RepoRef, commit: string, path: string): Promise<ReadonlyTree>;
   observe(input: ProductInitInput): Promise<ObservedState>;
+  /**
+   * Resolve a team slug to its member user logins. Used by finalizeProtection
+   * to verify that reviewers are members of bootstrap approver teams.
+   * Returns an empty array if the team doesn't exist or has no members.
+   */
+  resolveTeamMembers?(org: string, teamSlug: string): Promise<string[]>;
 }
 
 // ---- GitHub write port (real execution only) -----------------------------

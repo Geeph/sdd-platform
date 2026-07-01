@@ -351,7 +351,8 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
 
           // Recover source identity from the `workflows` rule parameters.
           const conditions = found.conditions ?? {};
-          const targetRepoIds = (conditions.repository_ids as number[] | undefined) ?? [];
+          const repoIdCond = conditions.repository_id as { repository_ids?: number[] } | undefined;
+          const targetRepoIds = repoIdCond?.repository_ids ?? [];
           const refName = conditions.ref_name as { include?: string[] } | undefined;
           const targetRefPattern = refName?.include?.[0];
 
@@ -360,12 +361,14 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
             const params = workflowsRule.parameters as {
               workflows?: Array<{ repository_id: number; path: string; sha: string }>;
             };
-            const first = params.workflows?.[0];
-            if (first) {
+            const allWorkflows = params.workflows ?? [];
+            if (allWorkflows.length > 0) {
               const source: NonNullable<ObservedState['orgWorkflowRulesetSource']> = {
-                repositoryId: first.repository_id,
-                path: first.path,
-                sha: first.sha,
+                workflows: allWorkflows.map((wf) => ({
+                  repositoryId: wf.repository_id,
+                  path: wf.path,
+                  sha: wf.sha,
+                })),
               };
               if (targetRepoIds[0] !== undefined) source.targetRepoId = targetRepoIds[0];
               if (targetRefPattern !== undefined) source.targetRefPattern = targetRefPattern;
@@ -520,6 +523,28 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
         result.bootstrapCheckRuns = bootstrapCheckRuns;
       }
       return result;
+    },
+
+    async resolveTeamMembers(org: string, teamSlug: string): Promise<string[]> {
+      const members: string[] = [];
+      try {
+        let page = 1;
+        while (members.length < 1000) {
+          const resp = (await safeRequest('GET /orgs/{org}/teams/{team_slug}/members', {
+            org,
+            team_slug: teamSlug,
+            per_page: 100,
+            page,
+          })) as Array<{ login: string }>;
+          if (!Array.isArray(resp) || resp.length === 0) break;
+          for (const m of resp) members.push(m.login);
+          if (resp.length < 100) break;
+          page++;
+        }
+      } catch {
+        // Team doesn't exist or no access — return empty
+      }
+      return members;
     },
   };
 }

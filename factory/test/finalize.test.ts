@@ -56,9 +56,14 @@ function happyObserved(overrides: Partial<ObservedState> = {}): ObservedState {
     orgWorkflowRulesetExists: true,
     orgWorkflowRulesetEnforcement: 'evaluate',
     orgWorkflowRulesetSource: {
-      repositoryId: PLATFORM_REPO_ID,
-      path: '.github/workflows/ci-gate.yml',
-      sha: PINNED_SHA,
+      workflows: [
+        { repositoryId: PLATFORM_REPO_ID, path: '.github/workflows/ci-gate.yml', sha: PINNED_SHA },
+        {
+          repositoryId: PLATFORM_REPO_ID,
+          path: '.github/workflows/pr-hygiene.yml',
+          sha: PINNED_SHA,
+        },
+      ],
       targetRepoId: REPOSITORY.id,
       targetRefPattern: 'refs/heads/main',
     },
@@ -345,9 +350,18 @@ describe('finalizeProtection', () => {
     const reader = createFakeReader(
       happyObserved({
         orgWorkflowRulesetSource: {
-          repositoryId: PLATFORM_REPO_ID,
-          path: '.github/workflows/ci-gate.yml',
-          sha: 'd'.repeat(40), // different from template.lock's PINNED_SHA
+          workflows: [
+            {
+              repositoryId: PLATFORM_REPO_ID,
+              path: '.github/workflows/ci-gate.yml',
+              sha: 'd'.repeat(40), // different from template.lock's PINNED_SHA
+            },
+            {
+              repositoryId: PLATFORM_REPO_ID,
+              path: '.github/workflows/pr-hygiene.yml',
+              sha: PINNED_SHA,
+            },
+          ],
           targetRepoId: REPOSITORY.id,
           targetRefPattern: 'refs/heads/main',
         },
@@ -363,9 +377,18 @@ describe('finalizeProtection', () => {
     const reader = createFakeReader(
       happyObserved({
         orgWorkflowRulesetSource: {
-          repositoryId: PLATFORM_REPO_ID,
-          path: '.github/workflows/ci-gate.yml',
-          sha: PINNED_SHA,
+          workflows: [
+            {
+              repositoryId: PLATFORM_REPO_ID,
+              path: '.github/workflows/ci-gate.yml',
+              sha: PINNED_SHA,
+            },
+            {
+              repositoryId: PLATFORM_REPO_ID,
+              path: '.github/workflows/pr-hygiene.yml',
+              sha: PINNED_SHA,
+            },
+          ],
           targetRepoId: 77777, // not our repo
           targetRefPattern: 'refs/heads/main',
         },

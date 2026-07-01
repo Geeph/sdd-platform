@@ -547,10 +547,54 @@ async function verifyUpstreamReference(
   }
 
   if (UPSTREAM_SHA_REF_RE.test(reference)) {
+    // SHA reference: verify it's reachable from main AND came from a PR with
+    // the correct gate label. We use GitHub's "list PRs associated with a
+    // commit" API to find the source PR.
     const reachable = await isCommitReachableFromBase(octokit, repo, reference, baseSha);
     if (!reachable) {
       return { ok: false, reason: `commit ${reference.slice(0, 8)} is not reachable from main` };
     }
+
+    // Find PRs associated with this commit.
+    let associatedPrs: Array<{
+      number: number;
+      state: string;
+      merged_at: string | null;
+      labels: Array<{ name: string }>;
+      base: { ref: string };
+    }>;
+    try {
+      associatedPrs = (await octokit.request(
+        'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls',
+        {
+          owner: repo.owner,
+          repo: repo.repo,
+          commit_sha: reference,
+        },
+      )) as typeof associatedPrs;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `commit ${reference.slice(0, 8)}: could not fetch associated PRs: ${(err as Error).message}`,
+      };
+    }
+
+    // Find a merged PR that targets main and has the correct gate label.
+    const validPr = associatedPrs.find(
+      (pr) =>
+        pr.state === 'closed' &&
+        pr.merged_at !== null &&
+        pr.base.ref === 'main' &&
+        pr.labels.some((l) => l.name === expectedLabel),
+    );
+
+    if (!validPr) {
+      return {
+        ok: false,
+        reason: `commit ${reference.slice(0, 8)} is not from a merged PR with label '${expectedLabel}'`,
+      };
+    }
+
     return { ok: true };
   }
 

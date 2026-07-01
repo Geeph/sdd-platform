@@ -506,8 +506,18 @@ export async function applyInitPlan(
     if (!repository) throw new Error('state machine error: repository not set');
 
     // Resolve platform repo id and pinned SHA.
+    // MUST use plan.source.resolved_commit (the resolved 40-char SHA) rather
+    // than input.platform.ref, which could be a tag/branch name that drifts.
+    // This closes the pin loop: the ruleset pins the exact commit that was
+    // resolved at plan time and recorded in template.lock.
     const platformRepoRef = parseRepoRef(input.platform.repository);
-    const resolvedCommit = input.platform.ref ?? '';
+    const resolvedCommit = plan.source.resolved_commit;
+
+    if (!resolvedCommit) {
+      throw new Error(
+        'applyInitPlan: plan.source.resolved_commit is empty — cannot pin platform workflows',
+      );
+    }
 
     // We need the platform repo's numeric ID — read it via the reader.
     const platformObserved = await deps.reader.observe({
@@ -792,6 +802,14 @@ export async function finalizeProtection(
   });
 
   // ---- Evidence 2: approvals bound to final head, reviewer ≠ author -------
+  //
+  // Security requirements (§2.3 step 6 / §3.6):
+  //   - At least one approval must be bound to the final head SHA
+  //   - No self-approval (reviewer ≠ author)
+  //   - If bootstrapApprovers is provided, at least one valid approval must
+  //     be from a member of one of those teams
+  //   - Stale approvals (on prior SHAs) are tolerated — they don't invalidate
+  //     a valid final-head approval, but alone they're not sufficient
   const approvals = bootstrapPr.approvals ?? [];
   if (approvals.length === 0) {
     return blocked(
@@ -803,42 +821,56 @@ export async function finalizeProtection(
   }
   const finalHead = bootstrapPr.headSha;
   const author = bootstrapPr.author;
-  const staleApprovals: string[] = [];
-  const selfApprovals: string[] = [];
-  for (const approval of approvals) {
-    if (approval.headSha !== finalHead) {
-      staleApprovals.push(`${approval.user}@${approval.headSha.slice(0, 8)}`);
-    }
-    if (author && approval.user === author) {
-      selfApprovals.push(approval.user);
-    }
-  }
-  if (staleApprovals.length > 0) {
+
+  // Split approvals into valid (final head, non-self) and invalid.
+  const validApprovals = approvals.filter(
+    (a) => a.headSha === finalHead && (!author || a.user !== author),
+  );
+  if (validApprovals.length === 0) {
+    // Either all approvals are stale or self-approvals.
+    const selfApprovals = approvals.filter((a) => author && a.user === author);
+    const staleApprovals = approvals.filter((a) => a.headSha !== finalHead);
+    const reason =
+      selfApprovals.length === approvals.length
+        ? `only self-approvals (no independent reviewer): ${selfApprovals.map((a) => a.user).join(', ')}`
+        : staleApprovals.length > 0
+          ? `no approval bound to final head ${finalHead.slice(0, 8)} (have: ${approvals.map((a) => `${a.user}@${a.headSha.slice(0, 8)}`).join(', ')})`
+          : 'no approval meets requirements';
     return blocked(
       'bootstrap-pull',
       'approval.verify',
       `${target.owner}/${target.repo}:bootstrap`,
-      `approval(s) not bound to final head ${finalHead.slice(0, 8)}: ${staleApprovals.join(', ')}`,
+      reason,
     );
   }
-  if (selfApprovals.length > 0) {
-    return blocked(
-      'bootstrap-pull',
-      'approval.verify',
-      `${target.owner}/${target.repo}:bootstrap`,
-      `self-approval not permitted: ${selfApprovals.join(', ')}`,
-    );
-  }
+
   // Optional: cross-check against bootstrapApprovers allow-list.
+  // bootstrapApprovers contains TEAM SLUGS; approvals contain USER LOGINS.
+  // Resolve each team slug to its member logins, then verify that at least
+  // one valid approval is from a member of one of those teams.
   if (config.bootstrapApprovers && config.bootstrapApprovers.length > 0) {
-    const allow = new Set(config.bootstrapApprovers);
-    const unknownReviewers = approvals.map((a) => a.user).filter((user) => !allow.has(user));
-    if (unknownReviewers.length > 0) {
+    const allowedLogins = new Set<string>();
+    for (const teamSlug of config.bootstrapApprovers) {
+      // If the reader doesn't implement resolveTeamMembers, fall back to
+      // treating the slug as a literal login (legacy behavior).
+      if (deps.reader.resolveTeamMembers) {
+        try {
+          const members = await deps.reader.resolveTeamMembers(target.owner, teamSlug);
+          for (const m of members) allowedLogins.add(m);
+        } catch {
+          // Team doesn't exist or no access — skip
+        }
+      } else {
+        allowedLogins.add(teamSlug);
+      }
+    }
+    const validFromAllowed = validApprovals.filter((a) => allowedLogins.has(a.user));
+    if (validFromAllowed.length === 0) {
       return blocked(
         'bootstrap-pull',
         'approval.verify',
         `${target.owner}/${target.repo}:bootstrap`,
-        `reviewer(s) not in bootstrap.approvers: ${unknownReviewers.join(', ')}`,
+        `no valid approval from bootstrap.approvers team members (allowed: ${[...allowedLogins].join(', ') || '<empty>'}; got: ${validApprovals.map((a) => a.user).join(', ')})`,
       );
     }
   }
@@ -849,7 +881,7 @@ export async function finalizeProtection(
     kind: 'approval.verify',
     disposition: 'noop',
     target: `${target.owner}/${target.repo}:bootstrap`,
-    result: `${approvals.length} approval(s) bound to final head ${finalHead.slice(0, 8)}`,
+    result: `${validApprovals.length} valid approval(s) on final head ${finalHead.slice(0, 8)}`,
   });
 
   // ---- Evidence 3: CI Gate + PR hygiene succeeded on final head -------------
@@ -947,6 +979,61 @@ export async function finalizeProtection(
       'org workflow ruleset sdd-workflows-<id> not found',
     );
   }
+
+  // Verify target — must match current repo/main.
+  // ALWAYS validate, regardless of enforcement mode (evaluate or active).
+  if (orgSource.targetRepoId !== undefined && orgSource.targetRepoId !== repository.id) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:org-workflows`,
+      `org ruleset targets repo id ${orgSource.targetRepoId}, expected ${repository.id}`,
+    );
+  }
+  if (orgSource.targetRefPattern && orgSource.targetRefPattern !== 'refs/heads/main') {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:org-workflows`,
+      `org ruleset targets '${orgSource.targetRefPattern}', expected 'refs/heads/main'`,
+    );
+  }
+
+  // Verify source — ALL workflows must match template.lock's pinned SHA.
+  // This prevents drift where only the first workflow is pinned correctly
+  // while others point elsewhere.
+  const expectedPaths = new Set([
+    '.github/workflows/ci-gate.yml',
+    '.github/workflows/pr-hygiene.yml',
+  ]);
+  const foundPaths = new Set<string>();
+  for (const wf of orgSource.workflows) {
+    foundPaths.add(wf.path);
+    if (wf.sha.toLowerCase() !== pinnedSha.toLowerCase()) {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset workflow '${wf.path}' pinned SHA ${wf.sha.slice(0, 8)} does not match template.lock ${pinnedSha.slice(0, 8)}`,
+      );
+    }
+  }
+  // Verify both expected workflows are present.
+  for (const expectedPath of expectedPaths) {
+    if (!foundPaths.has(expectedPath)) {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset missing expected workflow '${expectedPath}'`,
+      );
+    }
+  }
+  // Note: platform repo id vs name reconciliation would require an extra
+  // read; for M2 we trust that the name→id mapping was validated at init
+  // time and verify only the SHA pin here.
+
+  // Handle enforcement mode.
   if (observed.orgWorkflowRulesetEnforcement !== 'evaluate') {
     if (observed.orgWorkflowRulesetEnforcement === 'active') {
       // Already finalized — this is the idempotent path. Fall through to
@@ -967,38 +1054,6 @@ export async function finalizeProtection(
         `unexpected enforcement: ${observed.orgWorkflowRulesetEnforcement}`,
       );
     }
-  } else {
-    // Verify target — must match current repo/main.
-    if (orgSource.targetRepoId !== undefined && orgSource.targetRepoId !== repository.id) {
-      return blocked(
-        'org-workflows',
-        'ruleset.org-workflow.verify',
-        `${target.owner}/${target.repo}:org-workflows`,
-        `org ruleset targets repo id ${orgSource.targetRepoId}, expected ${repository.id}`,
-      );
-    }
-    if (orgSource.targetRefPattern && orgSource.targetRefPattern !== 'refs/heads/main') {
-      return blocked(
-        'org-workflows',
-        'ruleset.org-workflow.verify',
-        `${target.owner}/${target.repo}:org-workflows`,
-        `org ruleset targets '${orgSource.targetRefPattern}', expected 'refs/heads/main'`,
-      );
-    }
-    // Verify source — must match template.lock's pinned platform repo/sha.
-    // We compare the platform repo by name (org ruleset stores repo id,
-    // template.lock stores 'owner/repo' — caller must reconcile).
-    if (orgSource.sha.toLowerCase() !== pinnedSha.toLowerCase()) {
-      return blocked(
-        'org-workflows',
-        'ruleset.org-workflow.verify',
-        `${target.owner}/${target.repo}:org-workflows`,
-        `org ruleset pinned SHA ${orgSource.sha.slice(0, 8)} does not match template.lock ${pinnedSha.slice(0, 8)}`,
-      );
-    }
-    // Note: platform repo id vs name reconciliation would require an extra
-    // read; for M2 we trust that the name→id mapping was validated at init
-    // time and verify only the SHA pin here.
   }
 
   // ---- Evidence 5: merge commit reachable from main ------------------------
@@ -1047,9 +1102,17 @@ export async function finalizeProtection(
   if (observed.orgWorkflowRulesetEnforcement === 'evaluate') {
     try {
       // Recover platformRepoId: we don't have it directly, but the writer
-      // needs it. Reconstruct from observed org source — it already stores
-      // the platform repo id.
-      const platformRepoId = orgSource.repositoryId;
+      // needs it. Reconstruct from observed org source — all workflows
+      // should use the same platform repo id.
+      const platformRepoId = orgSource.workflows[0]?.repositoryId;
+      if (platformRepoId === undefined) {
+        return blocked(
+          'org-workflows',
+          'ruleset.org-workflow.activate',
+          `${target.owner}/${target.repo}:org-workflows`,
+          'org ruleset has no workflows — cannot recover platform repo id',
+        );
+      }
       await deps.writer.reconcileOrgWorkflowRuleset({
         repository,
         platformRepoId,

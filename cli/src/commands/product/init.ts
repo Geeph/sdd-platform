@@ -65,8 +65,8 @@ export default class ProductInit extends Command {
         'Platform repo release tag or full commit SHA (optional in dry-run; required for real execution)',
     }),
     config: Flags.string({
-      description: 'Path to product-init.yaml',
-      required: true,
+      description:
+        'Path to product-init.yaml (required for init; optional for --finalize-protection)',
     }),
     format: Flags.string({
       description: 'Output format',
@@ -94,12 +94,18 @@ export default class ProductInit extends Command {
   async run(): Promise<void> {
     const { flags, args } = await this.parse(ProductInit);
 
-    if (!flags['dry-run'] && !flags['platform-ref']) {
+    if (!flags['dry-run'] && !flags['platform-ref'] && !flags['finalize-protection']) {
       this.error('--platform-ref is required for real execution', { exit: 2 });
     }
     const githubToken = flags['dry-run'] ? undefined : process.env.GITHUB_TOKEN;
     if (!flags['dry-run'] && !githubToken) {
       this.error('GITHUB_TOKEN environment variable is required', { exit: 2 });
+    }
+
+    // --finalize-protection doesn't need --config (it recovers pin from template.lock)
+    // but if provided, we use it for bootstrap.approvers. All other paths require --config.
+    if (!flags['finalize-protection'] && !flags.config) {
+      this.error('--config is required for init (optional for --finalize-protection)', { exit: 2 });
     }
 
     // Detect whether user passed --platform-repo explicitly.
@@ -132,24 +138,36 @@ export default class ProductInit extends Command {
     }
 
     // Load + validate the product-init.yaml config.
-    let rawConfig: unknown;
-    try {
-      const configPath = resolve(flags.config);
-      const content = await readFile(configPath, 'utf8');
-      rawConfig = parseYaml(content);
-    } catch (err) {
-      this.error(`Failed to read --config: ${(err as Error).message}`, { exit: 2 });
-    }
-    const configResult = await validateProductInitDocument(rawConfig);
-    if (!configResult.ok) {
-      for (const e of configResult.errors) {
-        this.error(`${flags.config}${e.path}: ${e.message} (${e.keyword})`, {
-          exit: false,
-        });
+    // For --finalize-protection, --config is optional; if not provided, use
+    // a minimal config with empty bootstrap.approvers.
+    let config: ProductInitConfig;
+    if (flags.config) {
+      let rawConfig: unknown;
+      try {
+        const configPath = resolve(flags.config);
+        const content = await readFile(configPath, 'utf8');
+        rawConfig = parseYaml(content);
+      } catch (err) {
+        this.error(`Failed to read --config: ${(err as Error).message}`, { exit: 2 });
       }
-      this.exit(2);
+      const configResult = await validateProductInitDocument(rawConfig);
+      if (!configResult.ok) {
+        for (const e of configResult.errors) {
+          this.error(`${flags.config}${e.path}: ${e.message} (${e.keyword})`, {
+            exit: false,
+          });
+        }
+        this.exit(2);
+      }
+      config = validateProductInitConfig(rawConfig as ProductInitConfig);
+    } else {
+      // --finalize-protection without --config: use minimal config.
+      config = {
+        schema_version: 1,
+        bootstrap: { approvers: [] },
+        owners: { product: '', api: '', design: '', admins: '' },
+      };
     }
-    const config = validateProductInitConfig(rawConfig as ProductInitConfig);
 
     // Visibility: CLI flag not exposed in M2a, fall back to config or default.
     const visibility = config.repository?.visibility ?? 'private';
@@ -211,11 +229,7 @@ export default class ProductInit extends Command {
         const reader = createReadonlyGitHubPort(client);
         const writer = createWriteGitHubPort(client);
         const plan = await compileInitPlan(input, reader);
-        const result = await applyInitPlan(input, plan, {
-          reader,
-          writer,
-          stopAfterSnapshot: true,
-        });
+        const result = await applyInitPlan(input, plan, { reader, writer });
         if (flags.format === 'json') {
           process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         } else {
@@ -226,6 +240,7 @@ export default class ProductInit extends Command {
         );
         if (hasConflict) process.exitCode = 5;
         else if (result.nextAction === 'blocked') process.exitCode = 3;
+        else if (result.nextAction === 'await-human-merge') process.exitCode = 4;
         return;
       }
 

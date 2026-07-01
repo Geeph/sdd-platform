@@ -703,8 +703,15 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('creates initial ruleset with conditions as an object (not array)', async () => {
     const responses = new Map<string, unknown>();
-    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
-    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    let created = false;
+    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
+      // Return empty initially, then return the created ruleset after POST
+      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
+    });
+    responses.set('POST /repos/{owner}/{repo}/rulesets', (params: Record<string, unknown>) => {
+      created = true;
+      return { id: 1 };
+    });
     // Read-back response
     responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
       id: 1,
@@ -728,8 +735,14 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('hardened=true adds required_status_checks with integration_id', async () => {
     const responses = new Map<string, unknown>();
-    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
-    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    let created = false;
+    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
+      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
+    });
+    responses.set('POST /repos/{owner}/{repo}/rulesets', () => {
+      created = true;
+      return { id: 1 };
+    });
     responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
       id: 1,
       name: 'sdd-main',
@@ -761,8 +774,14 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('hardened without explicit integration_id defaults to 15368 (GitHub Actions)', async () => {
     const responses = new Map<string, unknown>();
-    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
-    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    let created = false;
+    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
+      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
+    });
+    responses.set('POST /repos/{owner}/{repo}/rulesets', () => {
+      created = true;
+      return { id: 1 };
+    });
     responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
       id: 1,
       name: 'sdd-main',
@@ -796,7 +815,7 @@ describe('reconcileOrgWorkflowRuleset', () => {
     visibility: 'private',
   };
 
-  it('uses repository_ids (plural) and sha: for pinned commit', async () => {
+  it('uses repository_id.repository_ids (nested) and sha: for pinned commit', async () => {
     const responses = new Map<string, unknown>();
     responses.set('GET /orgs/{org}/rulesets', []);
     responses.set('POST /orgs/{org}/rulesets', { id: 1 });
@@ -824,9 +843,9 @@ describe('reconcileOrgWorkflowRuleset', () => {
     // conditions must be an object, not an array (P0 #2 fix)
     expect(Array.isArray(params.conditions)).toBe(false);
 
-    // Must use repository_ids (plural, array form), NOT repository_id: {include: ...}
-    expect(params.conditions.repository_ids).toEqual([12345]);
-    expect(params.conditions.repository_id).toBeUndefined();
+    // Must use repository_id.repository_ids (nested form per GitHub official schema)
+    const repoIdCond = params.conditions.repository_id as { repository_ids?: number[] } | undefined;
+    expect(repoIdCond?.repository_ids).toEqual([12345]);
 
     // ref_name is a nested condition inside the same conditions object
     expect(params.conditions.ref_name).toEqual({
@@ -860,7 +879,7 @@ describe('reconcileOrgWorkflowRuleset', () => {
         id: 1,
         name: 'sdd-workflows-12345',
         enforcement: 'evaluate',
-        conditions: { repository_ids: [12345] },
+        conditions: { repository_id: { repository_ids: [12345] } },
         rules: [],
       },
     ]);
@@ -896,7 +915,7 @@ describe('reconcileOrgWorkflowRuleset', () => {
         id: 1,
         name: 'sdd-workflows-12345',
         enforcement: 'evaluate',
-        conditions: { repository_ids: [77777] }, // different repo id
+        conditions: { repository_id: { repository_ids: [77777] } }, // different repo id
         rules: [],
       },
     ]);
@@ -919,7 +938,7 @@ describe('reconcileOrgWorkflowRuleset', () => {
         id: 1,
         name: 'sdd-workflows-12345',
         enforcement: 'evaluate',
-        conditions: { repository_ids: [12345] },
+        conditions: { repository_id: { repository_ids: [12345] } },
         rules: [
           {
             type: 'workflows',
