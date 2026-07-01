@@ -102,8 +102,21 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
     // Extract gate labels.
     const gateLabels = pr.labels.map((l) => l.name).filter((name) => GATE_LABEL_RE.test(name));
 
-    // Non-Gate PR: only generic checks, pass.
+    // Fetch changed files (full pagination) — needed for both Gate and
+    // Scaffold PR detection.
+    const changedFiles = await fetchAllChangedFiles(input.octokit, input.repo, input.pr);
+
+    // Non-Gate PR: check if this is a Scaffold PR (D24), else generic only.
     if (gateLabels.length === 0) {
+      // Scaffold PR detection: any NEW apps/**/template.lock file indicates
+      // a Scaffold PR. Scaffold PRs have their own hygiene rule.
+      const newLockFiles = changedFiles.filter(
+        (f) => f.status === 'added' && /^apps\/.+\/template\.lock$/.test(f.filename),
+      );
+      if (newLockFiles.length > 0) {
+        // Run Scaffold PR hygiene checks (D24 §3.6).
+        return await checkScaffoldPrHygiene(input, changedFiles, newLockFiles);
+      }
       return { ok: true };
     }
 
@@ -155,8 +168,7 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       }
     }
 
-    // Fetch changed files (full pagination).
-    const changedFiles = await fetchAllChangedFiles(input.octokit, input.repo, input.pr);
+    // changedFiles already fetched above (line 107) for Scaffold detection.
 
     // §3.5.1: All changed specs/** paths must be under specs/<version>/.
     const version = marker.version;
@@ -387,6 +399,161 @@ function parseGateMarker(body: string): GateMarker | null {
 
   if (!marker.gate) return null;
   return marker;
+}
+
+/**
+ * Scaffold PR hygiene (D24).
+ *
+ * Identifies a PR as a Scaffold PR by the presence of at least one NEW
+ * apps/{component}/template.lock file (no gate:* label). Two layers:
+ *   1. (Layer 1) Read each new lock file on PR head, parse component/path/
+ *      template/template_ref. Read current main's projects.yaml and check
+ *      that a matching component exists (id/path/template/template_ref).
+ *      Mismatch means hygiene fail (the Scaffold PR is stale: main has been
+ *      rewritten by a subsequent Architecture Gate).
+ *   2. (Layer 2) Full D25 re-rendering against current main component and
+ *      pinned template commit. Deferred to a later iteration (requires
+ *      additional infrastructure to read platform repo at historical
+ *      template_ref commits).
+ *
+ * Both layers must pass for Scaffold PR hygiene to be ok.
+ */
+async function checkScaffoldPrHygiene(
+  input: HygieneInput,
+  changedFiles: ChangedFile[],
+  newLockFiles: ChangedFile[],
+): Promise<HygieneResult> {
+  const violations: string[] = [];
+
+  try {
+    // Read current main's projects.yaml.
+    const mainResp = (await input.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+      owner: input.repo.owner,
+      repo: input.repo.repo,
+      path: 'projects.yaml',
+      ref: 'main',
+      mediaType: { format: 'raw' },
+    })) as { content?: string; encoding?: string };
+
+    if (!mainResp.content) {
+      violations.push('projects.yaml not found on main');
+      return { ok: false, violations };
+    }
+
+    const mainYamlContent =
+      mainResp.encoding === 'base64'
+        ? Buffer.from(mainResp.content, 'base64').toString('utf8')
+        : mainResp.content;
+
+    // Parse main's projects.yaml (use YAML parser).
+    let mainProjects: {
+      components?: Array<{ id: string; path: string; template: string; template_ref: string }>;
+    };
+    try {
+      // Dynamic import to avoid a hard dependency on 'yaml' in the hygiene
+      // module's top-level imports.
+      const { parse: parseYaml } = await import('yaml');
+      mainProjects = parseYaml(mainYamlContent) as typeof mainProjects;
+    } catch {
+      violations.push('failed to parse projects.yaml on main');
+      return { ok: false, violations };
+    }
+
+    if (!mainProjects?.components) {
+      violations.push('projects.yaml on main has no components');
+      return { ok: false, violations };
+    }
+
+    // Build a lookup for main components by path.
+    const mainComponentsByPath = new Map<
+      string,
+      { id: string; path: string; template: string; template_ref: string }
+    >();
+    for (const c of mainProjects.components) {
+      mainComponentsByPath.set(c.path, c);
+    }
+
+    // Read each new lock file at PR head SHA and verify against main.
+    const headSha = (await input.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+      owner: input.repo.owner,
+      repo: input.repo.repo,
+      pull_number: input.pr,
+    })) as { head: { sha: string } };
+    const prHeadSha = headSha.head.sha;
+
+    for (const lockFile of newLockFiles) {
+      // Component path is the directory containing template.lock.
+      const componentPath = lockFile.filename.replace(/\/template\.lock$/, '');
+
+      // Read lock content at PR head.
+      const lockResp = (await input.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+        owner: input.repo.owner,
+        repo: input.repo.repo,
+        path: lockFile.filename,
+        ref: prHeadSha,
+        mediaType: { format: 'raw' },
+      })) as { content?: string; encoding?: string };
+
+      if (!lockResp.content) {
+        violations.push(`cannot read ${lockFile.filename} at PR head`);
+        continue;
+      }
+
+      const lockContent =
+        lockResp.encoding === 'base64'
+          ? Buffer.from(lockResp.content, 'base64').toString('utf8')
+          : lockResp.content;
+
+      // Parse lock YAML.
+      let lock: {
+        component?: { id: string; path: string };
+        template?: { name: string };
+        source?: { resolved_commit: string };
+      };
+      try {
+        const { parse: parseYaml } = await import('yaml');
+        lock = parseYaml(lockContent) as typeof lock;
+      } catch {
+        violations.push(`cannot parse ${lockFile.filename}`);
+        continue;
+      }
+
+      if (!lock.component || !lock.template || !lock.source) {
+        violations.push(`${lockFile.filename} is missing required fields`);
+        continue;
+      }
+
+      // Layer 1: verify this component still exists on main with matching info.
+      const mainComp = mainComponentsByPath.get(componentPath);
+      if (!mainComp) {
+        violations.push(`Scaffold PR stale: '${componentPath}' no longer in main projects.yaml`);
+        continue;
+      }
+      if (mainComp.id !== lock.component.id) {
+        violations.push(
+          `Scaffold PR stale: '${componentPath}' id changed (lock=${lock.component.id}, main=${mainComp.id})`,
+        );
+      }
+      if (mainComp.template !== lock.template.name) {
+        violations.push(
+          `Scaffold PR stale: '${componentPath}' template changed (lock=${lock.template.name}, main=${mainComp.template})`,
+        );
+      }
+      if (mainComp.template_ref !== lock.source.resolved_commit) {
+        violations.push(
+          `Scaffold PR stale: '${componentPath}' template_ref changed (lock=${lock.source.resolved_commit}, main=${mainComp.template_ref})`,
+        );
+      }
+    }
+
+    if (violations.length > 0) {
+      return { ok: false, violations };
+    }
+    return { ok: true };
+  } catch (err) {
+    violations.push(`Scaffold PR hygiene failed: ${(err as Error).message}`);
+    return { ok: false, violations };
+  }
 }
 
 interface ChangedFile {
