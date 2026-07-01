@@ -186,7 +186,8 @@ export interface SeedInput {
 export interface SnapshotInput {
   repository: RepositoryIdentity;
   seedCommit: string;
-  seedTree: string;
+  /** Tree SHA of the seed commit. If empty, publishSnapshot reads it from the commit. */
+  seedTree?: string;
   files: ReadonlyArray<{
     path: string;
     mode: '100644' | '100755';
@@ -197,6 +198,8 @@ export interface SnapshotInput {
 export interface CommitIdentity {
   sha: string;
   treeSha: string;
+  /** Disposition of the operation: 'create' | 'noop' | 'conflict'. */
+  disposition?: 'create' | 'noop' | 'conflict';
 }
 
 export interface LabelsInput {

@@ -158,6 +158,15 @@ export function assembleTree(
 }
 
 /**
+ * Parse an `owner/repo` string into components. Throws on invalid format.
+ */
+export function parseRepoRef(s: string): { owner: string; repo: string } {
+  const [owner, repo] = s.split('/');
+  if (!owner || !repo) throw new Error(`invalid repository ref: '${s}'`);
+  return { owner, repo };
+}
+
+/**
  * Parse a manifest JSON blob. Returns a frozen object or throws on schema
  * violations.
  */

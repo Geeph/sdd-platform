@@ -20,7 +20,7 @@
 import { createHash } from 'node:crypto';
 import { validateProjectsDocument } from '@sdd/schemas';
 import { renderTree } from './render.js';
-import { assembleTree, resolveRef, sha256Hex } from './resolve.js';
+import { assembleTree, parseRepoRef, resolveRef, sha256Hex } from './resolve.js';
 import type {
   Disposition,
   GitHubReadPort,
@@ -323,12 +323,6 @@ function buildTemplatePlan(
     output_tree_sha256: rendered.outputTreeSha256,
     files,
   };
-}
-
-function parseRepoRef(s: string): { owner: string; repo: string } {
-  const [owner, repo] = s.split('/');
-  if (!owner || !repo) throw new Error(`invalid repository ref: '${s}'`);
-  return { owner, repo };
 }
 
 /**
