@@ -1,17 +1,50 @@
 /**
  * product init CLI test — dry-run only.
+ *
+ * These tests run against the local platform checkout, so the
+ * --platform-repo flag must match the git remote's owner/repo. We derive
+ * it from `git remote get-url origin` at test time so the tests work in
+ * any developer's checkout (acme, Geeph, etc.).
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
+import { parseRemoteUrl } from '../../../src/local-reader.js';
 
 const execFileP = promisify(execFile);
 const REPO_ROOT = resolve(__dirname, '../../../..');
 const CLI_BIN = resolve(REPO_ROOT, 'cli/bin/run.js');
 const FIXTURES = resolve(REPO_ROOT, 'cli/test/fixtures');
+
+function normalizeError(s: string): string {
+  // Collapse oclif's `›` decoration and any whitespace so multi-line error
+  // messages become one line we can match against.
+  return s.replace(/[\s›]+/g, ' ');
+}
+
+/**
+ * Derive owner/repo from the local git remote so tests work regardless of
+ * which developer's checkout runs them.
+ */
+function derivePlatformRepo(): { owner: string; repo: string } {
+  try {
+    const url = execFileSync('git', ['remote', 'get-url', 'origin'], {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+    const parsed = parseRemoteUrl(url);
+    if (parsed) return parsed;
+  } catch {
+    // Fall through.
+  }
+  // Test environment where git isn't available — fall back to a fixed pair.
+  return { owner: 'test', repo: 'sdd-platform' };
+}
 
 async function runCli(
   args: string[],
@@ -37,26 +70,32 @@ describe('sdd product init', () => {
   });
 
   it('refuses real execution in M2a', async () => {
+    const platform = derivePlatformRepo();
     const { stderr, code } = await runCli([
       'product',
       'init',
       'demo',
       '--owner',
-      'acme',
+      platform.owner,
+      '--platform-repo',
+      `${platform.owner}/${platform.repo}`,
       '--config',
       resolve(FIXTURES, 'product-init-valid.yaml'),
     ]);
     expect(code).not.toBe(0);
-    expect(stderr).toMatch(/not implemented in M2a/);
+    expect(normalizeError(stderr)).toMatch(/not implemented in M2a/);
   });
 
   it('dry-run JSON produces byte-identical output', async () => {
+    const platform = derivePlatformRepo();
     const args = [
       'product',
       'init',
       'demo',
       '--owner',
-      'acme',
+      platform.owner,
+      '--platform-repo',
+      `${platform.owner}/${platform.repo}`,
       '--config',
       resolve(FIXTURES, 'product-init-valid.yaml'),
       '--dry-run',
@@ -71,17 +110,20 @@ describe('sdd product init', () => {
     const plan = JSON.parse(r1.stdout);
     expect(plan.plan_version).toBe(1);
     expect(plan.operation_id).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(plan.target.owner).toBe('acme');
+    expect(plan.target.owner).toBe(platform.owner);
     expect(plan.target.repository).toBe('demo');
   });
 
   it('dry-run text output includes key sections', async () => {
+    const platform = derivePlatformRepo();
     const { stdout, code } = await runCli([
       'product',
       'init',
       'demo',
       '--owner',
-      'acme',
+      platform.owner,
+      '--platform-repo',
+      `${platform.owner}/${platform.repo}`,
       '--config',
       resolve(FIXTURES, 'product-init-valid.yaml'),
       '--dry-run',
@@ -90,13 +132,14 @@ describe('sdd product init', () => {
     ]);
     expect(code).toBe(0);
     expect(stdout).toMatch(/operation_id:/);
-    expect(stdout).toMatch(/target:\s+acme\/demo/);
+    expect(stdout).toMatch(new RegExp(`target:\\s+${platform.owner}\\/demo`));
     expect(stdout).toMatch(/Operations/);
     expect(stdout).toMatch(/Requirements/);
     expect(stdout).toMatch(/Template files/);
   });
 
   it('fails with invalid config', async () => {
+    const platform = derivePlatformRepo();
     const badYaml = resolve(FIXTURES, 'product-init-bad.yaml');
     await writeFile(badYaml, 'schema_version: 1\nunknown_key: oops\n', 'utf8');
     const { stderr, code } = await runCli([
@@ -104,12 +147,55 @@ describe('sdd product init', () => {
       'init',
       'demo',
       '--owner',
-      'acme',
+      platform.owner,
+      '--platform-repo',
+      `${platform.owner}/${platform.repo}`,
       '--config',
       badYaml,
       '--dry-run',
     ]);
     expect(code).not.toBe(0);
-    expect(stderr).toMatch(/additionalProperties/);
+    expect(normalizeError(stderr)).toMatch(/additionalProperties/);
+  });
+
+  it('refuses cross-org --platform-repo (same-org invariant)', async () => {
+    const platform = derivePlatformRepo();
+    // Pass an --owner that differs from the platform-repo owner.
+    const otherOwner = platform.owner === 'acme' ? 'acme-other' : 'acme';
+    const { stderr, code } = await runCli([
+      'product',
+      'init',
+      'demo',
+      '--owner',
+      otherOwner,
+      '--platform-repo',
+      `${platform.owner}/${platform.repo}`,
+      '--config',
+      resolve(FIXTURES, 'product-init-valid.yaml'),
+      '--dry-run',
+    ]);
+    expect(code).not.toBe(0);
+    expect(normalizeError(stderr)).toMatch(/same-org invariant/);
+  });
+
+  it('refuses --platform-repo that does not match local git remote', async () => {
+    const platform = derivePlatformRepo();
+    // Use an owner that DOES match --owner (so same-org passes) but differs
+    // from the local remote.
+    const fakeOwner = 'not-the-local-remote-owner';
+    const { stderr, code } = await runCli([
+      'product',
+      'init',
+      'demo',
+      '--owner',
+      fakeOwner,
+      '--platform-repo',
+      `${fakeOwner}/${platform.repo}`,
+      '--config',
+      resolve(FIXTURES, 'product-init-valid.yaml'),
+      '--dry-run',
+    ]);
+    expect(code).not.toBe(0);
+    expect(normalizeError(stderr)).toMatch(/local git remote/);
   });
 });

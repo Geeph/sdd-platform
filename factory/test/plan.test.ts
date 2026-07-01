@@ -131,7 +131,7 @@ function makeInput(): ProductInitInput {
       repository: 'acme/sdd-platform',
       ref: 'v1.0.0',
     },
-    config: CONFIG,
+    config: structuredClone(CONFIG),
   };
 }
 
@@ -385,5 +385,54 @@ describe('compileInitPlan', () => {
     const plan2 = await compileInitPlan(input, reader);
     const repoOp = plan2.operations.find((o) => o.kind === 'repository.create');
     expect(repoOp?.disposition).toBe('noop');
+  });
+
+  it('operation_id differs when environment reviewers change (full config hash)', async () => {
+    // Regression: previously operation_id only hashed environment *names*,
+    // so two configs that differed only in reviewers or prevent_self_review
+    // produced the same id.
+    const tree = buildTestTree();
+    const reader = makeFakeReader(tree);
+
+    const inputA = makeInput();
+    inputA.config.environments = {
+      preview: { reviewers: ['product-team'], prevent_self_review: true },
+    };
+    const inputB = makeInput();
+    inputB.config.environments = {
+      preview: { reviewers: ['design-team'], prevent_self_review: false },
+    };
+
+    const planA = await compileInitPlan(inputA, reader);
+    const planB = await compileInitPlan(inputB, reader);
+    expect(planA.operation_id).not.toBe(planB.operation_id);
+  });
+
+  it('operation_id differs when repository.description changes', async () => {
+    const tree = buildTestTree();
+    const reader = makeFakeReader(tree);
+
+    const inputA = makeInput();
+    inputA.config.repository = { description: 'Alpha' };
+    const inputB = makeInput();
+    inputB.config.repository = { description: 'Beta' };
+
+    const planA = await compileInitPlan(inputA, reader);
+    const planB = await compileInitPlan(inputB, reader);
+    expect(planA.operation_id).not.toBe(planB.operation_id);
+  });
+
+  it('operation_id differs when team_permissions change', async () => {
+    const tree = buildTestTree();
+    const reader = makeFakeReader(tree);
+
+    const inputA = makeInput();
+    inputA.config.team_permissions = { 'product-team': 'push' };
+    const inputB = makeInput();
+    inputB.config.team_permissions = { 'product-team': 'maintain' };
+
+    const planA = await compileInitPlan(inputA, reader);
+    const planB = await compileInitPlan(inputB, reader);
+    expect(planA.operation_id).not.toBe(planB.operation_id);
   });
 });

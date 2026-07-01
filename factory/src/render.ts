@@ -65,11 +65,18 @@ export function renderContent(source: Uint8Array, tokens: Map<string, string>): 
 
 /**
  * Compute the sha256 of the concatenation of all rendered file digests
- * (sorted by path). The template.lock file itself is NOT included.
+ * (sorted by path), each prefixed with its POSIX mode. The template.lock
+ * file itself is NOT included.
+ *
+ * Mode is part of the identity because a tree with identical content but
+ * different mode (e.g. a script flipped from 100644 to 100755) is a
+ * different tree.
  */
-function outputTreeDigest(files: ReadonlyArray<{ path: string; content: Uint8Array }>): string {
+function outputTreeDigest(
+  files: ReadonlyArray<{ path: string; mode: '100644' | '100755'; content: Uint8Array }>,
+): string {
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
-  const lines = sorted.map((f) => `100644  ${sha256Hex(f.content)}  ${f.path}`).join('\n');
+  const lines = sorted.map((f) => `${f.mode}  ${sha256Hex(f.content)}  ${f.path}`).join('\n');
   return sha256Hex(`${lines}\n`);
 }
 
@@ -205,7 +212,7 @@ export { sha256Hex };
 
 // Export for tests — deterministic digest of the concatenation.
 export function computeOutputTreeDigest(
-  files: ReadonlyArray<{ path: string; content: Uint8Array }>,
+  files: ReadonlyArray<{ path: string; mode: '100644' | '100755'; content: Uint8Array }>,
 ): string {
   return outputTreeDigest(files);
 }

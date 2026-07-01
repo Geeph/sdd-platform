@@ -24,7 +24,7 @@ import { validateProductInitDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
 import { compileInitPlan, serializeInitPlan, validateProductInitConfig } from '../../init-lib.js';
 
-const DEFAULT_PLATFORM_REPO = 'acme/sdd-platform';
+const DEFAULT_PLATFORM_REPO_NAME = 'sdd-platform';
 
 export default class ProductInit extends Command {
   static override description = 'Bootstrap a product repository (M2a: dry-run only)';
@@ -45,8 +45,7 @@ export default class ProductInit extends Command {
     }),
     'platform-repo': Flags.string({
       description:
-        "Platform repo as 'owner/repo' (must share organization with --owner; same-org invariant)",
-      default: DEFAULT_PLATFORM_REPO,
+        "Platform repo as 'owner/repo'. Defaults to '<owner>/sdd-platform' when omitted (same-org invariant enforced).",
     }),
     'platform-ref': Flags.string({
       description:
@@ -83,10 +82,24 @@ export default class ProductInit extends Command {
       });
     }
 
+    // Detect whether user passed --platform-repo explicitly.
+    const platformRepoExplicit = process.argv.some(
+      (a) => a === '--platform-repo' || a.startsWith('--platform-repo='),
+    );
+
+    // Derive platform repo: explicit value wins; otherwise `${owner}/sdd-platform`.
+    // This ensures the default always satisfies the same-org invariant.
+    const platformRepo =
+      platformRepoExplicit && flags['platform-repo']
+        ? flags['platform-repo']
+        : `${flags.owner}/${DEFAULT_PLATFORM_REPO_NAME}`;
+
     // Same-org invariant: the platform repo owner must equal the target org.
-    const platformRepoParts = flags['platform-repo'].split('/');
+    // This is a security property — required workflows can only be consumed
+    // by repos in the same org, and the Bootstrap PR reviewers live there.
+    const platformRepoParts = platformRepo.split('/');
     if (platformRepoParts.length !== 2 || !platformRepoParts[0] || !platformRepoParts[1]) {
-      this.error(`--platform-repo must be 'owner/repo': '${flags['platform-repo']}'`, {
+      this.error(`--platform-repo must be 'owner/repo': '${platformRepo}'`, {
         exit: 2,
       });
     }
@@ -97,11 +110,6 @@ export default class ProductInit extends Command {
         { exit: 2 },
       );
     }
-
-    // Detect whether user passed --platform-repo explicitly.
-    const platformRepoExplicit = process.argv.some(
-      (a) => a === '--platform-repo' || a.startsWith('--platform-repo='),
-    );
 
     // Load + validate the product-init.yaml config.
     let rawConfig: unknown;
@@ -127,7 +135,7 @@ export default class ProductInit extends Command {
     const visibility = config.repository?.visibility ?? 'private';
 
     const platform: ProductInitInput['platform'] = {
-      repository: flags['platform-repo'],
+      repository: platformRepo,
     };
     if (flags['platform-ref']) {
       platform.ref = flags['platform-ref'];
@@ -151,10 +159,11 @@ export default class ProductInit extends Command {
       const plan = await compileInitPlan(input, reader);
 
       // Post-process warnings: surface that teams aren't verified in local
-      // mode, and that --platform-repo was defaulted.
+      // mode, that --platform-repo was defaulted, and whether the worktree
+      // is dirty (uncommitted template changes).
       if (!platformRepoExplicit) {
         plan.warnings.unshift(
-          `--platform-repo defaulted to '${DEFAULT_PLATFORM_REPO}'; pass it explicitly for production runs.`,
+          `--platform-repo defaulted to '${platformRepo}'; pass it explicitly for production runs.`,
         );
       }
       const uncheckedTeams = plan.requirements.filter(
@@ -163,6 +172,12 @@ export default class ProductInit extends Command {
       if (uncheckedTeams.length > 0) {
         plan.warnings.push(
           `本地模式下无法校验 team 存在性（${uncheckedTeams.length} 个 team 标记为 missing）；实际执行前将由 GitHub API 验证。`,
+        );
+      }
+      const worktree = await reader.verifyWorktree();
+      if (worktree.dirty) {
+        plan.warnings.push(
+          '本地 platform 仓有未提交的改动；模板字节归因到 HEAD commit，可能不反映真实来源。',
         );
       }
 

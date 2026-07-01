@@ -214,4 +214,57 @@ describe('renderTree', () => {
     const recomputed = computeOutputTreeDigest(filesWithoutLock);
     expect(recomputed).toBe(result.outputTreeSha256);
   });
+
+  it('output tree digest differs when mode differs (100644 vs 100755)', () => {
+    // Same content, different mode → different digest. This guards against
+    // silently hashing all files as 100644 and missing an executable bit flip.
+    const content = utf8('#!/bin/sh\necho hello\n');
+    const tree100644 = computeOutputTreeDigest([{ path: 'script.sh', mode: '100644', content }]);
+    const tree100755 = computeOutputTreeDigest([{ path: 'script.sh', mode: '100755', content }]);
+    expect(tree100644).not.toBe(tree100755);
+  });
+
+  it('renders CODEOWNERS with admins fallback when optional owners are absent', () => {
+    // The template references {{owners.backend}}, {{owners.web}}, etc. but
+    // the config only provides the 4 required owners. The renderer must
+    // fall back to {{owners.admins}} for the missing optional slots.
+    const files = [
+      {
+        path: '.github/CODEOWNERS',
+        content:
+          '*                @{{repo}}/{{owners.admins}}\n/apps/backend/     @{{repo}}/{{owners.backend}}\n/apps/web/         @{{repo}}/{{owners.web}}\n',
+        render: true,
+      },
+    ];
+    const manifest = makeManifestWithRender(files);
+    const tree = assembleTree(
+      manifest,
+      files.map((f) => makeEntry(f.path, f.content)),
+    );
+    const minimalContext: RenderContext = {
+      product: 'demo',
+      repo: 'acme',
+      owners: {
+        product: 'product-team',
+        api: 'api-owners',
+        design: 'design-team',
+        admins: 'platform-admins',
+        // No backend/web/ios/android — the template should still render.
+      },
+    };
+    const result = renderTree({
+      tree,
+      context: minimalContext,
+      source: {
+        repository: 'acme/sdd-platform',
+        requestedRef: 'v1.0.0',
+        resolvedCommit: 'a'.repeat(40),
+      },
+      generator: { package: '@sdd/factory', version: '0.1.0' },
+    });
+    const rendered = new TextDecoder().decode(result.entries[0]?.content);
+    expect(rendered).toContain('*                @acme/platform-admins');
+    expect(rendered).toContain('/apps/backend/     @acme/platform-admins');
+    expect(rendered).toContain('/apps/web/         @acme/platform-admins');
+  });
 });

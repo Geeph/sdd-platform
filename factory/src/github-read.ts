@@ -62,41 +62,56 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       if (/^[0-9a-f]{40}$/i.test(ref)) {
         return { commit: ref.toLowerCase(), requestedRef: ref, peeled: false };
       }
-      // Otherwise GET the ref and peel annotated tags recursively.
-      let currentRef = ref;
-      let peeled = false;
+      // Otherwise GET the ref, then follow tag→tag→...→commit chains by
+      // calling /git/tags/{sha} for each tag object we encounter. We must
+      // NOT feed a tag SHA back into /git/ref/{ref} — that endpoint only
+      // accepts symbolic ref names and would 404 on a raw SHA.
+      let _peeled = false;
+
+      // Step 1: resolve the symbolic ref to an object (commit or tag).
+      const initial = (await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        owner: repo.owner,
+        repo: repo.repo,
+        ref,
+      })) as { object: { type: string; sha: string } };
+
+      // Fast path: the ref points directly at a commit.
+      if (initial.object.type === 'commit') {
+        return {
+          commit: initial.object.sha.toLowerCase(),
+          requestedRef: ref,
+          peeled: false,
+        };
+      }
+      if (initial.object.type !== 'tag') {
+        throw new Error(
+          `ref '${ref}' resolved to unsupported object type '${initial.object.type}'`,
+        );
+      }
+
+      // Step 2: peel the tag chain. We know we have at least one tag; loop
+      // calling /git/tags/{sha} until we hit a commit (or give up).
+      let tagSha = initial.object.sha;
       for (let hops = 0; hops < 8; hops++) {
-        const res = (await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        _peeled = true;
+        const tag = (await safeRequest('GET /repos/{owner}/{repo}/git/tags/{tag_sha}', {
           owner: repo.owner,
           repo: repo.repo,
-          ref: currentRef,
+          tag_sha: tagSha,
         })) as { object: { type: string; sha: string } };
-        if (res.object.type === 'commit') {
+        if (tag.object.type === 'commit') {
           return {
-            commit: res.object.sha.toLowerCase(),
+            commit: tag.object.sha.toLowerCase(),
             requestedRef: ref,
-            peeled,
+            peeled: true,
           };
         }
-        if (res.object.type === 'tag') {
-          peeled = true;
-          const tag = (await safeRequest('GET /repos/{owner}/{repo}/git/tags/{tag_sha}', {
-            owner: repo.owner,
-            repo: repo.repo,
-            tag_sha: res.object.sha,
-          })) as { object: { type: string; sha: string } };
-          if (tag.object.type === 'commit') {
-            return {
-              commit: tag.object.sha.toLowerCase(),
-              requestedRef: ref,
-              peeled: true,
-            };
-          }
-          // Annotated tag pointing to another tag; keep peeling.
-          currentRef = tag.object.sha;
+        if (tag.object.type === 'tag') {
+          // Another annotated tag; keep peeling using /git/tags/{sha}.
+          tagSha = tag.object.sha;
           continue;
         }
-        throw new Error(`ref '${ref}' resolved to unsupported object type '${res.object.type}'`);
+        throw new Error(`ref '${ref}' peeled to unsupported object type '${tag.object.type}'`);
       }
       throw new Error(`ref '${ref}' exceeded peel depth`);
     },
