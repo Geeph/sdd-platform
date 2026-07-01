@@ -54,10 +54,15 @@ export async function publishComponentBranch(
 ): Promise<PublishResult> {
   const { target, baseTreeSha, baseCommitSha, branchName, files, commitMessage } = input;
 
-  // Validate paths are under allowed prefixes.
+  // D4: every file must be under a pending component's path prefix.
   for (const file of files) {
-    if (!file.path.startsWith('apps/')) {
-      throw new Error(`publishComponentBranch: file '${file.path}' is not under apps/ prefix`);
+    const ok = [...input.allowedPaths].some((prefix) =>
+      file.path.startsWith(`${prefix}/`),
+    );
+    if (!ok) {
+      throw new Error(
+        `publishComponentBranch: file '${file.path}' is not under any pending component path. Allowed: [${[...input.allowedPaths].join(', ')}]`,
+      );
     }
   }
 
@@ -136,12 +141,17 @@ export async function publishComponentBranch(
  *
  * Uses `team_reviewers` (not `reviewers`) — the pending components'
  * `owner` slugs are teams, not users (D23).
+ *
+ * D20: before reusing an existing PR, verifies that `base.repo` /
+ * `base.ref` / `head.repo` / `head.ref` match the expected target
+ * and branch. If any mismatch → conflict (does not trust head query
+ * alone; must validate the API response's own fields).
  */
 export async function upsertScaffoldPull(
   octokit: OctokitMutate,
   input: UpsertScaffoldPullInput,
 ): Promise<ScaffoldPull> {
-  const { target, headBranch, baseBranch, title, body, teamReviewers } = input;
+  const { target, headBranch, baseBranch, title, body, teamReviewers, expectedHeadRepo, expectedBaseRef } = input;
 
   // Check for existing PR.
   const existingPrs = (await withRetry(
@@ -154,10 +164,42 @@ export async function upsertScaffoldPull(
         per_page: 10,
       }),
     'upsertScaffoldPull:listPRs',
-  )) as Array<{ number: number; head: { sha: string }; html_url: string }>;
+  )) as Array<{ number: number; head: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } }; base: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } }; html_url: string }>;
 
   if (existingPrs.length > 0) {
     const pr = existingPrs[0]!;
+
+    // D20: verify base/head repo and ref match the expected values.
+    if (expectedHeadRepo) {
+      const headRepoOwner = pr.head.repo?.owner?.login;
+      const headRepoName = pr.head.repo?.name;
+      if (
+        headRepoOwner?.toLowerCase() !== expectedHeadRepo.owner.toLowerCase() ||
+        headRepoName?.toLowerCase() !== expectedHeadRepo.repo.toLowerCase()
+      ) {
+        throw new Error(
+          `upsertScaffoldPull: conflict — existing PR #${pr.number} head repo ` +
+          `(${headRepoOwner}/${headRepoName}) does not match expected ` +
+          `(${expectedHeadRepo.owner}/${expectedHeadRepo.repo})`,
+        );
+      }
+    }
+    if (
+      expectedBaseRef &&
+      pr.base.ref !== expectedBaseRef
+    ) {
+      throw new Error(
+        `upsertScaffoldPull: conflict — existing PR #${pr.number} base ref ` +
+        `'${pr.base.ref}' does not match expected '${expectedBaseRef}'`,
+      );
+    }
+    if (pr.head.ref !== headBranch) {
+      throw new Error(
+        `upsertScaffoldPull: conflict — existing PR #${pr.number} head ref ` +
+        `'${pr.head.ref}' does not match expected '${headBranch}'`,
+      );
+    }
+
     await withRetry(
       () =>
         octokit.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers', {

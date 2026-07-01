@@ -150,6 +150,8 @@ export interface PublishComponentBranchInput {
     content: Uint8Array;
   }>;
   commitMessage: string;
+  /** Set of pending component path prefixes — every file must be under one. */
+  allowedPaths: ReadonlySet<string>;
 }
 
 export interface PublishResult {
@@ -166,6 +168,13 @@ export interface UpsertScaffoldPullInput {
   body: string;
   /** Team slugs to request review from (D23). */
   teamReviewers: string[];
+  /**
+   * D20: when reusing an existing PR, verify base.repo/base.ref/
+   * head.repo/head.ref match these expected values. If not,
+   * return a conflict rather than blindly trusting the query.
+   */
+  expectedHeadRepo?: RepoRef;
+  expectedBaseRef?: string;
 }
 
 export interface ScaffoldPull {
