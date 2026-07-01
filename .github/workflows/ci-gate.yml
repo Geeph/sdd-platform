@@ -1,0 +1,58 @@
+# CI Gate — required workflow for product repositories (§3.4).
+#
+# This workflow is hosted in the platform repo and enforced via the dedicated
+# organization ruleset (sdd-workflows-<repository-id>). Product repositories
+# do NOT contain a copy.
+#
+# Job name frozen at "CI Gate" (D8) — required status check context matches
+# this name. M4 adds detect + platform matrix aggregation under the same job.
+#
+# Minimal permissions (D10): contents:read, pull-requests:read.
+# No secrets, no checkout/execute of product PR blob.
+
+name: ci-gate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect:
+    name: detect
+    runs-on: ubuntu-latest
+    outputs:
+      backend: 'false'
+      web: 'false'
+      ios: 'false'
+      android: 'false'
+    steps:
+      # M2 stub: all platforms false. M4 fills with path rules + sdd impact.
+      - name: detect platforms
+        run: |
+          echo "M2 stub: no platform detection yet"
+          echo "backend=false" >> "$GITHUB_OUTPUT"
+          echo "web=false" >> "$GITHUB_OUTPUT"
+          echo "ios=false" >> "$GITHUB_OUTPUT"
+          echo "android=false" >> "$GITHUB_OUTPUT"
+
+  CI Gate:
+    name: CI Gate
+    needs: [detect]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # §3.4 truth table: read needs.*.result.
+      # M2: no platform jobs → no detected failures → pass.
+      - name: aggregate
+        run: |
+          echo "CI Gate aggregation (M2 stub)"
+          echo "detect result: ${{ needs.detect.result }}"
+          if [ "${{ needs.detect.result }}" = "failure" ]; then
+            echo "detect failed"
+            exit 1
+          fi
+          echo "CI Gate passed"

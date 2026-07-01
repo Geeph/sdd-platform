@@ -1,0 +1,63 @@
+# PR hygiene — required workflow for product repositories (§3.4).
+#
+# This workflow is hosted in the platform repo and enforced via the dedicated
+# organization ruleset (sdd-workflows-<repository-id>). Product repositories
+# do NOT contain a copy.
+#
+# Job name frozen at "PR hygiene" (D8) — required status check context matches
+# this name.
+#
+# Minimal permissions (D10): contents:read, pull-requests:read.
+# No secrets, no checkout/execute of product PR blob.
+# Checks out the PLATFORM repo at pinned SHA to get the sdd CLI, then runs
+# `sdd gate hygiene` which reads the product PR via API (not filesystem).
+
+name: pr-hygiene
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  PR hygiene:
+    name: PR hygiene
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout platform repo at pinned SHA to get sdd CLI.
+      # This is the platform repo itself, NOT the product PR.
+      - name: checkout platform repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: platform
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install dependencies
+        working-directory: platform
+        run: pnpm install --frozen-lockfile
+
+      - name: build sdd CLI
+        working-directory: platform
+        run: pnpm -r build
+
+      - name: run gate hygiene
+        working-directory: platform
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract repo and PR number from the event context.
+          REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Run hygiene check — reads PR via API, does NOT checkout product blob.
+          node cli/bin/run.js gate hygiene \
+            --repo "$REPO" \
+            --pr "$PR_NUMBER"

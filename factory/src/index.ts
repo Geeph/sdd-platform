@@ -5,13 +5,34 @@
  * implementation details (octokit adapter internals, YAML parsing quirks,
  * etc.) are not exported.
  *
- * M2a scope: compileInitPlan + dry-run support. Write-port types are
- * declared but no writer implementation exists yet (M2b/c scope).
+ * M2a: compileInitPlan + dry-run support.
+ * M2b: + write-port implementation (createRepository, seedMainViaContents,
+ *      publishSnapshot) + applyInitPlan state machine.
  */
 
+// Gate hygiene (M2c)
+export { checkPrHygiene } from './gate-hygiene.js';
+// Read port
 export type { OctokitReadOnly } from './github-read.js';
-// Read-only octokit adapter factory (M2b/c will wire this for real runs).
 export { createReadonlyGitHubPort } from './github-read.js';
+// Write port (M2b + M2c)
+export type { OctokitMutate, SnapshotResult } from './github-write.js';
+export {
+  createRepository,
+  createWriteGitHubPort,
+  grantTeamPermissions,
+  publishSnapshot,
+  reconcileEnvironments,
+  reconcileLabels,
+  reconcileOrgWorkflowRuleset,
+  reconcileRepositoryRuleset,
+  seedMainViaContents,
+  upsertBootstrapPull,
+} from './github-write.js';
+// Init orchestrator (M2b + M2c)
+export type { ApplyInitPlanDeps } from './init.js';
+export { applyInitPlan, finalizeProtection } from './init.js';
+
 // Core functions
 export { compileInitPlan, serializeInitPlan } from './plan.js';
 export {
@@ -29,6 +50,7 @@ export {
   isFullCommit,
   isSha256,
   parseManifest,
+  parseRepoRef,
   resolveRef,
   sha256Hex,
   validateManifest,
@@ -75,5 +97,3 @@ export type {
   TemplatePlan,
   TemplateTreeEntry,
 } from './types.js';
-
-// Write port types remain declared only — no implementation in M2a.
