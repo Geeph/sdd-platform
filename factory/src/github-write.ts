@@ -18,6 +18,7 @@
  *     limit never blindly replayed.
  */
 
+import { createHash } from 'node:crypto';
 import type {
   BootstrapPull,
   BootstrapPullInput,
@@ -29,6 +30,7 @@ import type {
   OrgWorkflowRulesetInput,
   ReconcileResult,
   RepositoryIdentity,
+  RepositorySettingsInput,
   RulesetInput,
   SeedInput,
   SnapshotInput,
@@ -79,10 +81,9 @@ function backoffWithJitter(attempt: number, retryAfterMs?: number): number {
 
 /**
  * Retry wrapper: retries 429/5xx with backoff+jitter. 403 secondary rate
- * limit is NOT blindly replayed. Mutation calls are only retried when the
- * caller confirms idempotency (all three M2b endpoints are idempotent by
- * their nature: repo create by name uniqueness, Contents upsert by path,
- * ref update by non-force compare).
+ * limit is NOT blindly replayed. Callers use this only for reads and
+ * content-addressed Git object writes; repository/Contents/commit/ref
+ * mutations use explicit read-after-error confirmation instead.
  */
 async function withRetry<T>(fn: (attempt: number) => Promise<T>, label: string): Promise<T> {
   const state: RetryState = { attempt: 0 };
@@ -95,6 +96,7 @@ async function withRetry<T>(fn: (attempt: number) => Promise<T>, label: string):
       const httpErr = err as {
         status?: number;
         message?: string;
+        transient?: boolean;
         response?: { headers?: Record<string, string | undefined> };
       };
       const status = httpErr.status;
@@ -104,7 +106,7 @@ async function withRetry<T>(fn: (attempt: number) => Promise<T>, label: string):
         throw new Error(`${label}: 403 secondary rate limit — not retrying`);
       }
 
-      if (status !== undefined && RETRYABLE_STATUS.has(status)) {
+      if (httpErr.transient === true || (status !== undefined && RETRYABLE_STATUS.has(status))) {
         if (state.attempt >= MAX_RETRIES) break;
 
         // Extract Retry-After header if present (value in seconds).
@@ -140,7 +142,38 @@ interface CreateRepoResponse {
   private: boolean;
   visibility: string;
   default_branch: string;
-  description?: string;
+  description?: string | null;
+}
+
+function repositoryIdentity(resp: CreateRepoResponse): RepositoryIdentity {
+  return {
+    owner: resp.owner.login,
+    name: resp.name,
+    id: resp.id,
+    defaultBranch: resp.default_branch,
+    visibility: normalizeVisibility(resp.visibility, resp.private),
+  };
+}
+
+function repositoryMatchesCreateInput(resp: CreateRepoResponse, input: CreateRepoInput): boolean {
+  return (
+    resp.owner.login.toLowerCase() === input.owner.toLowerCase() &&
+    resp.name.toLowerCase() === input.name.toLowerCase() &&
+    resp.description === input.description &&
+    normalizeVisibility(resp.visibility, resp.private) === input.visibility
+  );
+}
+
+function errorStatus(err: unknown): number | undefined {
+  return (err as { status?: number }).status;
+}
+
+function isRetryableError(err: unknown): boolean {
+  const candidate = err as { status?: number; transient?: boolean };
+  return (
+    candidate.transient === true ||
+    (candidate.status !== undefined && RETRYABLE_STATUS.has(candidate.status))
+  );
 }
 
 /**
@@ -155,26 +188,42 @@ export async function createRepository(
   octokit: OctokitMutate,
   input: CreateRepoInput,
 ): Promise<RepositoryIdentity> {
-  const resp = await withRetry(
-    () =>
-      octokit.request('POST /orgs/{org}/repos', {
-        org: input.owner,
-        name: input.name,
-        description: input.initMarker,
-        private: input.visibility !== 'public',
-        visibility: input.visibility,
-        auto_init: false,
-      }) as Promise<CreateRepoResponse>,
-    'createRepository',
-  );
+  let resp: CreateRepoResponse;
+  try {
+    resp = (await octokit.request('POST /orgs/{org}/repos', {
+      org: input.owner,
+      name: input.name,
+      description: input.description,
+      private: input.visibility !== 'public',
+      visibility: input.visibility,
+      auto_init: false,
+    })) as CreateRepoResponse;
+  } catch (err) {
+    // POST is not blindly replayed. A 422 or ambiguous transient failure may
+    // mean the server committed the create but the response was lost.
+    if (errorStatus(err) !== 422 && !isRetryableError(err)) throw err;
+    let observed: CreateRepoResponse;
+    try {
+      observed = (await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}', {
+            owner: input.owner,
+            repo: input.name,
+          }) as Promise<CreateRepoResponse>,
+        'createRepository:confirm',
+      )) as CreateRepoResponse;
+    } catch {
+      throw err;
+    }
+    if (!repositoryMatchesCreateInput(observed, input)) throw err;
+    resp = observed;
+  }
 
-  return {
-    owner: resp.owner.login,
-    name: resp.name,
-    id: resp.id,
-    defaultBranch: resp.default_branch,
-    visibility: normalizeVisibility(resp.visibility, resp.private),
-  };
+  if (!repositoryMatchesCreateInput(resp, input)) {
+    throw new Error('createRepository: GitHub read-back does not match requested repository');
+  }
+
+  return repositoryIdentity(resp);
 }
 
 function normalizeVisibility(
@@ -183,15 +232,45 @@ function normalizeVisibility(
 ): RepositoryIdentity['visibility'] {
   if (apiVisibility === 'public') return 'public';
   if (apiVisibility === 'internal') return 'internal';
-  return isPrivate ? 'private' : 'private';
+  return isPrivate ? 'private' : 'public';
+}
+
+export async function updateRepositorySettings(
+  octokit: OctokitMutate,
+  input: RepositorySettingsInput,
+): Promise<RepositoryIdentity> {
+  const { repository, description, defaultBranch } = input;
+  let mutationError: unknown;
+  try {
+    await octokit.request('PATCH /repos/{owner}/{repo}', {
+      owner: repository.owner,
+      repo: repository.name,
+      description,
+      default_branch: defaultBranch,
+    });
+  } catch (err) {
+    if (!isRetryableError(err)) throw err;
+    mutationError = err;
+  }
+  const observed = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}', {
+        owner: repository.owner,
+        repo: repository.name,
+      }),
+    'updateRepositorySettings:confirm',
+  )) as CreateRepoResponse;
+  if (observed.description !== description || observed.default_branch !== defaultBranch) {
+    if (mutationError) throw mutationError;
+    throw new Error('updateRepositorySettings: read-back mismatch');
+  }
+  return repositoryIdentity(observed);
 }
 
 // ---- seedMainViaContents --------------------------------------------------
 
 interface SeedContentsResponse {
-  content: {
-    commit: { sha: string };
-  };
+  commit: { sha: string };
 }
 
 /**
@@ -208,22 +287,65 @@ export async function seedMainViaContents(
   octokit: OctokitMutate,
   input: SeedInput,
 ): Promise<CommitIdentity> {
-  const commitMessage = `sdd-init: seed template.lock [${input.repository.owner}/${input.repository.name}]`;
+  const commitMessage = `sdd-init: seed template.lock [${input.operationId}]`;
 
-  const resp = await withRetry(
-    () =>
-      octokit.request('PUT /repos/{owner}/{repo}/contents/{path}', {
-        owner: input.repository.owner,
-        repo: input.repository.name,
-        path: 'template.lock',
-        message: commitMessage,
-        content: Buffer.from(input.lockContent, 'utf8').toString('base64'),
-        branch: 'main',
-      }) as Promise<SeedContentsResponse>,
-    'seedMainViaContents',
-  );
+  let commitSha: string | undefined;
+  try {
+    const resp = (await octokit.request('PUT /repos/{owner}/{repo}/contents/{path}', {
+      owner: input.repository.owner,
+      repo: input.repository.name,
+      path: 'template.lock',
+      message: commitMessage,
+      content: Buffer.from(input.lockContent, 'utf8').toString('base64'),
+      branch: 'main',
+    })) as SeedContentsResponse;
+    commitSha = resp.commit?.sha;
+  } catch (err) {
+    if (![409, 422].includes(errorStatus(err) ?? -1) && !isRetryableError(err)) throw err;
+    // PUT may have succeeded despite a lost response. Confirm exact content
+    // before treating it as complete; never replay the mutation blindly.
+    let existing: unknown;
+    try {
+      existing = await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+            owner: input.repository.owner,
+            repo: input.repository.name,
+            path: 'template.lock',
+            ref: 'main',
+          }),
+        'seedMainViaContents:confirmContent',
+      );
+    } catch {
+      throw err;
+    }
+    if (decodeApiContent(existing) !== input.lockContent) throw err;
+    const ref = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+          owner: input.repository.owner,
+          repo: input.repository.name,
+          ref: 'heads/main',
+        }),
+      'seedMainViaContents:confirmRef',
+    )) as GetRefResponse;
+    const headCommit = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+          owner: input.repository.owner,
+          repo: input.repository.name,
+          commit_sha: ref.object.sha,
+        }),
+      'seedMainViaContents:confirmHead',
+    )) as { parents?: Array<{ sha: string }> };
+    // A concurrent invocation may already have published the direct-child
+    // snapshot. Recover the root seed rather than treating HEAD as the seed.
+    commitSha =
+      headCommit.parents?.length === 1 && headCommit.parents[0]?.sha
+        ? headCommit.parents[0].sha
+        : ref.object.sha;
+  }
 
-  const commitSha = resp.content?.commit?.sha;
   if (!commitSha) {
     throw new Error('seedMainViaContents: no commit SHA in response');
   }
@@ -235,14 +357,33 @@ export async function seedMainViaContents(
         owner: input.repository.owner,
         repo: input.repository.name,
         commit_sha: commitSha,
-      }) as Promise<{ sha: string; tree: { sha: string } }>,
+      }) as Promise<{
+        sha: string;
+        message?: string;
+        tree: { sha: string };
+        parents?: Array<{ sha: string }>;
+      }>,
     'seedMainViaContents:readCommit',
   );
+
+  if (commitResp.message !== commitMessage || (commitResp.parents ?? []).length !== 0) {
+    throw new Error(
+      "seedMainViaContents: recovered commit is not this operation's root seed commit",
+    );
+  }
 
   return {
     sha: commitResp.sha,
     treeSha: commitResp.tree.sha,
   };
+}
+
+function decodeApiContent(value: unknown): string {
+  const response = value as { content?: string; encoding?: string };
+  if (response.encoding === 'base64' && response.content) {
+    return Buffer.from(response.content.replace(/\n/g, ''), 'base64').toString('utf8');
+  }
+  return response.content ?? '';
 }
 
 // ---- publishSnapshot ------------------------------------------------------
@@ -269,7 +410,7 @@ interface CreateTreeEntry {
 
 interface CreateTreeResponse {
   sha: string;
-  tree: CreateTreeEntry[];
+  tree?: CreateTreeEntry[];
 }
 
 interface CreateCommitResponse {
@@ -310,6 +451,23 @@ export async function publishSnapshot(
   const owner = repository.owner;
   const repo = repository.name;
 
+  // Validate the entire intended write set before creating any Git objects.
+  const paths = new Set<string>();
+  for (const file of files) {
+    if (file.path === 'template.lock') {
+      throw new Error('publishSnapshot: template.lock must only come from the seed tree');
+    }
+    if (paths.has(file.path)) {
+      throw new Error(`publishSnapshot: duplicate path '${file.path}'`);
+    }
+    paths.add(file.path);
+    if (file.path.startsWith('apps/') || file.path.includes('/apps/')) {
+      throw new Error(
+        `publishSnapshot: apps/* paths are not allowed in snapshot, got '${file.path}'`,
+      );
+    }
+  }
+
   // Step 0: Check current main ref for safety.
   const currentRef = await withRetry(
     () =>
@@ -323,33 +481,25 @@ export async function publishSnapshot(
 
   const currentSha = currentRef.object.sha;
 
-  // Resolve seedTree if not provided (resume path): read the commit to get its tree SHA.
+  if (currentSha !== seedCommit) {
+    const existing = await verifySnapshotCommit(octokit, input, currentSha);
+    if (existing) return { ...existing, disposition: 'noop' };
+    return { sha: currentSha, treeSha: '', disposition: 'conflict' };
+  }
+
+  // Resolve seedTree if not provided (resume path).
   let resolvedSeedTree = seedTree;
   if (!resolvedSeedTree) {
-    const seedCommitResp = await withRetry(
+    const seedCommitResp = (await withRetry(
       () =>
         octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
           owner,
           repo,
           commit_sha: seedCommit,
-        }) as Promise<{ sha: string; tree: { sha: string } }>,
+        }),
       'publishSnapshot:readSeedCommit',
-    );
+    )) as { tree: { sha: string } };
     resolvedSeedTree = seedCommitResp.tree.sha;
-  }
-
-  if (currentSha === seedCommit) {
-    // Expected: main still at seed, proceed with snapshot.
-  } else {
-    // Main has moved. Check if it's already at the snapshot (idempotent).
-    // We can't know the snapshot SHA yet (we haven't created it), but if
-    // main has moved away from seed WITHOUT our snapshot, that's a conflict.
-    // The only safe assumption: if main != seed, someone else modified it.
-    return {
-      sha: currentSha,
-      treeSha: '',
-      disposition: 'conflict',
-    };
   }
 
   // Step 1: Create blobs for each file (parallel, with concurrency limit).
@@ -374,15 +524,6 @@ export async function publishSnapshot(
     );
     for (const r of results) {
       blobShas.set(r.path, r.sha);
-    }
-  }
-
-  // Validate no apps/* paths (spec invariant).
-  for (const file of files) {
-    if (file.path.startsWith('apps/') || file.path.includes('/apps/')) {
-      throw new Error(
-        `publishSnapshot: apps/* paths are not allowed in snapshot, got '${file.path}'`,
-      );
     }
   }
 
@@ -411,28 +552,22 @@ export async function publishSnapshot(
     'publishSnapshot:createTree',
   );
 
-  // Verify the tree was created correctly.
+  // Verify the tree was created correctly using a recursive read-back. The
+  // create-tree response may include base-tree entries or only submitted
+  // entries, so its array length is not a stable contract.
   if (!treeResp.sha) {
     throw new Error('publishSnapshot: tree creation returned no SHA');
   }
-  if (treeResp.tree.length !== files.length) {
-    throw new Error(
-      `publishSnapshot: tree entry count mismatch: expected ${files.length}, got ${treeResp.tree.length}`,
-    );
-  }
+  await verifySnapshotTree(octokit, input, treeResp.sha);
 
   // Step 3: Create commit with parent = seed commit.
-  const commitResp = await withRetry(
-    () =>
-      octokit.request('POST /repos/{owner}/{repo}/git/commits', {
-        owner,
-        repo,
-        message: `sdd-init: publish snapshot [${owner}/${repo}]`,
-        tree: treeResp.sha,
-        parents: [seedCommit],
-      }) as Promise<CreateCommitResponse>,
-    'publishSnapshot:createCommit',
-  );
+  const commitResp = (await octokit.request('POST /repos/{owner}/{repo}/git/commits', {
+    owner,
+    repo,
+    message: `sdd-init: publish snapshot [${owner}/${repo}]`,
+    tree: treeResp.sha,
+    parents: [seedCommit],
+  })) as CreateCommitResponse;
 
   if (!commitResp.sha) {
     throw new Error('publishSnapshot: commit creation returned no SHA');
@@ -440,23 +575,118 @@ export async function publishSnapshot(
 
   // Step 4: Non-force ref advance (compare-and-set via conditional update).
   // Use the update ref API with the current SHA as a condition.
-  const updateResp = await withRetry(
-    () =>
-      octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
-        owner,
-        repo,
-        ref: 'heads/main',
-        sha: commitResp.sha,
-        force: false,
-      }) as Promise<UpdateRefResponse>,
-    'publishSnapshot:updateRef',
-  );
+  try {
+    const updateResp = (await octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
+      owner,
+      repo,
+      ref: 'heads/main',
+      sha: commitResp.sha,
+      force: false,
+    })) as UpdateRefResponse;
+    return {
+      sha: updateResp.object.sha,
+      treeSha: commitResp.tree.sha,
+      disposition: 'create',
+    };
+  } catch (err) {
+    // PATCH is not replayed. Confirm whether it succeeded before surfacing a
+    // retryable failure; a later process run can safely converge.
+    if (errorStatus(err) !== 422 && !isRetryableError(err)) throw err;
+    const confirmed = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+          owner,
+          repo,
+          ref: 'heads/main',
+        }),
+      'publishSnapshot:confirmRef',
+    )) as GetRefResponse;
+    if (confirmed.object.sha === commitResp.sha) {
+      return { sha: commitResp.sha, treeSha: commitResp.tree.sha, disposition: 'create' };
+    }
+    if (confirmed.object.sha === seedCommit && isRetryableError(err)) throw err;
+    const concurrent = await verifySnapshotCommit(octokit, input, confirmed.object.sha);
+    if (concurrent) return { ...concurrent, disposition: 'noop' };
+    return { sha: confirmed.object.sha, treeSha: '', disposition: 'conflict' };
+  }
+}
 
-  return {
-    sha: updateResp.object.sha,
-    treeSha: commitResp.tree.sha,
-    disposition: 'create',
-  };
+function gitBlobSha(content: Uint8Array | string): string {
+  const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+async function verifySnapshotTree(
+  octokit: OctokitMutate,
+  input: SnapshotInput,
+  treeSha: string,
+): Promise<void> {
+  const response = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+        owner: input.repository.owner,
+        repo: input.repository.name,
+        tree_sha: treeSha,
+        recursive: '1',
+      }),
+    'publishSnapshot:verifyTree',
+  )) as { truncated?: boolean; tree?: CreateTreeEntry[] };
+  if (response.truncated) throw new Error('publishSnapshot: recursive tree response was truncated');
+  const leaves = (response.tree ?? []).filter((entry) => entry.type !== 'tree');
+  const expected = new Map<string, { mode: string; sha: string }>([
+    ['template.lock', { mode: '100644', sha: gitBlobSha(input.lockContent) }],
+    ...input.files.map(
+      (file) =>
+        [file.path, { mode: file.mode, sha: gitBlobSha(file.content) }] as [
+          string,
+          { mode: string; sha: string },
+        ],
+    ),
+  ]);
+  if (leaves.length !== expected.size) {
+    throw new Error(
+      `publishSnapshot: leaf count mismatch: expected ${expected.size}, got ${leaves.length}`,
+    );
+  }
+  for (const entry of leaves) {
+    const wanted = expected.get(entry.path);
+    if (
+      entry.type !== 'blob' ||
+      !wanted ||
+      wanted.mode !== entry.mode ||
+      wanted.sha !== entry.sha
+    ) {
+      throw new Error(`publishSnapshot: tree verification mismatch at '${entry.path}'`);
+    }
+    expected.delete(entry.path);
+  }
+  if (expected.size > 0) {
+    throw new Error(`publishSnapshot: tree missing '${expected.keys().next().value as string}'`);
+  }
+}
+
+async function verifySnapshotCommit(
+  octokit: OctokitMutate,
+  input: SnapshotInput,
+  commitSha: string,
+): Promise<CommitIdentity | null> {
+  const commit = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+        owner: input.repository.owner,
+        repo: input.repository.name,
+        commit_sha: commitSha,
+      }),
+    'publishSnapshot:verifyCommit',
+  )) as { tree: { sha: string }; parents?: Array<{ sha: string }> };
+  if (commit.parents?.length !== 1 || commit.parents[0]?.sha !== input.seedCommit) return null;
+  try {
+    await verifySnapshotTree(octokit, input, commit.tree.sha);
+    return { sha: commitSha, treeSha: commit.tree.sha };
+  } catch (err) {
+    if (errorStatus(err) !== undefined) throw err;
+    return null;
+  }
 }
 
 // ---- reconcileLabels (§3.1) -----------------------------------------------
@@ -1299,6 +1529,8 @@ async function paginateAll<T>(
 export function createWriteGitHubPort(octokit: OctokitMutate): GitHubWritePort {
   return {
     createRepository: (input: CreateRepoInput) => createRepository(octokit, input),
+    updateRepositorySettings: (input: RepositorySettingsInput) =>
+      updateRepositorySettings(octokit, input),
     seedMainViaContents: (input: SeedInput) => seedMainViaContents(octokit, input),
     publishSnapshot: (input: SnapshotInput) => publishSnapshot(octokit, input),
     reconcileLabels: (input: LabelsInput) => reconcileLabels(octokit, input),

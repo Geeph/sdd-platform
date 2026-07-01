@@ -69,11 +69,25 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       let _peeled = false;
 
       // Step 1: resolve the symbolic ref to an object (commit or tag).
-      const initial = (await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
-        owner: repo.owner,
-        repo: repo.repo,
-        ref,
-      })) as { object: { type: string; sha: string } };
+      const candidates = ref.startsWith('refs/')
+        ? [ref.slice('refs/'.length)]
+        : ref.startsWith('tags/') || ref.startsWith('heads/')
+          ? [ref]
+          : [`tags/${ref}`, `heads/${ref}`];
+      let initial: { object: { type: string; sha: string } } | undefined;
+      for (const candidate of candidates) {
+        try {
+          initial = (await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+            owner: repo.owner,
+            repo: repo.repo,
+            ref: candidate,
+          })) as { object: { type: string; sha: string } };
+          break;
+        } catch (err) {
+          if ((err as { status?: number }).status !== 404) throw err;
+        }
+      }
+      if (!initial) throw new Error(`ref '${ref}' was not found`);
 
       // Fast path: the ref points directly at a commit.
       if (initial.object.type === 'commit') {
@@ -160,7 +174,7 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
         default_branch: string;
         private: boolean;
         visibility?: string;
-        description?: string;
+        description?: string | null;
       };
       try {
         repoResp = (await safeRequest('GET /repos/{owner}/{repo}', {
@@ -184,12 +198,57 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
 
       // Repo exists. Determine if it's empty by checking for HEAD commit.
       let empty = true;
+      let mainSha: string | undefined;
+      let mainTreeSha: string | undefined;
+      let mainParentShas: string[] | undefined;
+      let seedCommitSha: string | undefined;
+      let seedOperationId: string | undefined;
+      let templateLock: string | undefined;
       try {
-        await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        const mainRef = (await safeRequest('GET /repos/{owner}/{repo}/git/ref/{ref}', {
           owner,
           repo,
           ref: `heads/${repoResp.default_branch}`,
-        });
+        })) as { object: { sha: string } };
+        mainSha = mainRef.object.sha;
+        const commit = (await safeRequest('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+          owner,
+          repo,
+          commit_sha: mainSha,
+        })) as { message?: string; tree: { sha: string }; parents?: Array<{ sha: string }> };
+        mainTreeSha = commit.tree.sha;
+        mainParentShas = (commit.parents ?? []).map((parent) => parent.sha);
+        // M2b owns exactly seed + snapshot. Recover the seed only when main
+        // is the root seed or its direct child; deeper/branched history is not
+        // silently adopted and does not require walking the full repo history.
+        if (mainParentShas.length === 0) {
+          seedCommitSha = mainSha;
+          seedOperationId = extractSeedOperationId(commit.message);
+        } else if (mainParentShas.length === 1) {
+          const parentSha = mainParentShas[0];
+          if (parentSha) {
+            const parentCommit = (await safeRequest(
+              'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+              { owner, repo, commit_sha: parentSha },
+            )) as { message?: string; parents?: Array<{ sha: string }> };
+            if ((parentCommit.parents ?? []).length === 0) {
+              seedCommitSha = parentSha;
+              seedOperationId = extractSeedOperationId(parentCommit.message);
+            }
+          }
+        }
+        try {
+          const lockResponse = (await safeRequest('GET /repos/{owner}/{repo}/contents/{path}', {
+            owner,
+            repo,
+            path: 'template.lock',
+            ref: mainSha,
+            mediaType: { format: 'raw' },
+          })) as { content?: string; encoding?: string };
+          templateLock = new TextDecoder().decode(decodeContent(lockResponse));
+        } catch (err) {
+          if ((err as { status?: number }).status !== 404) throw err;
+        }
         empty = false;
       } catch (err) {
         const httpErr = err as { status?: number };
@@ -313,9 +372,16 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
         visibility: normalizeVisibility(repoResp.visibility, repoResp.private),
         empty,
       };
+      if (typeof repoResp.description === 'string') repoState.description = repoResp.description;
       if (initMarker !== undefined) {
         repoState.initMarker = initMarker;
       }
+      if (mainSha !== undefined) repoState.mainSha = mainSha;
+      if (mainTreeSha !== undefined) repoState.mainTreeSha = mainTreeSha;
+      if (mainParentShas !== undefined) repoState.mainParentShas = mainParentShas;
+      if (seedCommitSha !== undefined) repoState.seedCommitSha = seedCommitSha;
+      if (seedOperationId !== undefined) repoState.seedOperationId = seedOperationId;
+      if (templateLock !== undefined) repoState.templateLock = templateLock;
 
       const result: ObservedState = {
         repositoryExists: true,
@@ -346,13 +412,17 @@ function decodeContent(resp: { content?: string; encoding?: string }): Uint8Arra
   return new TextEncoder().encode(resp.content);
 }
 
+function extractSeedOperationId(message: string | undefined): string | undefined {
+  return message?.match(/\[(sha256:[0-9a-f]{64})\]/)?.[1];
+}
+
 function normalizeVisibility(
   apiVisibility: string | undefined,
   isPrivate: boolean,
 ): 'private' | 'internal' | 'public' {
   if (apiVisibility === 'public') return 'public';
   if (apiVisibility === 'internal') return 'internal';
-  return isPrivate ? 'private' : 'private';
+  return isPrivate ? 'private' : 'public';
 }
 
 // Re-export the TemplateManifest type so consumers can use `parseManifest`.

@@ -65,6 +65,8 @@ function buildInitResult(
 export interface ApplyInitPlanDeps {
   reader: GitHubReadPort;
   writer: GitHubWritePort;
+  /** M2b CLI boundary: stop after the repository snapshot is established. */
+  stopAfterSnapshot?: boolean;
 }
 
 /**
@@ -83,7 +85,7 @@ export async function applyInitPlan(
   // Re-render the tree to obtain lock content + file list for seed/snapshot.
   // Rendering is deterministic, so this produces byte-identical output to
   // what compileInitPlan computed.
-  const rendered = await renderForApply(input, deps.reader);
+  const rendered = await renderForApply(input, plan, deps.reader);
 
   const lockContent = rendered.lockYaml;
   const snapshotFiles = rendered.entries
@@ -108,7 +110,7 @@ export async function applyInitPlan(
   const observed: ObservedState = await deps.reader.observe(input);
 
   // Preflight: validate repo name + partial-state detection.
-  preflightCheck(input, plan, observed);
+  preflightCheck(input, plan, observed, lockContent);
 
   // Determine starting phase from observed state.
   const { phase: startPhase, seedCommit } = determineStartPhase(observed, plan);
@@ -199,6 +201,7 @@ export async function applyInitPlan(
     const seedInput: SeedInput = {
       repository,
       lockContent,
+      operationId: plan.operation_id,
     };
 
     const seedResult = await deps.writer.seedMainViaContents(seedInput);
@@ -217,7 +220,7 @@ export async function applyInitPlan(
     currentPhase = 'SEED_MAIN';
   } else {
     // Resume from SEED_MAIN or later — seed commit already exists.
-    const seedSha = seedCommit ?? observed.repository?.initMarker;
+    const seedSha = seedCommit ?? observed.repository?.mainSha;
     operations.push({
       order: 20,
       phase: 'seed',
@@ -236,15 +239,15 @@ export async function applyInitPlan(
     // On fresh seed, we have mainSha/mainTreeSha from the seed call.
     // On resume, we need to read the seed commit SHA from GitHub.
     // publishSnapshot will read the tree SHA from the commit if seedTree is empty.
-    let seedCommitSha = mainSha;
+    const seedCommitSha = mainSha ?? seedCommit ?? observed.repository?.mainSha;
     if (!seedCommitSha) {
-      const headInfo = await readHeadCommit(deps.reader, input, repository);
-      seedCommitSha = headInfo.sha;
+      throw new Error('state machine error: seed commit is unavailable for snapshot recovery');
     }
 
     const snapshotInput: SnapshotInput = {
       repository,
       seedCommit: seedCommitSha,
+      lockContent,
       files: snapshotFiles,
     };
     if (mainTreeSha !== undefined) snapshotInput.seedTree = mainTreeSha;
@@ -294,15 +297,39 @@ export async function applyInitPlan(
   }
 
   // ---- Post-snapshot: update description ----------------------------------
-  // Replace the temporary [sdd-init:<operation_id>] marker with the config
-  // description value. This is a best-effort cosmetic update.
-  if (currentPhase === 'SNAPSHOT_MAIN' && operations.some((o) => o.disposition !== 'noop')) {
+  // Replace the temporary marker only after template.lock + snapshot provide
+  // durable recovery evidence. This is desired state, not best-effort.
+  if (currentPhase === 'SNAPSHOT_MAIN') {
     const description = input.config.repository?.description ?? `${input.product} monorepo`;
-    try {
-      await updateRepoDescription(deps.writer, input, description);
-    } catch {
-      // Silently ignore description update failures — cosmetic only.
+    const settingsChanged =
+      observed.repository?.description !== description ||
+      observed.repository?.defaultBranch !== 'main';
+    if (settingsChanged) {
+      if (!repository) throw new Error('state machine error: repository not set at SNAPSHOT_MAIN');
+      repository = await deps.writer.updateRepositorySettings({
+        repository,
+        description,
+        defaultBranch: 'main',
+      });
     }
+    operations.push({
+      order: 35,
+      phase: 'repository',
+      kind: 'repository.settings',
+      disposition: settingsChanged ? 'update' : 'noop',
+      target: `${input.target.owner}/${input.target.repo}`,
+      result: `default_branch=main, description=${JSON.stringify(description)}`,
+    });
+  }
+
+  if (currentPhase === 'SNAPSHOT_MAIN' && deps.stopAfterSnapshot) {
+    return buildInitResult(
+      'SNAPSHOT_MAIN',
+      operations,
+      'configure-repository',
+      repository,
+      mainSha ?? observed.repository?.mainSha,
+    );
   }
 
   // ---- Phase: REPO_CONFIGURED (labels + teams + envs + repo ruleset) -------
@@ -891,10 +918,11 @@ function isLaterPhase(current: InitPhase, target: InitPhase): boolean {
  */
 async function renderForApply(
   input: ProductInitInput,
+  plan: InitPlan,
   reader: GitHubReadPort,
 ): Promise<ReturnType<typeof renderTree>> {
   const platformRepoRef = parseRepoRef(input.platform.repository);
-  const resolvedCommit = input.platform.ref ?? '';
+  const resolvedCommit = plan.source.resolved_commit;
 
   const tree: ReadonlyTree = await reader.readTemplateTree(
     platformRepoRef,
@@ -902,7 +930,7 @@ async function renderForApply(
     'templates/monorepo-root',
   );
 
-  return renderTree({
+  const rendered = renderTree({
     tree: assembleTree(tree.manifest, [...tree.entries]),
     context: {
       product: input.product,
@@ -916,6 +944,13 @@ async function renderForApply(
     },
     generator: { package: '@sdd/factory', version: '0.1.0' },
   });
+  if (rendered.outputTreeSha256 !== plan.template.output_tree_sha256) {
+    throw new Error(
+      `applyInitPlan: rendered tree digest changed after planning ` +
+        `(plan=${plan.template.output_tree_sha256}, apply=${rendered.outputTreeSha256})`,
+    );
+  }
+  return rendered;
 }
 
 /**
@@ -978,7 +1013,8 @@ function determineStartPhase(
   // Repo has content — assume at least SEED_MAIN.
   // publishSnapshot will check the ref and return noop if already snapshotted.
   const result: { phase: InitPhase; seedCommit?: string } = { phase: 'SEED_MAIN' };
-  if (repo.initMarker !== undefined) result.seedCommit = repo.initMarker;
+  const seed = repo.seedCommitSha ?? (repo.mainParentShas?.length === 0 ? repo.mainSha : undefined);
+  if (seed !== undefined) result.seedCommit = seed;
   return result;
 }
 
@@ -990,13 +1026,21 @@ function determineStartPhase(
  *
  * team/env/ruleset capability checks are M2c scope.
  */
-function preflightCheck(input: ProductInitInput, plan: InitPlan, observed: ObservedState): void {
+function preflightCheck(
+  input: ProductInitInput,
+  plan: InitPlan,
+  observed: ObservedState,
+  expectedLock: string,
+): void {
   // Repo name was already validated in compileInitPlan (validateSlug).
   // Here we check for conflicts based on observed state.
 
   if (observed.repositoryExists && observed.repository) {
     const repo = observed.repository;
-    const isOurOperation = repo.initMarker === plan.operation_id;
+    const markerMatches = repo.initMarker === plan.operation_id;
+    const lockMatches = repo.templateLock === expectedLock;
+    const seedMarkerMatches = repo.seedOperationId === plan.operation_id;
+    const isOurOperation = repo.empty ? markerMatches : lockMatches && seedMarkerMatches;
 
     if (!isOurOperation && !repo.empty) {
       // Repo exists, is not empty, and was not created by us → conflict.
@@ -1018,39 +1062,4 @@ function preflightCheck(input: ProductInitInput, plan: InitPlan, observed: Obser
   }
 
   // If repo doesn't exist, we'll create it. No preflight error.
-}
-
-/**
- * Read the current HEAD commit SHA from the target repo.
- * Used when resuming from SEED_MAIN without cached seed commit SHA.
- */
-async function readHeadCommit(
-  reader: GitHubReadPort,
-  input: ProductInitInput,
-  _repository: RepositoryIdentity,
-): Promise<{ sha: string }> {
-  const resolved = await reader.resolveCommit(
-    { owner: input.target.owner, repo: input.target.repo },
-    'main',
-  );
-  return { sha: resolved.commit };
-}
-
-/**
- * Best-effort description update. Uses createRepository as a proxy since
- * the write port doesn't have a dedicated update endpoint in M2b.
- * In M2c this will use a proper PATCH /repos/{owner}/{repo} call.
- */
-async function updateRepoDescription(
-  writer: GitHubWritePort,
-  input: ProductInitInput,
-  description: string,
-): Promise<void> {
-  // M2b write port doesn't have a dedicated update endpoint.
-  // The description update is cosmetic and will be properly implemented
-  // in M2c via reconcileRepositoryRuleset or a dedicated update method.
-  // For now, we skip this — the init marker description is sufficient.
-  void writer;
-  void input;
-  void description;
 }

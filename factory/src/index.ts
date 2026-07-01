@@ -27,6 +27,7 @@ export {
   reconcileOrgWorkflowRuleset,
   reconcileRepositoryRuleset,
   seedMainViaContents,
+  updateRepositorySettings,
   upsertBootstrapPull,
 } from './github-write.js';
 // Init orchestrator (M2b + M2c)
@@ -85,6 +86,7 @@ export type {
   RenderInput,
   RepoRef,
   RepositoryIdentity,
+  RepositorySettingsInput,
   Requirement,
   ResolvedCommit,
   RulesetInput,

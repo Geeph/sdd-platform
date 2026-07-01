@@ -50,11 +50,12 @@ function derivePlatformRepo(): { owner: string; repo: string } {
 async function runCli(
   args: string[],
   cwd?: string,
+  envOverrides: NodeJS.ProcessEnv = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   try {
     const { stdout, stderr } = await execFileP('node', [CLI_BIN, ...args], {
       cwd: cwd ?? REPO_ROOT,
-      env: { ...process.env, NODE_ENV: 'test' },
+      env: { ...process.env, NODE_ENV: 'test', ...envOverrides },
     });
     return { stdout, stderr, code: 0 };
   } catch (err) {
@@ -70,7 +71,7 @@ describe('sdd product init', () => {
     expect(stdout).toMatch(/Bootstrap a product repository/);
   });
 
-  it('refuses real execution in M2a', async () => {
+  it('requires a pinned platform ref for real execution', async () => {
     const platform = derivePlatformRepo();
     const { stderr, code } = await runCli([
       'product',
@@ -84,7 +85,30 @@ describe('sdd product init', () => {
       resolve(FIXTURES, 'product-init-valid.yaml'),
     ]);
     expect(code).not.toBe(0);
-    expect(normalizeError(stderr)).toMatch(/not implemented in M2a/);
+    expect(normalizeError(stderr)).toMatch(/--platform-ref is required/);
+  });
+
+  it('requires GITHUB_TOKEN for real execution', async () => {
+    const platform = derivePlatformRepo();
+    const { stderr, code } = await runCli(
+      [
+        'product',
+        'init',
+        'demo',
+        '--owner',
+        platform.owner,
+        '--platform-repo',
+        `${platform.owner}/${platform.repo}`,
+        '--platform-ref',
+        'a'.repeat(40),
+        '--config',
+        resolve(FIXTURES, 'product-init-valid.yaml'),
+      ],
+      undefined,
+      { GITHUB_TOKEN: '' },
+    );
+    expect(code).toBe(2);
+    expect(normalizeError(stderr)).toMatch(/GITHUB_TOKEN/);
   });
 
   it('dry-run JSON produces byte-identical output', async () => {

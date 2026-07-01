@@ -1,11 +1,11 @@
 /**
  * `sdd product init` — bootstrap a product repository.
  *
- * M2a scope: only `--dry-run` is implemented. The real execution path is
- * stubbed (prints "not implemented in M2a").
+ * M2b real execution establishes the repository through SNAPSHOT_MAIN and
+ * returns `configure-repository`; M2c continues with GitHub configuration.
  *
  * Flags:
- *   --dry-run             Required in M2a; zero GitHub writes.
+ *   --dry-run             Preview only; zero GitHub writes.
  *   --format text|json    Output format (default text).
  *   --owner <org>         Target GitHub org (required).
  *   --mode monorepo       Only "monorepo" supported.
@@ -19,15 +19,23 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Args, Command, Flags } from '@oclif/core';
-import type { ProductInitConfig, ProductInitInput } from '@sdd/factory';
+import {
+  applyInitPlan,
+  createReadonlyGitHubPort,
+  createWriteGitHubPort,
+  type InitResult,
+  type ProductInitConfig,
+  type ProductInitInput,
+} from '@sdd/factory';
 import { validateProductInitDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
+import { createGitHubRequestClient } from '../../github-client.js';
 import { compileInitPlan, serializeInitPlan, validateProductInitConfig } from '../../init-lib.js';
 
 const DEFAULT_PLATFORM_REPO_NAME = 'sdd-platform';
 
 export default class ProductInit extends Command {
-  static override description = 'Bootstrap a product repository (M2a: dry-run only)';
+  static override description = 'Bootstrap a product repository';
 
   static override examples = [
     '<%= config.bin %> product init demo --owner acme --platform-repo acme/sdd-platform --config product-init.yaml --dry-run --format json',
@@ -61,7 +69,7 @@ export default class ProductInit extends Command {
       default: 'text',
     }),
     'dry-run': Flags.boolean({
-      description: 'Preview only; zero GitHub writes (M2a only supports this mode)',
+      description: 'Preview only; zero GitHub writes',
       default: false,
     }),
   };
@@ -76,10 +84,12 @@ export default class ProductInit extends Command {
   async run(): Promise<void> {
     const { flags, args } = await this.parse(ProductInit);
 
-    if (!flags['dry-run']) {
-      this.error('Real execution is not implemented in M2a. Use --dry-run to preview.', {
-        exit: 2,
-      });
+    if (!flags['dry-run'] && !flags['platform-ref']) {
+      this.error('--platform-ref is required for real execution', { exit: 2 });
+    }
+    const githubToken = flags['dry-run'] ? undefined : process.env.GITHUB_TOKEN;
+    if (!flags['dry-run'] && !githubToken) {
+      this.error('GITHUB_TOKEN environment variable is required', { exit: 2 });
     }
 
     // Detect whether user passed --platform-repo explicitly.
@@ -152,9 +162,31 @@ export default class ProductInit extends Command {
       config,
     };
 
-    // Compile the plan using the local-fs reader (no GitHub calls needed for
-    // a deterministic preview against the local templates tree).
     try {
+      if (!flags['dry-run']) {
+        const client = createGitHubRequestClient(githubToken as string);
+        const reader = createReadonlyGitHubPort(client);
+        const writer = createWriteGitHubPort(client);
+        const plan = await compileInitPlan(input, reader);
+        const result = await applyInitPlan(input, plan, {
+          reader,
+          writer,
+          stopAfterSnapshot: true,
+        });
+        if (flags.format === 'json') {
+          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        } else {
+          this.log(renderTextResult(result));
+        }
+        const hasConflict = result.operations.some(
+          (operation) => operation.disposition === 'conflict',
+        );
+        if (hasConflict) process.exitCode = 5;
+        else if (result.nextAction === 'blocked') process.exitCode = 3;
+        return;
+      }
+
+      // dry-run uses only local commit blobs and never constructs a writer.
       const reader = await createLocalFsReader();
       const plan = await compileInitPlan(input, reader);
 
@@ -179,9 +211,42 @@ export default class ProductInit extends Command {
         this.log(renderTextPlan(plan));
       }
     } catch (err) {
-      this.error((err as Error).message, { exit: 2 });
+      const error = err as Error & { status?: number; transient?: boolean };
+      const status = error.status;
+      const exit =
+        error.transient === true ||
+        status === 429 ||
+        (status !== undefined && status >= 500) ||
+        /rate limit/i.test(error.message)
+          ? 6
+          : status === 401 || status === 403
+            ? 3
+            : status === 409 || status === 422 || /conflict|marker mismatch/i.test(error.message)
+              ? 5
+              : 2;
+      this.error(error.message, { exit });
     }
   }
+}
+
+function renderTextResult(result: InitResult): string {
+  const lines = [
+    '# sdd product init',
+    '',
+    `phase:       ${result.phase}`,
+    `next_action: ${result.nextAction}`,
+  ];
+  if (result.repository) {
+    lines.push(`repository:  ${result.repository.owner}/${result.repository.name}`);
+  }
+  if (result.mainSha) lines.push(`main:        ${result.mainSha}`);
+  lines.push('', '## Operations');
+  for (const operation of result.operations) {
+    lines.push(
+      `  [${operation.disposition.padEnd(8)}] ${operation.phase.padEnd(16)} ${operation.kind}`,
+    );
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 /**

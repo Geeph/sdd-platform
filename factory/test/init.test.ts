@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { applyInitPlan } from '../src/init.js';
+import { computeOutputTreeDigest, renderTree } from '../src/render.js';
 import { assembleTree, parseManifest, sha256Hex } from '../src/resolve.js';
 import type {
   CommitIdentity,
@@ -72,7 +73,11 @@ function makePlan(overrides: Partial<InitPlan> = {}): InitPlan {
       path: 'templates/monorepo-root',
       manifest_sha256: 'sha256:manifest',
       source_tree_sha256: 'sha256:source-tree',
-      output_tree_sha256: 'sha256:output-tree',
+      output_tree_sha256: computeOutputTreeDigest([
+        { path: 'AGENTS.md', mode: '100644', content: utf8('# Agents for demo') },
+        { path: 'README.md', mode: '100644', content: utf8('# demo') },
+        { path: 'template.lock', mode: '100644', content: utf8('schema_version: 1') },
+      ]),
       files: [
         { target: 'AGENTS.md', mode: '100644', render: true, output_sha256: 'sha256:agents' },
         { target: 'README.md', mode: '100644', render: true, output_sha256: 'sha256:readme' },
@@ -124,6 +129,29 @@ function makeTestManifestFromEntries(entries: TemplateTreeEntry[]): TemplateMani
   });
 }
 
+function expectedLock(): string {
+  const tree = assembleTree(makeTestManifest(), makeTestEntries());
+  return renderTree({
+    tree,
+    context: {
+      product: 'demo',
+      repo: 'acme',
+      owners: {
+        product: 'product-team',
+        api: 'api-owners',
+        design: 'design-team',
+        admins: 'platform-admins',
+      },
+    },
+    source: {
+      repository: 'acme/sdd-platform',
+      requestedRef: 'v1.0.0',
+      resolvedCommit: 'a'.repeat(40),
+    },
+    generator: { package: '@sdd/factory', version: '0.1.0' },
+  }).lockYaml;
+}
+
 /**
  * Create a fake reader that returns a configurable observed state and
  * serves a minimal template tree.
@@ -163,6 +191,10 @@ function createFakeWriter(responses: {
         defaultBranch: 'main',
         visibility: 'private',
       };
+    },
+    async updateRepositorySettings(input) {
+      calls.push('updateRepositorySettings');
+      return { ...input.repository, defaultBranch: input.defaultBranch };
     },
     async seedMainViaContents() {
       calls.push('seedMainViaContents');
@@ -239,6 +271,7 @@ describe('applyInitPlan — happy path', () => {
       'createRepository',
       'seedMainViaContents',
       'publishSnapshot',
+      'updateRepositorySettings',
       'reconcileLabels',
       'grantTeamPermissions',
       'reconcileRepositoryRuleset',
@@ -260,6 +293,34 @@ describe('applyInitPlan — happy path', () => {
     expect(result.operations.find((o) => o.phase === 'ruleset')).toBeDefined();
     expect(result.operations.find((o) => o.phase === 'org-workflows')).toBeDefined();
     expect(result.operations.find((o) => o.phase === 'bootstrap-pull')).toBeDefined();
+  });
+
+  it('stops at SNAPSHOT_MAIN for the M2b CLI boundary', async () => {
+    const observed: ObservedState = {
+      repositoryExists: false,
+      existingLabels: [],
+      knownTeams: [],
+      existingEnvironments: [],
+      repositoryRulesetExists: false,
+      orgWorkflowRulesetExists: false,
+    };
+    const reader = createFakeReader(observed);
+    const { writer, calls } = createFakeWriter({});
+
+    const result = await applyInitPlan(makeInput(), makePlan(), {
+      reader,
+      writer,
+      stopAfterSnapshot: true,
+    });
+
+    expect(result.phase).toBe('SNAPSHOT_MAIN');
+    expect(result.nextAction).toBe('configure-repository');
+    expect(calls).toEqual([
+      'createRepository',
+      'seedMainViaContents',
+      'publishSnapshot',
+      'updateRepositorySettings',
+    ]);
   });
 });
 
@@ -291,6 +352,7 @@ describe('applyInitPlan — resume / idempotency', () => {
     expect(calls).toEqual([
       'seedMainViaContents',
       'publishSnapshot',
+      'updateRepositorySettings',
       'reconcileLabels',
       'grantTeamPermissions',
       'reconcileRepositoryRuleset',
@@ -308,6 +370,10 @@ describe('applyInitPlan — resume / idempotency', () => {
         visibility: 'private',
         empty: false,
         initMarker: TEST_OPERATION_ID,
+        mainSha: 'seed-commit-sha',
+        mainParentShas: [],
+        seedOperationId: TEST_OPERATION_ID,
+        templateLock: expectedLock(),
       },
       existingLabels: [],
       knownTeams: [],
@@ -327,6 +393,7 @@ describe('applyInitPlan — resume / idempotency', () => {
     // Should NOT call createRepository or seedMainViaContents (resume from SEED_MAIN).
     expect(calls).toEqual([
       'publishSnapshot',
+      'updateRepositorySettings',
       'reconcileLabels',
       'grantTeamPermissions',
       'reconcileRepositoryRuleset',
@@ -344,6 +411,11 @@ describe('applyInitPlan — resume / idempotency', () => {
         visibility: 'private',
         empty: false,
         initMarker: TEST_OPERATION_ID,
+        mainSha: 'existing-snap-sha',
+        mainParentShas: ['seed-commit-sha'],
+        seedCommitSha: 'seed-commit-sha',
+        seedOperationId: TEST_OPERATION_ID,
+        templateLock: expectedLock(),
       },
       existingLabels: [],
       knownTeams: [],
@@ -362,6 +434,7 @@ describe('applyInitPlan — resume / idempotency', () => {
     expect(result.phase).toBe('AWAITING_HUMAN');
     expect(calls).toEqual([
       'publishSnapshot',
+      'updateRepositorySettings',
       'reconcileLabels',
       'grantTeamPermissions',
       'reconcileRepositoryRuleset',
@@ -459,30 +532,51 @@ describe('applyInitPlan — spec invariants', () => {
       orgWorkflowRulesetExists: false,
     };
 
+    const appEntries: TemplateTreeEntry[] = [
+      { path: 'template.lock', mode: '100644', content: utf8('lock') },
+      { path: 'apps/backend/main.ts', mode: '100644', content: utf8('app') },
+    ];
+    const appFiles = appEntries.map((e) => ({
+      path: e.path,
+      mode: e.mode,
+      render: false,
+      sha256: sha256Hex(e.content),
+    }));
+    const appLines = appFiles.map((f) => `${f.mode}  ${f.sha256}  ${f.path}`).join('\n');
+    const appTreeSha = sha256Hex(`${appLines}\n`);
+    const manifest = parseManifest({
+      template: 'monorepo-root',
+      path: 'templates/monorepo-root',
+      tree_sha256: appTreeSha,
+      files: appFiles,
+    });
+    const tree = assembleTree(manifest, appEntries);
+    const rendered = renderTree({
+      tree,
+      context: {
+        product: 'demo',
+        repo: 'acme',
+        owners: {
+          product: 'product-team',
+          api: 'api-owners',
+          design: 'design-team',
+          admins: 'platform-admins',
+        },
+      },
+      source: {
+        repository: 'acme/sdd-platform',
+        requestedRef: 'v1.0.0',
+        resolvedCommit: 'a'.repeat(40),
+      },
+      generator: { package: '@sdd/factory', version: '0.1.0' },
+    });
+
     const reader: GitHubReadPort = {
       async resolveCommit() {
         return { commit: 'a'.repeat(40), requestedRef: 'v1.0.0', peeled: false };
       },
       async readTemplateTree() {
-        const appEntries: TemplateTreeEntry[] = [
-          { path: 'template.lock', mode: '100644', content: utf8('lock') },
-          { path: 'apps/backend/main.ts', mode: '100644', content: utf8('app') },
-        ];
-        const appFiles = appEntries.map((e) => ({
-          path: e.path,
-          mode: e.mode,
-          render: false,
-          sha256: sha256Hex(e.content),
-        }));
-        const appLines = appFiles.map((f) => `${f.mode}  ${f.sha256}  ${f.path}`).join('\n');
-        const appTreeSha = sha256Hex(`${appLines}\n`);
-        const manifest = parseManifest({
-          template: 'monorepo-root',
-          path: 'templates/monorepo-root',
-          tree_sha256: appTreeSha,
-          files: appFiles,
-        });
-        return assembleTree(manifest, appEntries);
+        return tree;
       },
       async observe() {
         return observed;
@@ -491,9 +585,14 @@ describe('applyInitPlan — spec invariants', () => {
 
     const { writer } = createFakeWriter({});
 
-    await expect(applyInitPlan(makeInput(), makePlan(), { reader, writer })).rejects.toThrow(
-      'apps/*',
-    );
+    const plan = makePlan({
+      template: {
+        ...makePlan().template,
+        output_tree_sha256: computeOutputTreeDigest(rendered.entries),
+      },
+    });
+
+    await expect(applyInitPlan(makeInput(), plan, { reader, writer })).rejects.toThrow('apps/*');
   });
 
   it('does NOT call any M2c write methods', async () => {
@@ -516,6 +615,7 @@ describe('applyInitPlan — spec invariants', () => {
       'createRepository',
       'seedMainViaContents',
       'publishSnapshot',
+      'updateRepositorySettings',
       'reconcileLabels',
       'grantTeamPermissions',
       'reconcileRepositoryRuleset',

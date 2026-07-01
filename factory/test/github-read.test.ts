@@ -105,7 +105,7 @@ describe('createReadonlyGitHubPort', () => {
     // Exactly 3 calls: 1 ref + 2 tags (outer + inner).
     expect(calls).toHaveLength(3);
     expect(calls[0]?.route).toBe('GET /repos/{owner}/{repo}/git/ref/{ref}');
-    expect(calls[0]?.params.ref).toBe('v2.0.0');
+    expect(calls[0]?.params.ref).toBe('tags/v2.0.0');
     expect(calls[1]?.route).toBe('GET /repos/{owner}/{repo}/git/tags/{tag_sha}');
     expect(calls[1]?.params.tag_sha).toBe('tag-outer');
     expect(calls[2]?.route).toBe('GET /repos/{owner}/{repo}/git/tags/{tag_sha}');
@@ -123,6 +123,27 @@ describe('createReadonlyGitHubPort', () => {
     ).rejects.toThrow(/unsupported object type/);
   });
 
+  it('falls back from a missing tag to a branch ref', async () => {
+    const responses = new Map<string, unknown>([
+      [
+        'GET /repos/{owner}/{repo}/git/ref/{ref}',
+        (params: { ref: string }) => {
+          if (params.ref === 'tags/release') {
+            throw Object.assign(new Error('not found'), { status: 404 });
+          }
+          return { object: { type: 'commit', sha: 'a'.repeat(40) } };
+        },
+      ],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+    const port = createReadonlyGitHubPort(octokit);
+
+    await expect(
+      port.resolveCommit({ owner: 'acme', repo: 'sdd-platform' }, 'release'),
+    ).resolves.toMatchObject({ commit: 'a'.repeat(40), peeled: false });
+    expect(calls.map((call) => call.params.ref)).toEqual(['tags/release', 'heads/release']);
+  });
+
   it('lowers case on commit SHAs', async () => {
     const responses = new Map<string, unknown>([
       [
@@ -134,5 +155,65 @@ describe('createReadonlyGitHubPort', () => {
     const port = createReadonlyGitHubPort(octokit);
     const result = await port.resolveCommit({ owner: 'acme', repo: 'sdd-platform' }, 'main');
     expect(result.commit).toBe(result.commit.toLowerCase());
+  });
+
+  it('observes main, seed parent, and template.lock for crash recovery', async () => {
+    const responses = new Map<string, unknown>([
+      [
+        'GET /repos/{owner}/{repo}',
+        {
+          id: 42,
+          name: 'demo',
+          owner: { login: 'acme' },
+          default_branch: 'main',
+          private: true,
+          visibility: 'private',
+          description: 'Demo product',
+        },
+      ],
+      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'snapshot-sha' } }],
+      [
+        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+        (params: { commit_sha: string }) =>
+          params.commit_sha === 'snapshot-sha'
+            ? {
+                message: 'snapshot',
+                tree: { sha: 'snapshot-tree' },
+                parents: [{ sha: 'seed-sha' }],
+              }
+            : {
+                message: `sdd-init: seed template.lock [sha256:${'a'.repeat(64)}]`,
+                tree: { sha: 'seed-tree' },
+                parents: [],
+              },
+      ],
+      [
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        { content: Buffer.from('schema_version: 1\n').toString('base64'), encoding: 'base64' },
+      ],
+    ]);
+    const { octokit } = createFakeOctokit(responses);
+    const port = createReadonlyGitHubPort(octokit);
+
+    const observed = await port.observe({
+      product: 'demo',
+      target: { owner: 'acme', repo: 'demo', visibility: 'private' },
+      mode: 'monorepo',
+      platform: { repository: 'acme/sdd-platform', ref: 'a'.repeat(40) },
+      config: {
+        schema_version: 1,
+        bootstrap: { approvers: ['admins'] },
+        owners: { product: 'product', api: 'api', design: 'design', admins: 'admins' },
+      },
+    });
+
+    expect(observed.repository).toMatchObject({
+      mainSha: 'snapshot-sha',
+      mainTreeSha: 'snapshot-tree',
+      mainParentShas: ['seed-sha'],
+      seedCommitSha: 'seed-sha',
+      seedOperationId: `sha256:${'a'.repeat(64)}`,
+      templateLock: 'schema_version: 1\n',
+    });
   });
 });

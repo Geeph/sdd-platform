@@ -7,6 +7,7 @@
  * non-force ref advance).
  */
 
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   createRepository,
@@ -14,6 +15,7 @@ import {
   type OctokitMutate,
   publishSnapshot,
   seedMainViaContents,
+  updateRepositorySettings,
 } from '../src/index.js';
 import type { RepositoryIdentity } from '../src/types.js';
 
@@ -35,7 +37,11 @@ function createFakeOctokit(responses: Map<string, unknown> = new Map()): {
       calls.push({ route, params: parameters });
       const key = `${route.split(' ')[0]} ${route.split(' ')[1]}`;
       if (responses.has(key)) {
-        return responses.get(key);
+        const response = responses.get(key);
+        if (typeof response === 'function') {
+          return (response as (parameters: Record<string, unknown>) => unknown)(parameters);
+        }
+        return response;
       }
       // Default: return empty object.
       return {};
@@ -48,6 +54,14 @@ function createFakeOctokit(responses: Map<string, unknown> = new Map()): {
 function utf8(s: string): Uint8Array {
   return new TextEncoder().encode(s);
 }
+
+function blobSha(content: Uint8Array | string): string {
+  const bytes = typeof content === 'string' ? Buffer.from(content) : Buffer.from(content);
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+const OPERATION_ID = `sha256:${'a'.repeat(64)}`;
+const SEED_MESSAGE = `sdd-init: seed template.lock [${OPERATION_ID}]`;
 
 // ---- createRepository -----------------------------------------------------
 
@@ -88,7 +102,7 @@ describe('createRepository', () => {
     expect(calls[0].params).toEqual({
       org: 'acme',
       name: 'demo',
-      description: 'sha256:abc123',
+      description: '[sdd-init:sha256:abc123]',
       private: true,
       visibility: 'private',
       auto_init: false,
@@ -104,6 +118,7 @@ describe('createRepository', () => {
       private: false,
       visibility: 'public',
       default_branch: 'main',
+      description: 'test',
     });
     const { octokit } = createFakeOctokit(responses);
 
@@ -117,6 +132,82 @@ describe('createRepository', () => {
 
     expect(result.visibility).toBe('public');
   });
+
+  it('confirms an ambiguous create failure without replaying POST', async () => {
+    const error = Object.assign(new Error('response lost'), { status: 500 });
+    const responses = new Map<string, unknown>([
+      [
+        'POST /orgs/{org}/repos',
+        () => {
+          throw error;
+        },
+      ],
+      [
+        'GET /repos/{owner}/{repo}',
+        {
+          id: 7,
+          name: 'demo',
+          owner: { login: 'acme' },
+          private: true,
+          visibility: 'private',
+          default_branch: 'main',
+          description: '[sdd-init:sha256:abc123]',
+        },
+      ],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    const result = await createRepository(octokit, {
+      owner: 'acme',
+      name: 'demo',
+      visibility: 'private',
+      description: '[sdd-init:sha256:abc123]',
+      initMarker: 'sha256:abc123',
+    });
+
+    expect(result.id).toBe(7);
+    expect(calls.filter((call) => call.route.startsWith('POST'))).toHaveLength(1);
+  });
+});
+
+// ---- updateRepositorySettings -------------------------------------------
+
+describe('updateRepositorySettings', () => {
+  it('sets main + description and verifies both by read-back', async () => {
+    const observed = {
+      id: 12345,
+      name: 'demo',
+      owner: { login: 'acme' },
+      private: true,
+      visibility: 'private',
+      default_branch: 'main',
+      description: 'Demo monorepo',
+    };
+    const responses = new Map<string, unknown>([
+      ['PATCH /repos/{owner}/{repo}', observed],
+      ['GET /repos/{owner}/{repo}', observed],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+    const repository: RepositoryIdentity = {
+      owner: 'acme',
+      name: 'demo',
+      id: 12345,
+      defaultBranch: 'master',
+      visibility: 'private',
+    };
+
+    await expect(
+      updateRepositorySettings(octokit, {
+        repository,
+        description: 'Demo monorepo',
+        defaultBranch: 'main',
+      }),
+    ).resolves.toMatchObject({ defaultBranch: 'main' });
+    expect(calls[0]?.params).toMatchObject({
+      description: 'Demo monorepo',
+      default_branch: 'main',
+    });
+  });
 });
 
 // ---- seedMainViaContents --------------------------------------------------
@@ -124,13 +215,14 @@ describe('createRepository', () => {
 describe('seedMainViaContents', () => {
   it('writes template.lock via Contents API and reads back commit', async () => {
     const seedResp = {
-      content: {
-        commit: { sha: 'aaa111' },
-      },
+      content: { path: 'template.lock' },
+      commit: { sha: 'aaa111' },
     };
     const commitResp = {
       sha: 'aaa111',
+      message: SEED_MESSAGE,
       tree: { sha: 'tree-seed' },
+      parents: [],
     };
 
     const responses = new Map<string, unknown>();
@@ -149,6 +241,7 @@ describe('seedMainViaContents', () => {
     const result = await seedMainViaContents(octokit, {
       repository: repo,
       lockContent: 'schema_version: 1\n...',
+      operationId: OPERATION_ID,
     });
 
     expect(result).toEqual({
@@ -183,8 +276,135 @@ describe('seedMainViaContents', () => {
     };
 
     await expect(
-      seedMainViaContents(octokit, { repository: repo, lockContent: 'test' }),
+      seedMainViaContents(octokit, {
+        repository: repo,
+        lockContent: 'test',
+        operationId: OPERATION_ID,
+      }),
     ).rejects.toThrow('no commit SHA');
+  });
+
+  it('confirms exact lock content after an ambiguous PUT failure', async () => {
+    const error = Object.assign(new Error('response lost'), { status: 500 });
+    const lockContent = 'schema_version: 1\n';
+    const responses = new Map<string, unknown>([
+      [
+        'PUT /repos/{owner}/{repo}/contents/{path}',
+        () => {
+          throw error;
+        },
+      ],
+      [
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        { content: Buffer.from(lockContent).toString('base64'), encoding: 'base64' },
+      ],
+      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'seed-sha' } }],
+      [
+        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+        { sha: 'seed-sha', message: SEED_MESSAGE, tree: { sha: 'seed-tree' }, parents: [] },
+      ],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+    const repository: RepositoryIdentity = {
+      owner: 'acme',
+      name: 'demo',
+      id: 1,
+      defaultBranch: 'main',
+      visibility: 'private',
+    };
+
+    await expect(
+      seedMainViaContents(octokit, { repository, lockContent, operationId: OPERATION_ID }),
+    ).resolves.toEqual({
+      sha: 'seed-sha',
+      treeSha: 'seed-tree',
+    });
+    expect(calls.filter((call) => call.route.startsWith('PUT'))).toHaveLength(1);
+  });
+
+  it('recovers the root seed when a concurrent run already published the snapshot', async () => {
+    const error = Object.assign(new Error('already exists'), { status: 422 });
+    const lockContent = 'schema_version: 1\n';
+    const responses = new Map<string, unknown>([
+      [
+        'PUT /repos/{owner}/{repo}/contents/{path}',
+        () => {
+          throw error;
+        },
+      ],
+      [
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        { content: Buffer.from(lockContent).toString('base64'), encoding: 'base64' },
+      ],
+      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'snapshot-sha' } }],
+      [
+        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+        (parameters: Record<string, unknown>) =>
+          parameters.commit_sha === 'snapshot-sha'
+            ? {
+                sha: 'snapshot-sha',
+                tree: { sha: 'snapshot-tree' },
+                parents: [{ sha: 'seed-sha' }],
+              }
+            : {
+                sha: 'seed-sha',
+                message: SEED_MESSAGE,
+                tree: { sha: 'seed-tree' },
+                parents: [],
+              },
+      ],
+    ]);
+    const { octokit } = createFakeOctokit(responses);
+    const repository: RepositoryIdentity = {
+      owner: 'acme',
+      name: 'demo',
+      id: 1,
+      defaultBranch: 'main',
+      visibility: 'private',
+    };
+
+    await expect(
+      seedMainViaContents(octokit, { repository, lockContent, operationId: OPERATION_ID }),
+    ).resolves.toEqual({ sha: 'seed-sha', treeSha: 'seed-tree' });
+  });
+
+  it('rejects an ambiguous PUT owned by a different seed operation', async () => {
+    const error = Object.assign(new Error('already exists'), { status: 422 });
+    const lockContent = 'schema_version: 1\n';
+    const responses = new Map<string, unknown>([
+      [
+        'PUT /repos/{owner}/{repo}/contents/{path}',
+        () => {
+          throw error;
+        },
+      ],
+      [
+        'GET /repos/{owner}/{repo}/contents/{path}',
+        { content: Buffer.from(lockContent).toString('base64'), encoding: 'base64' },
+      ],
+      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'seed-sha' } }],
+      [
+        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+        {
+          sha: 'seed-sha',
+          message: `sdd-init: seed template.lock [sha256:${'b'.repeat(64)}]`,
+          tree: { sha: 'seed-tree' },
+          parents: [],
+        },
+      ],
+    ]);
+    const { octokit } = createFakeOctokit(responses);
+    const repository: RepositoryIdentity = {
+      owner: 'acme',
+      name: 'demo',
+      id: 1,
+      defaultBranch: 'main',
+      visibility: 'private',
+    };
+
+    await expect(
+      seedMainViaContents(octokit, { repository, lockContent, operationId: OPERATION_ID }),
+    ).rejects.toThrow('not this operation');
   });
 });
 
@@ -206,14 +426,19 @@ describe('publishSnapshot', () => {
     responses.set('GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'seed-sha' } });
 
     // Blob creation (2 files).
-    responses.set('POST /repos/{owner}/{repo}/git/blobs', { sha: 'blob-sha-1' });
+    responses.set('POST /repos/{owner}/{repo}/git/blobs', (params: Record<string, unknown>) => ({
+      sha: blobSha(Buffer.from(params.content as string, 'base64')),
+    }));
 
     // Tree creation.
     responses.set('POST /repos/{owner}/{repo}/git/trees', {
       sha: 'tree-snapshot',
+    });
+    responses.set('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
       tree: [
-        { path: 'AGENTS.md', mode: '100644', type: 'blob', sha: 'blob-sha-1' },
-        { path: 'README.md', mode: '100644', type: 'blob', sha: 'blob-sha-2' },
+        { path: 'template.lock', mode: '100644', type: 'blob', sha: blobSha('lock') },
+        { path: 'AGENTS.md', mode: '100644', type: 'blob', sha: blobSha('# Agents') },
+        { path: 'README.md', mode: '100644', type: 'blob', sha: blobSha('# Readme') },
       ],
     });
 
@@ -234,6 +459,7 @@ describe('publishSnapshot', () => {
       repository: baseRepo,
       seedCommit: 'seed-sha',
       seedTree: 'tree-seed',
+      lockContent: 'lock',
       files: [
         { path: 'AGENTS.md', mode: '100644', content: utf8('# Agents') },
         { path: 'README.md', mode: '100644', content: utf8('# Readme') },
@@ -272,17 +498,97 @@ describe('publishSnapshot', () => {
     responses.set('GET /repos/{owner}/{repo}/git/ref/{ref}', {
       object: { sha: 'someone-else-sha' },
     });
+    responses.set('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+      tree: { sha: 'foreign-tree' },
+      parents: [{ sha: 'different-parent' }],
+    });
     const { octokit } = createFakeOctokit(responses);
 
     const result = await publishSnapshot(octokit, {
       repository: baseRepo,
       seedCommit: 'seed-sha',
       seedTree: 'tree-seed',
+      lockContent: 'lock',
       files: [{ path: 'AGENTS.md', mode: '100644', content: utf8('test') }],
     });
 
     expect(result.disposition).toBe('conflict');
     expect(result.sha).toBe('someone-else-sha');
+  });
+
+  it('returns noop when main already contains the exact snapshot', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+      object: { sha: 'snapshot-sha' },
+    });
+    responses.set('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+      tree: { sha: 'snapshot-tree' },
+      parents: [{ sha: 'seed-sha' }],
+    });
+    responses.set('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+      tree: [
+        { path: 'template.lock', mode: '100644', type: 'blob', sha: blobSha('lock') },
+        { path: 'AGENTS.md', mode: '100644', type: 'blob', sha: blobSha('agents') },
+      ],
+    });
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    const result = await publishSnapshot(octokit, {
+      repository: baseRepo,
+      seedCommit: 'seed-sha',
+      lockContent: 'lock',
+      files: [{ path: 'AGENTS.md', mode: '100644', content: utf8('agents') }],
+    });
+
+    expect(result).toEqual({
+      sha: 'snapshot-sha',
+      treeSha: 'snapshot-tree',
+      disposition: 'noop',
+    });
+    expect(calls.some((call) => call.route.startsWith('POST'))).toBe(false);
+    expect(calls.some((call) => call.route.startsWith('PATCH'))).toBe(false);
+  });
+
+  it('confirms ref state after a lost PATCH response without replaying PATCH', async () => {
+    let refReads = 0;
+    const responses = new Map<string, unknown>();
+    responses.set('GET /repos/{owner}/{repo}/git/ref/{ref}', () => {
+      refReads++;
+      return { object: { sha: refReads === 1 ? 'seed-sha' : 'snapshot-sha' } };
+    });
+    responses.set('POST /repos/{owner}/{repo}/git/blobs', (params: Record<string, unknown>) => ({
+      sha: blobSha(Buffer.from(params.content as string, 'base64')),
+    }));
+    responses.set('POST /repos/{owner}/{repo}/git/trees', { sha: 'snapshot-tree' });
+    responses.set('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+      tree: [
+        { path: 'template.lock', mode: '100644', type: 'blob', sha: blobSha('lock') },
+        { path: 'README.md', mode: '100644', type: 'blob', sha: blobSha('readme') },
+      ],
+    });
+    responses.set('POST /repos/{owner}/{repo}/git/commits', {
+      sha: 'snapshot-sha',
+      tree: { sha: 'snapshot-tree' },
+    });
+    responses.set('PATCH /repos/{owner}/{repo}/git/refs/{ref}', () => {
+      throw Object.assign(new Error('response lost'), { status: 500 });
+    });
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    await expect(
+      publishSnapshot(octokit, {
+        repository: baseRepo,
+        seedCommit: 'seed-sha',
+        seedTree: 'seed-tree',
+        lockContent: 'lock',
+        files: [{ path: 'README.md', mode: '100644', content: utf8('readme') }],
+      }),
+    ).resolves.toEqual({
+      sha: 'snapshot-sha',
+      treeSha: 'snapshot-tree',
+      disposition: 'create',
+    });
+    expect(calls.filter((call) => call.route.startsWith('PATCH'))).toHaveLength(1);
   });
 
   it('rejects apps/* paths', async () => {
@@ -296,18 +602,51 @@ describe('publishSnapshot', () => {
         repository: baseRepo,
         seedCommit: 'seed-sha',
         seedTree: 'tree-seed',
+        lockContent: 'lock',
         files: [{ path: 'apps/backend/main.ts', mode: '100644', content: utf8('test') }],
       }),
     ).rejects.toThrow('apps/*');
   });
 
-  it('verifies tree entry count matches file count', async () => {
+  it('rejects duplicate and reserved paths before any GitHub write', async () => {
+    const duplicate = createFakeOctokit();
+    await expect(
+      publishSnapshot(duplicate.octokit, {
+        repository: baseRepo,
+        seedCommit: 'seed-sha',
+        lockContent: 'lock',
+        files: [
+          { path: 'README.md', mode: '100644', content: utf8('a') },
+          { path: 'README.md', mode: '100644', content: utf8('b') },
+        ],
+      }),
+    ).rejects.toThrow('duplicate path');
+    expect(duplicate.calls).toHaveLength(0);
+
+    const reserved = createFakeOctokit();
+    await expect(
+      publishSnapshot(reserved.octokit, {
+        repository: baseRepo,
+        seedCommit: 'seed-sha',
+        lockContent: 'lock',
+        files: [{ path: 'template.lock', mode: '100644', content: utf8('other') }],
+      }),
+    ).rejects.toThrow('must only come from the seed tree');
+    expect(reserved.calls).toHaveLength(0);
+  });
+
+  it('verifies recursive tree content instead of trusting create-tree array length', async () => {
     const responses = new Map<string, unknown>();
     responses.set('GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'seed-sha' } });
     responses.set('POST /repos/{owner}/{repo}/git/blobs', { sha: 'blob-sha' });
     responses.set('POST /repos/{owner}/{repo}/git/trees', {
       sha: 'tree-sha',
-      tree: [{ path: 'f1.md', mode: '100644', type: 'blob', sha: 'blob-sha' }], // only 1 entry but we sent 2 files
+    });
+    responses.set('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+      tree: [
+        { path: 'template.lock', mode: '100644', type: 'blob', sha: blobSha('lock') },
+        { path: 'f1.md', mode: '100644', type: 'blob', sha: blobSha('a') },
+      ],
     });
     const { octokit } = createFakeOctokit(responses);
 
@@ -316,12 +655,13 @@ describe('publishSnapshot', () => {
         repository: baseRepo,
         seedCommit: 'seed-sha',
         seedTree: 'tree-seed',
+        lockContent: 'lock',
         files: [
           { path: 'f1.md', mode: '100644', content: utf8('a') },
           { path: 'f2.md', mode: '100644', content: utf8('b') },
         ],
       }),
-    ).rejects.toThrow('entry count mismatch');
+    ).rejects.toThrow('leaf count mismatch');
   });
 });
 
@@ -333,6 +673,7 @@ describe('createWriteGitHubPort', () => {
     const port = createWriteGitHubPort(octokit);
 
     expect(typeof port.createRepository).toBe('function');
+    expect(typeof port.updateRepositorySettings).toBe('function');
     expect(typeof port.seedMainViaContents).toBe('function');
     expect(typeof port.publishSnapshot).toBe('function');
     expect(typeof port.reconcileLabels).toBe('function');

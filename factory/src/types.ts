@@ -130,6 +130,16 @@ export interface ObservedState {
     empty: boolean;
     /** Existing `[sdd-init:<operation_id>]` marker, if any. */
     initMarker?: string;
+    description?: string;
+    /** Current default-branch commit state, used for crash recovery. */
+    mainSha?: string;
+    mainTreeSha?: string;
+    mainParentShas?: string[];
+    /** Root seed commit discovered by following the single-parent chain. */
+    seedCommitSha?: string;
+    seedOperationId?: string;
+    /** Raw template.lock at main, if present. */
+    templateLock?: string;
   };
   /** Existing label names (lower-cased) on the target repo. */
   existingLabels: string[];
@@ -181,6 +191,13 @@ export interface RepositoryIdentity {
 export interface SeedInput {
   repository: RepositoryIdentity;
   lockContent: string;
+  operationId: string;
+}
+
+export interface RepositorySettingsInput {
+  repository: RepositoryIdentity;
+  description: string;
+  defaultBranch: 'main';
 }
 
 export interface SnapshotInput {
@@ -188,6 +205,8 @@ export interface SnapshotInput {
   seedCommit: string;
   /** Tree SHA of the seed commit. If empty, publishSnapshot reads it from the commit. */
   seedTree?: string;
+  /** Canonical seed lock, used to verify an already-published snapshot. */
+  lockContent: string;
   files: ReadonlyArray<{
     path: string;
     mode: '100644' | '100755';
@@ -264,6 +283,7 @@ export interface ReconcileResult {
 
 export interface GitHubWritePort {
   createRepository(i: CreateRepoInput): Promise<RepositoryIdentity>;
+  updateRepositorySettings(i: RepositorySettingsInput): Promise<RepositoryIdentity>;
   seedMainViaContents(i: SeedInput): Promise<CommitIdentity>;
   publishSnapshot(i: SnapshotInput): Promise<CommitIdentity>;
   reconcileLabels(i: LabelsInput): Promise<ReconcileResult>;
@@ -372,6 +392,7 @@ export interface AppliedOperation extends PlannedOperation {
 }
 
 export type NextAction =
+  | 'configure-repository'
   | 'await-human-merge'
   | 'run-finalize-protection'
   | 'retry'
