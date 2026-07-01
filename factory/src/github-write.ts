@@ -858,7 +858,7 @@ export async function reconcileRepositoryRuleset(
 function checkRulesetNeedsUpdate(
   existing: RulesetResponse,
   desiredRules: Array<Record<string, unknown>>,
-  desiredConditions: Record<string, unknown>,
+  _desiredConditions: Record<string, unknown>,
 ): boolean {
   // Simple comparison: if enforcement or rule count differs → update.
   if (existing.enforcement !== 'active') return true;
@@ -894,7 +894,7 @@ export async function reconcileOrgWorkflowRuleset(
 ): Promise<ReconcileResult> {
   const owner = input.repository.owner;
   const repoId = input.repository.id;
-  const repoName = input.repository.name;
+  const _repoName = input.repository.name;
   const result: ReconcileResult = { created: [], updated: [], noop: [] };
   const rulesetName = `sdd-workflows-${repoId}`;
 
@@ -1166,7 +1166,7 @@ export async function upsertBootstrapPull(
   )) as { sha: string };
 
   // Create or update the branch ref.
-  let branchCreated = false;
+  let _branchCreated = false;
   try {
     await withRetry(
       () =>
@@ -1178,7 +1178,7 @@ export async function upsertBootstrapPull(
         }),
       'upsertBootstrapPull:createRef',
     );
-    branchCreated = true;
+    _branchCreated = true;
   } catch (err) {
     const httpErr = err as { status?: number };
     if (httpErr.status === 422) {

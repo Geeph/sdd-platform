@@ -9,6 +9,8 @@
  *   --format text|json    Output format (default text).
  *   --owner <org>         Target GitHub org (required).
  *   --mode monorepo       Only "monorepo" supported.
+ *   --platform-repo <o/n> Platform repo (owner/repo); must share org with
+ *                         --owner (same-org invariant).
  *   --platform-ref <ref>  Release tag or full commit SHA (optional in
  *                         dry-run; required for real execution).
  *   --config <path>       Path to product-init.yaml (required).
@@ -22,11 +24,13 @@ import { validateProductInitDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
 import { compileInitPlan, serializeInitPlan, validateProductInitConfig } from '../../init-lib.js';
 
+const DEFAULT_PLATFORM_REPO = 'acme/sdd-platform';
+
 export default class ProductInit extends Command {
   static override description = 'Bootstrap a product repository (M2a: dry-run only)';
 
   static override examples = [
-    '<%= config.bin %> product init demo --owner acme --mode monorepo --config product-init.yaml --dry-run --format json',
+    '<%= config.bin %> product init demo --owner acme --platform-repo acme/sdd-platform --config product-init.yaml --dry-run --format json',
   ];
 
   static override flags = {
@@ -38,6 +42,11 @@ export default class ProductInit extends Command {
       description: 'Repository mode',
       options: ['monorepo'],
       default: 'monorepo',
+    }),
+    'platform-repo': Flags.string({
+      description:
+        "Platform repo as 'owner/repo' (must share organization with --owner; same-org invariant)",
+      default: DEFAULT_PLATFORM_REPO,
     }),
     'platform-ref': Flags.string({
       description:
@@ -74,6 +83,26 @@ export default class ProductInit extends Command {
       });
     }
 
+    // Same-org invariant: the platform repo owner must equal the target org.
+    const platformRepoParts = flags['platform-repo'].split('/');
+    if (platformRepoParts.length !== 2 || !platformRepoParts[0] || !platformRepoParts[1]) {
+      this.error(`--platform-repo must be 'owner/repo': '${flags['platform-repo']}'`, {
+        exit: 2,
+      });
+    }
+    const platformOwner = platformRepoParts[0];
+    if (platformOwner !== flags.owner) {
+      this.error(
+        `--platform-repo owner '${platformOwner}' must match --owner '${flags.owner}' (same-org invariant).`,
+        { exit: 2 },
+      );
+    }
+
+    // Detect whether user passed --platform-repo explicitly.
+    const platformRepoExplicit = process.argv.some(
+      (a) => a === '--platform-repo' || a.startsWith('--platform-repo='),
+    );
+
     // Load + validate the product-init.yaml config.
     let rawConfig: unknown;
     try {
@@ -98,7 +127,7 @@ export default class ProductInit extends Command {
     const visibility = config.repository?.visibility ?? 'private';
 
     const platform: ProductInitInput['platform'] = {
-      repository: 'acme/sdd-platform', // Placeholder; in M2b/c this is a flag.
+      repository: flags['platform-repo'],
     };
     if (flags['platform-ref']) {
       platform.ref = flags['platform-ref'];
@@ -120,6 +149,23 @@ export default class ProductInit extends Command {
     try {
       const reader = await createLocalFsReader();
       const plan = await compileInitPlan(input, reader);
+
+      // Post-process warnings: surface that teams aren't verified in local
+      // mode, and that --platform-repo was defaulted.
+      if (!platformRepoExplicit) {
+        plan.warnings.unshift(
+          `--platform-repo defaulted to '${DEFAULT_PLATFORM_REPO}'; pass it explicitly for production runs.`,
+        );
+      }
+      const uncheckedTeams = plan.requirements.filter(
+        (r) => r.kind === 'team' && r.status === 'missing',
+      );
+      if (uncheckedTeams.length > 0) {
+        plan.warnings.push(
+          `本地模式下无法校验 team 存在性（${uncheckedTeams.length} 个 team 标记为 missing）；实际执行前将由 GitHub API 验证。`,
+        );
+      }
+
       if (flags.format === 'json') {
         process.stdout.write(serializeInitPlan(plan));
       } else {
@@ -136,7 +182,6 @@ export default class ProductInit extends Command {
  * dry-run previews: no network calls, fully deterministic.
  */
 async function createLocalFsReader() {
-  // Lazy import to avoid bundling node:fs into browser targets.
   const { createLocalFsReadPort } = await import('../../local-reader.js');
   return createLocalFsReadPort();
 }

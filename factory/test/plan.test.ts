@@ -208,14 +208,17 @@ describe('compileInitPlan', () => {
     );
   });
 
-  it('unpinned ref produces warning and zero commit', async () => {
+  it('unpinned ref produces warning; reader still provides real commit identity', async () => {
     const tree = buildTestTree();
     const reader = makeFakeReader(tree);
     const input = makeInput();
     delete input.platform.ref;
     const plan = await compileInitPlan(input, reader);
     expect(plan.source.ref_pinned).toBe(false);
-    expect(plan.source.resolved_commit).toBe('0'.repeat(40));
+    // The reader supplies the actual source identity (in the fake: 'a'×40),
+    // so resolved_commit is whatever the reader returns — not a zero sentinel.
+    expect(plan.source.resolved_commit).toBe('a'.repeat(40));
+    expect(plan.source.requested_ref).toBe('<unpinned>');
     expect(plan.warnings.length).toBeGreaterThan(0);
     expect(plan.warnings[0]).toMatch(/未固定/);
   });

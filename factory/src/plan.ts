@@ -64,7 +64,20 @@ export function computeOperationId(parts: {
   resolvedCommit: string;
   outputTreeSha256: string;
 }): string {
-  // Canonical input: strip any undefined, sort keys deterministically.
+  // The operation_id must cover the FULL intended outcome — any two inputs
+  // that differ in any way the plan could act on must produce distinct ids.
+  // Previously we only hashed a subset (environment names, owners keys),
+  // which let configs that differ in reviewers / prevent_self_review /
+  // repository.description share an id; that's a collision hazard.
+  //
+  // We canonicalize by:
+  //   - sorting every object's keys (JCS-style)
+  //   - sorting every array that represents a set (approvers, teams,
+  //     environments, required_secrets)
+  //   - preserving order where order matters (template.files, operations)
+  //     — but those come from the template / plan itself, not input
+  //   - stripping `undefined` values to keep output stable regardless of
+  //     whether an optional field was `undefined` vs. omitted
   const canonicalInput = {
     mode: parts.input.mode,
     platform: {
@@ -77,16 +90,8 @@ export function computeOperationId(parts: {
       repo: parts.input.target.repo,
       visibility: parts.input.target.visibility,
     },
-    // Config contributes stable identity: owners + team permissions keys +
-    // bootstrap approvers + environments keys + required_secrets. Values like
-    // descriptions don't affect plan identity but do appear in operations.
-    config_identity: {
-      approvers: [...(parts.input.config.bootstrap?.approvers ?? [])].sort(),
-      environments: Object.keys(parts.input.config.environments ?? {}).sort(),
-      owners: sortObject(parts.input.config.owners),
-      required_secrets: [...(parts.input.config.required_secrets ?? [])].sort(),
-      team_permissions: sortObject(parts.input.config.team_permissions ?? {}),
-    },
+    // Full config: every field contributes to identity.
+    config: deepSortConfig(parts.input.config),
   };
   const blob = jcs({
     input: canonicalInput,
@@ -95,6 +100,66 @@ export function computeOperationId(parts: {
   });
   const hex = createHash('sha256').update(blob, 'utf8').digest('hex');
   return `sha256:${hex}`;
+}
+
+/**
+ * Deterministic serialization of the product-init config: sort every object
+ * by key, sort every set-like array alphabetically, strip `undefined`. This
+ * is applied recursively so nested config (environments, team_permissions)
+ * is also canonical.
+ */
+function deepSortConfig(config: ProductInitInput['config']): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  out.schema_version = config.schema_version;
+
+  if (config.repository) {
+    const repo: Record<string, unknown> = {};
+    if (config.repository.description !== undefined) {
+      repo.description = config.repository.description;
+    }
+    if (config.repository.visibility !== undefined) {
+      repo.visibility = config.repository.visibility;
+    }
+    out.repository = repo;
+  }
+
+  // bootstrap.approvers is a set — sort.
+  out.bootstrap = {
+    approvers: [...(config.bootstrap?.approvers ?? [])].sort(),
+  };
+
+  // owners is keyed; sort keys.
+  out.owners = sortObject(config.owners);
+
+  // team_permissions is keyed; sort keys.
+  if (config.team_permissions && Object.keys(config.team_permissions).length > 0) {
+    out.team_permissions = sortObject(config.team_permissions as Record<string, unknown>);
+  }
+
+  // environments: sort by name, and within each environment, sort reviewers.
+  if (config.environments && Object.keys(config.environments).length > 0) {
+    const envs: Record<string, unknown> = {};
+    for (const name of Object.keys(config.environments).sort()) {
+      const env = config.environments[name];
+      if (!env) continue;
+      const sortedEnv: Record<string, unknown> = {
+        reviewers: [...env.reviewers].sort(),
+      };
+      if (env.prevent_self_review !== undefined) {
+        sortedEnv.prevent_self_review = env.prevent_self_review;
+      }
+      envs[name] = sortedEnv;
+    }
+    out.environments = envs;
+  }
+
+  // required_secrets is a set — sort.
+  if (config.required_secrets && config.required_secrets.length > 0) {
+    out.required_secrets = [...config.required_secrets].sort();
+  }
+
+  return out;
 }
 
 function sortObject(o: Record<string, unknown> | undefined): Record<string, unknown> {
@@ -138,7 +203,11 @@ export async function compileInitPlan(
     throw new Error(`only mode='monorepo' supported, got '${input.mode}'`);
   }
 
-  // 2. Resolve platform ref → full 40-char commit (dry-run may omit ref).
+  // 2. Resolve platform ref → full 40-char commit.
+  //    Even when the user didn't pin a ref, we still ask the reader for the
+  //    *actual* identity of the template source (e.g. local-reader returns
+  //    the git HEAD of the checkout). This keeps the report honest:
+  //    `resolved_commit` always reflects what bytes were read.
   const refPinned = Boolean(input.platform.ref);
   let resolvedCommit: string;
   let requestedRef: string;
@@ -153,8 +222,11 @@ export async function compileInitPlan(
     requestedRef = r.requestedRef;
     _peeled = r.peeled;
   } else {
-    // Unpinned: marker value only valid for preview.
-    resolvedCommit = '0'.repeat(40);
+    // Unpinned preview: ask the reader for the source's real identity, then
+    // mark it as unpinned in the report (so consumers know the ref was not
+    // fixed by the user).
+    const r = await resolveRef(reader, parseRepoRef(input.platform.repository), '<unpinned>');
+    resolvedCommit = r.commit;
     requestedRef = '<unpinned>';
   }
 
@@ -550,45 +622,5 @@ export function serializeInitPlan(plan: InitPlan): string {
   return `${JSON.stringify(plan, null, 2)}\n`;
 }
 
-/**
- * Re-digest a serialized plan's operation_id to verify byte-identical output.
- */
-export function verifyPlanIdentity(plan: InitPlan): boolean {
-  const recomputed = computeOperationId({
-    input: reconstructInputSkeleton(plan),
-    resolvedCommit: plan.source.resolved_commit,
-    outputTreeSha256: plan.template.output_tree_sha256,
-  });
-  return recomputed === plan.operation_id;
-}
-
-function reconstructInputSkeleton(plan: InitPlan): ProductInitInput {
-  // We don't need a fully valid ProductInitInput for the hash; only the
-  // fields that contribute to the identity. The compiler already stored them
-  // via `plan.source.*`, `plan.target.*`, `plan.projects.product`. Callers
-  // should prefer to re-run compileInitPlan for verification.
-  const platform: { repository: string; ref?: string } = {
-    repository: plan.source.repository,
-  };
-  if (plan.source.ref_pinned) {
-    platform.ref = plan.source.requested_ref;
-  }
-  return {
-    product: plan.projects.product,
-    target: {
-      owner: plan.target.owner,
-      repo: plan.target.repository,
-      visibility: plan.target.visibility,
-    },
-    mode: 'monorepo',
-    platform,
-    config: {
-      schema_version: 1,
-      bootstrap: { approvers: [] },
-      owners: { product: '', api: '', design: '', admins: '' },
-    },
-  };
-}
-
 /** Expose for tests. */
-export const __internal__ = { jcs, sha256Hex };
+export const __internal__ = { jcs, sha256Hex, deepSortConfig };

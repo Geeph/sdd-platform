@@ -23,8 +23,20 @@ function tokenMap(context: RenderContext): Map<string, string> {
   const m = new Map<string, string>();
   m.set('product', context.product);
   m.set('repo', context.repo);
+  const adminsFallback = context.owners.admins;
   for (const [k, v] of Object.entries(context.owners)) {
     if (typeof v === 'string') m.set(`owners.${k}`, v);
+  }
+  // Bootstrap fallback: any optional owner slot (backend/web/ios/android)
+  // not provided in the config falls back to `admins`. This preserves the
+  // "admins own everything unspecified at init" semantic — see §1 / §3.3
+  // of the M2 spec. The template can reference `{{owners.backend}}`
+  // unconditionally without failing when only the 4 required owners are
+  // configured.
+  for (const k of ['backend', 'web', 'ios', 'android'] as const) {
+    if (!m.has(`owners.${k}`) && adminsFallback) {
+      m.set(`owners.${k}`, adminsFallback);
+    }
   }
   return m;
 }

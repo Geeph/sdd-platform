@@ -699,7 +699,7 @@ export async function finalizeProtection(
 
   // Check Bootstrap PR is merged.
   const bootstrapPr = observed.bootstrapPullRequest;
-  if (!bootstrapPr || bootstrapPr.state !== 'merged') {
+  if (bootstrapPr?.state !== 'merged') {
     operations.push({
       order: 100,
       phase: 'bootstrap-pull',

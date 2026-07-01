@@ -49,7 +49,7 @@ const VERSION_LABEL_RE = /^version:(v\d+)$/;
 const VERSION_MARKER_RE = /^v\d+$/;
 const REQ_ID_RE = /^REQ-[A-Z0-9]+-\d+$/;
 const SCR_ID_RE = /^SCR-[A-Z0-9-]+$/;
-const OPERATION_ID_RE = /^[a-z][a-z0-9_-]*$/;
+const _OPERATION_ID_RE = /^[a-z][a-z0-9_-]*$/;
 
 const VALID_GATES = new Set(['spec', 'architecture', 'design', 'plan', 'contract']);
 
@@ -446,7 +446,7 @@ function codeownersPatternMatches(pattern: string, path: string): boolean {
   if (pattern.endsWith('/') && path.startsWith(pattern)) return true;
   if (pattern.startsWith('/')) {
     const pat = pattern.slice(1);
-    if (path === pat || path.startsWith(pat + '/') || path.startsWith(pat + '/')) {
+    if (path === pat || path.startsWith(`${pat}/`) || path.startsWith(`${pat}/`)) {
       return true;
     }
   }
