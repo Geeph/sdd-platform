@@ -14,6 +14,9 @@
  *   --platform-ref <ref>  Release tag or full commit SHA (optional in
  *                         dry-run; required for real execution).
  *   --config <path>       Path to product-init.yaml (required).
+ *   --finalize-protection Activate required checks after the Bootstrap PR
+ *                         has been merged and all evidence is verified
+ *                         (§2.3 step 6). Idempotent, fail-closed.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -23,6 +26,8 @@ import {
   applyInitPlan,
   createReadonlyGitHubPort,
   createWriteGitHubPort,
+  type FinalizeConfig,
+  finalizeProtection,
   type InitResult,
   type ProductInitConfig,
   type ProductInitInput,
@@ -70,6 +75,11 @@ export default class ProductInit extends Command {
     }),
     'dry-run': Flags.boolean({
       description: 'Preview only; zero GitHub writes',
+      default: false,
+    }),
+    'finalize-protection': Flags.boolean({
+      description:
+        'Activate required checks after the Bootstrap PR has merged. Idempotent, fail-closed (§2.3 step 6).',
       default: false,
     }),
   };
@@ -163,6 +173,39 @@ export default class ProductInit extends Command {
     };
 
     try {
+      if (flags['finalize-protection']) {
+        // --finalize-protection path: does not take a plan, does not write
+        // a repo. Recovers platform identity from template.lock + org
+        // ruleset, verifies all evidence, then hardens.
+        if (flags['dry-run']) {
+          this.error('--finalize-protection cannot be combined with --dry-run', { exit: 2 });
+        }
+        const client = createGitHubRequestClient(githubToken as string);
+        const reader = createReadonlyGitHubPort(client);
+        const writer = createWriteGitHubPort(client);
+
+        const finalizeConfig: FinalizeConfig = {
+          bootstrapApprovers: config.bootstrap.approvers,
+        };
+
+        const result = await finalizeProtection(
+          { owner: flags.owner, repo: args.product, visibility },
+          { reader, writer },
+          finalizeConfig,
+        );
+
+        if (flags.format === 'json') {
+          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        } else {
+          this.log(renderFinalizeResult(result));
+        }
+
+        const hasBlocked = result.operations.some((o) => o.disposition === 'blocked');
+        if (hasBlocked) process.exitCode = 3;
+        else if (result.phase !== 'COMPLETE') process.exitCode = 4;
+        return;
+      }
+
       if (!flags['dry-run']) {
         const client = createGitHubRequestClient(githubToken as string);
         const reader = createReadonlyGitHubPort(client);
@@ -227,6 +270,27 @@ export default class ProductInit extends Command {
       this.error(error.message, { exit });
     }
   }
+}
+
+function renderFinalizeResult(result: InitResult): string {
+  const lines = [
+    '# sdd product init --finalize-protection',
+    '',
+    `phase:       ${result.phase}`,
+    `next_action: ${result.nextAction}`,
+  ];
+  if (result.repository) {
+    lines.push(`repository:  ${result.repository.owner}/${result.repository.name}`);
+  }
+  if (result.mainSha) lines.push(`main:        ${result.mainSha}`);
+  lines.push('', '## Evidence & operations');
+  for (const operation of result.operations) {
+    const resultSuffix = operation.result ? ` — ${operation.result}` : '';
+    lines.push(
+      `  [${operation.disposition.padEnd(8)}] ${operation.phase.padEnd(16)} ${operation.kind}${resultSuffix}`,
+    );
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 function renderTextResult(result: InitResult): string {

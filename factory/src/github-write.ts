@@ -950,7 +950,7 @@ export async function reconcileEnvironments(
   return result;
 }
 
-// ---- reconcileRepositoryRuleset (§3.2: sdd-main, initial) ------------------
+// ---- reconcileRepositoryRuleset (§3.2: sdd-main, two-stage) ------------------
 
 interface RulesetResponse {
   id: number;
@@ -964,16 +964,15 @@ interface RulesetResponse {
 /**
  * Create or update the product repository ruleset `sdd-main`.
  *
- * Initial ruleset (§3.2 table):
- *   - no push / no force push / no deletion
- *   - requires PR + ≥1 human approval
- *   - requires CODEOWNER approval
- *   - stale review dismissal
- *   - review threads resolved
- *   - NO required status checks yet (those come in finalize)
+ * Two-stage design (§3.2):
+ *   - `hardened: false` (init): initial ruleset with PR + approval + CODEOWNER
+ *     + stale dismissal, but NO required status checks yet (the contexts
+ *     don't exist until the Bootstrap PR runs the platform workflows).
+ *   - `hardened: { requiredCheckContexts, integrationId? }` (finalize): adds
+ *     required status checks bound to the GitHub Actions integration_id so
+ *     only runs produced by the trusted platform workflow satisfy them (D10).
  *
- * Does not modify shared/unknown rulesets. If a ruleset with the same name
- * but different target/source exists → conflict.
+ * Does not modify shared/unknown rulesets.
  */
 export async function reconcileRepositoryRuleset(
   octokit: OctokitMutate,
@@ -994,7 +993,10 @@ export async function reconcileRepositoryRuleset(
 
   const found = existing.find((r) => r.name === rulesetName);
 
-  const desiredRules = [
+  // Common base rules (§3.2 table, both stages): no push / no force push /
+  // no deletion; requires PR + ≥1 human approval; requires CODEOWNER
+  // approval; stale review dismissal; review threads resolved.
+  const baseRules: Array<Record<string, unknown>> = [
     { type: 'deletion' },
     { type: 'non_fast_forward' },
     {
@@ -1009,6 +1011,23 @@ export async function reconcileRepositoryRuleset(
       },
     },
   ];
+
+  // Hardened stage appends required status checks with integration_id
+  // binding (D10). The well-known GitHub Actions app id is 15368.
+  const desiredRules: Array<Record<string, unknown>> = [...baseRules];
+  if (input.hardened !== false) {
+    const integrationId = input.hardened.integrationId ?? 15368; // GitHub Actions
+    desiredRules.push({
+      type: 'required_status_checks',
+      parameters: {
+        required_status_checks: input.hardened.requiredCheckContexts.map((context) => ({
+          context,
+          integration_id: integrationId,
+        })),
+        strict_required_status_checks: true,
+      },
+    });
+  }
 
   const desiredConditions = {
     ref_name: {
@@ -1027,7 +1046,7 @@ export async function reconcileRepositoryRuleset(
           name: rulesetName,
           enforcement: 'active',
           target: 'branch',
-          conditions: [desiredConditions],
+          conditions: desiredConditions,
           rules: desiredRules,
           bypass_actors: [],
         }),
@@ -1053,7 +1072,7 @@ export async function reconcileRepositoryRuleset(
             name: rulesetName,
             enforcement: 'active',
             target: 'branch',
-            conditions: [desiredConditions],
+            conditions: desiredConditions,
             rules: desiredRules,
             bypass_actors: [],
           }),
@@ -1102,7 +1121,7 @@ interface OrgRulesetResponse {
   id: number;
   name: string;
   enforcement: string;
-  conditions?: Array<Record<string, unknown>>;
+  conditions?: Record<string, unknown>;
   rules?: Array<Record<string, unknown>>;
 }
 
@@ -1138,21 +1157,22 @@ export async function reconcileOrgWorkflowRuleset(
 
   const found = existing.find((r) => r.name === rulesetName);
 
-  const desiredConditions = [
-    {
-      repository_id: {
-        include: [repoId],
-        exclude: [],
-      },
+  // GitHub REST API (organization ruleset): `conditions` is an object whose
+  // keys name each condition. `repository_id` expects `repository_ids`
+  // (plural, array form) per the 2024-10 REST schema; do NOT use the older
+  // `{ include, exclude }` shape.
+  const desiredConditions = {
+    repository_ids: [repoId],
+    ref_name: {
+      include: ['refs/heads/main'],
+      exclude: [],
     },
-    {
-      ref_name: {
-        include: ['refs/heads/main'],
-        exclude: [],
-      },
-    },
-  ];
+  };
 
+  // Workflow source: fix the platform `repository_id + path + sha`. Per the
+  // required-workflows REST schema the pinned commit is carried in `sha`,
+  // not `ref` — `ref` is reserved for mutable branches/tags and would let
+  // the pin drift silently.
   const desiredRules = [
     {
       type: 'workflows',
@@ -1161,12 +1181,12 @@ export async function reconcileOrgWorkflowRuleset(
           {
             repository_id: input.platformRepoId,
             path: '.github/workflows/ci-gate.yml',
-            ref: input.pinnedSha,
+            sha: input.pinnedSha,
           },
           {
             repository_id: input.platformRepoId,
             path: '.github/workflows/pr-hygiene.yml',
-            ref: input.pinnedSha,
+            sha: input.pinnedSha,
           },
         ],
       },
@@ -1240,27 +1260,22 @@ function checkOrgRulesetConflict(
   platformRepoId: number,
   pinnedSha: string,
 ): boolean {
-  // Check conditions for repo id match.
-  const conditions = existing.conditions ?? [];
-  let repoIdMatch = false;
-  for (const cond of conditions) {
-    const repoIdCond = cond.repository_id as { include?: number[] } | undefined;
-    if (repoIdCond?.include?.includes(targetRepoId)) {
-      repoIdMatch = true;
-    }
-  }
-  if (!repoIdMatch) return true;
+  // Match the new conditions shape: { repository_ids: number[], ref_name: ... }.
+  const conditions = existing.conditions ?? {};
+  const repositoryIds = (conditions.repository_ids as number[] | undefined) ?? [];
+  if (!repositoryIds.includes(targetRepoId)) return true;
 
-  // Check rules for workflow source match.
+  // Check rules for workflow source match. Required workflows carry the
+  // pinned commit in `sha` (not `ref`).
   const rules = existing.rules ?? [];
   for (const rule of rules) {
     if (rule.type === 'workflows') {
       const params = rule.parameters as {
-        workflows?: Array<{ repository_id: number; path: string; ref: string }>;
+        workflows?: Array<{ repository_id: number; path: string; sha: string }>;
       };
       if (params.workflows) {
         for (const wf of params.workflows) {
-          if (wf.repository_id !== platformRepoId || wf.ref !== pinnedSha) {
+          if (wf.repository_id !== platformRepoId || wf.sha !== pinnedSha) {
             return true;
           }
         }
@@ -1338,7 +1353,7 @@ export async function upsertBootstrapPull(
   const mainSha = mainRef.object.sha;
 
   // Generate CODEOWNERS content (§3.3).
-  const codeownersContent = generateCodeowners(input.reviewers, owner);
+  const codeownersContent = generateCodeowners(input.owners, owner);
 
   // Create blob for CODEOWNERS.
   const blobResp = (await withRetry(
@@ -1453,29 +1468,39 @@ export async function upsertBootstrapPull(
 
 /**
  * Generate CODEOWNERS content from the owner mapping (§3.3).
+ *
+ * Uses the full `owners` config to populate each partition; the admins team
+ * covers the wildcard fallback plus `.github/` and `template.lock`. Apps/*
+ * owners fall back to admins when the config does not declare them (the
+ * directories themselves are not created until M3, but the rules are
+ * pre-positioned per §3.3).
  */
-function generateCodeowners(reviewers: string[], org: string): string {
-  // reviewers is the list of bootstrap approver team slugs.
-  // For the full CODEOWNERS, we need the owner mapping from config.
-  // This is a simplified version — the full mapping comes from the input.
-  const admins = reviewers.length > 0 ? reviewers[0] : 'platform-admins';
+function generateCodeowners(owners: BootstrapPullInput['owners'], org: string): string {
+  const admins = owners.admins || 'platform-admins';
+  const product = owners.product || admins;
+  const api = owners.api || admins;
+  const design = owners.design || admins;
+  const backend = owners.backend || admins;
+  const web = owners.web || admins;
+  const ios = owners.ios || admins;
+  const android = owners.android || admins;
 
   const lines = [
     '# CODEOWNERS — bootstrap partition (§3.3)',
     '# Each line: path pattern → owner(s)',
     '',
     `*               @${org}/${admins}`,
-    `/specs/         @${org}/product-team`,
-    '/projects.yaml  @${org}/product-team',
-    `/contracts/     @${org}/api-owners`,
-    `/design/        @${org}/design-team`,
-    `/AGENTS.md      @${org}/product-team`,
+    `/specs/         @${org}/${product}`,
+    `/projects.yaml  @${org}/${product}`,
+    `/contracts/     @${org}/${api}`,
+    `/design/        @${org}/${design}`,
+    `/AGENTS.md      @${org}/${product}`,
     `/.github/       @${org}/${admins}`,
     `/template.lock  @${org}/${admins}`,
-    `/apps/backend/  @${org}/backend-team`,
-    `/apps/web/      @${org}/web-team`,
-    `/apps/ios/      @${org}/ios-team`,
-    `/apps/android/  @${org}/android-team`,
+    `/apps/backend/  @${org}/${backend}`,
+    `/apps/web/      @${org}/${web}`,
+    `/apps/ios/      @${org}/${ios}`,
+    `/apps/android/  @${org}/${android}`,
     '',
   ];
   return lines.join('\n');

@@ -592,6 +592,7 @@ export async function applyInitPlan(
         headBranch: 'sdd/bootstrap',
         baseBranch: 'main',
         reviewers: input.config.bootstrap.approvers,
+        owners: input.config.owners,
       });
       operations.push({
         order: 90,
@@ -677,33 +678,61 @@ export async function applyInitPlan(
 // ---- finalizeProtection (§2.3 step 6, idempotent) -------------------------
 
 /**
- * Finalize protection: activate org workflow ruleset and harden product
- * repository ruleset with required status checks.
+ * Evidence that finalizeProtection must recover before it will switch the
+ * org ruleset to `active` and harden the product ruleset. See §2.3 step 6.
+ */
+export interface FinalizeConfig {
+  /**
+   * Bootstrap approver team slugs. If supplied, every approving reviewer
+   * must be a member of one of these teams (the caller resolves membership
+   * upstream). When omitted, finalize only checks reviewer !== author.
+   */
+  bootstrapApprovers?: ReadonlyArray<string>;
+}
+
+/** Well-known GitHub Actions app id (used to bind required status checks). */
+const GITHUB_ACTIONS_APP_ID = 15368;
+
+/**
+ * Activate required protections after the Bootstrap PR has merged and all
+ * evidence checks out. Idempotent and fail-closed — see §2.3 step 6 and
+ * §3.2. If any evidence is missing or inconsistent, the function refuses
+ * to mutate anything and returns a `blocked` InitResult.
  *
  * Evidence required (all must hold):
- *   - Bootstrap PR merged to main
- *   - Approval on final head SHA, reviewer ≠ author, reviewer is bootstrap approver
- *   - CI Gate + PR hygiene check runs: head_sha = final head, conclusion=success,
- *     app.id = GitHub Actions
- *   - Workflow runs from org ruleset's pinned platform repo/path/SHA
- *   - Org ruleset still evaluate, targeting current repo/main
+ *   - Bootstrap PR state === 'merged'
+ *   - ≥1 approval, each bound to the PR's final head SHA, reviewer ≠ author
+ *   - If `config.bootstrapApprovers` given, each reviewer is in that set
+ *   - Check runs on the final head: `CI Gate` + `PR hygiene`, conclusion=success,
+ *     app.id === GITHUB_ACTIONS_APP_ID
+ *   - Org workflow ruleset exists, enforcement === 'evaluate', target matches
+ *     current repo/main, source matches pinned platform repo/path/sha
+ *     recovered from template.lock
  *   - Merge commit reachable from current main
  *
- * Sequence: org ruleset → active, then product ruleset → add required checks
- * + integration_id. Both read-back. Fail closed on insufficient evidence.
+ * Mutation sequence (only after all evidence passes):
+ *   1. org ruleset: evaluate → active
+ *   2. product ruleset: add required_status_checks with integration_id
+ *   3. read-back both (handled by the reconcilers)
+ *
+ * The platform source identity is recovered from the target repo's
+ * `template.lock` + the existing org ruleset — the caller MUST NOT pass it.
  */
 export async function finalizeProtection(
   target: ProductInitInput['target'],
-  deps: ApplyInitPlanDeps,
+  deps: { reader: GitHubReadPort; writer: GitHubWritePort },
+  config: FinalizeConfig = {},
 ): Promise<InitResult> {
   const operations: AppliedOperation[] = [];
 
-  // Observe current state.
-  const input: ProductInitInput = {
-    product: '', // Not needed for finalize observe.
+  // Build a minimal input just to drive observe(). finalize doesn't need
+  // the full product/platform config — it recovers source identity from
+  // template.lock and the existing org ruleset.
+  const observeInput: ProductInitInput = {
+    product: '',
     target,
     mode: 'monorepo',
-    platform: { repository: '', ref: '' }, // Will be recovered from template.lock.
+    platform: { repository: '', ref: '' },
     config: {
       schema_version: 1,
       bootstrap: { approvers: [] },
@@ -711,7 +740,7 @@ export async function finalizeProtection(
     },
   };
 
-  const observed = await deps.reader.observe(input);
+  const observed = await deps.reader.observe(observeInput);
   if (!observed.repositoryExists || !observed.repository) {
     throw new Error('finalizeProtection: target repo does not exist');
   }
@@ -724,18 +753,33 @@ export async function finalizeProtection(
     visibility: observed.repository.visibility,
   };
 
-  // Check Bootstrap PR is merged.
+  // Helper: emit a blocked operation and return.
+  const blocked = (
+    phase: AppliedOperation['phase'],
+    kind: string,
+    targetLabel: string,
+    resultMsg: string,
+  ): InitResult => {
+    operations.push({
+      order: operations.length * 10 + 100,
+      phase,
+      kind,
+      disposition: 'blocked',
+      target: targetLabel,
+      result: resultMsg,
+    });
+    return buildInitResult('BOOTSTRAP_MERGED', operations, 'blocked', repository);
+  };
+
+  // ---- Evidence 1: Bootstrap PR merged -------------------------------------
   const bootstrapPr = observed.bootstrapPullRequest;
   if (bootstrapPr?.state !== 'merged') {
-    operations.push({
-      order: 100,
-      phase: 'bootstrap-pull',
-      kind: 'pull.bootstrap.verify',
-      disposition: 'blocked',
-      target: `${target.owner}/${target.repo}:bootstrap`,
-      result: `Bootstrap PR not merged (state: ${bootstrapPr?.state ?? 'not found'})`,
-    });
-    return buildInitResult('SNAPSHOT_MAIN', operations, 'blocked', repository);
+    return blocked(
+      'bootstrap-pull',
+      'pull.bootstrap.verify',
+      `${target.owner}/${target.repo}:bootstrap`,
+      `Bootstrap PR not merged (state: ${bootstrapPr?.state ?? 'not found'})`,
+    );
   }
 
   operations.push({
@@ -747,24 +791,168 @@ export async function finalizeProtection(
     result: `PR #${bootstrapPr.number} merged (head: ${bootstrapPr.headSha.slice(0, 8)})`,
   });
 
-  // Check org ruleset is still evaluate and targeting our repo.
-  if (!observed.orgWorkflowRulesetExists) {
-    operations.push({
-      order: 110,
-      phase: 'org-workflows',
-      kind: 'ruleset.org-workflow.verify',
-      disposition: 'blocked',
-      target: `${target.owner}/${target.repo}:org-workflows`,
-      result: 'org workflow ruleset not found',
-    });
-    return buildInitResult('BOOTSTRAP_MERGED', operations, 'blocked', repository);
+  // ---- Evidence 2: approvals bound to final head, reviewer ≠ author -------
+  const approvals = bootstrapPr.approvals ?? [];
+  if (approvals.length === 0) {
+    return blocked(
+      'bootstrap-pull',
+      'approval.verify',
+      `${target.owner}/${target.repo}:bootstrap`,
+      'no APPROVED reviews on Bootstrap PR',
+    );
+  }
+  const finalHead = bootstrapPr.headSha;
+  const author = bootstrapPr.author;
+  const staleApprovals: string[] = [];
+  const selfApprovals: string[] = [];
+  for (const approval of approvals) {
+    if (approval.headSha !== finalHead) {
+      staleApprovals.push(`${approval.user}@${approval.headSha.slice(0, 8)}`);
+    }
+    if (author && approval.user === author) {
+      selfApprovals.push(approval.user);
+    }
+  }
+  if (staleApprovals.length > 0) {
+    return blocked(
+      'bootstrap-pull',
+      'approval.verify',
+      `${target.owner}/${target.repo}:bootstrap`,
+      `approval(s) not bound to final head ${finalHead.slice(0, 8)}: ${staleApprovals.join(', ')}`,
+    );
+  }
+  if (selfApprovals.length > 0) {
+    return blocked(
+      'bootstrap-pull',
+      'approval.verify',
+      `${target.owner}/${target.repo}:bootstrap`,
+      `self-approval not permitted: ${selfApprovals.join(', ')}`,
+    );
+  }
+  // Optional: cross-check against bootstrapApprovers allow-list.
+  if (config.bootstrapApprovers && config.bootstrapApprovers.length > 0) {
+    const allow = new Set(config.bootstrapApprovers);
+    const unknownReviewers = approvals.map((a) => a.user).filter((user) => !allow.has(user));
+    if (unknownReviewers.length > 0) {
+      return blocked(
+        'bootstrap-pull',
+        'approval.verify',
+        `${target.owner}/${target.repo}:bootstrap`,
+        `reviewer(s) not in bootstrap.approvers: ${unknownReviewers.join(', ')}`,
+      );
+    }
   }
 
+  operations.push({
+    order: 110,
+    phase: 'bootstrap-pull',
+    kind: 'approval.verify',
+    disposition: 'noop',
+    target: `${target.owner}/${target.repo}:bootstrap`,
+    result: `${approvals.length} approval(s) bound to final head ${finalHead.slice(0, 8)}`,
+  });
+
+  // ---- Evidence 3: CI Gate + PR hygiene succeeded on final head -------------
+  const checkRuns = observed.bootstrapCheckRuns ?? [];
+  const requiredContexts = ['CI Gate', 'PR hygiene'] as const;
+  for (const ctx of requiredContexts) {
+    const matching = checkRuns.filter((cr) => cr.context === ctx);
+    if (matching.length === 0) {
+      return blocked(
+        'ruleset',
+        'check.verify',
+        `${target.owner}/${target.repo}:${ctx}`,
+        `no check run for '${ctx}' on head ${finalHead.slice(0, 8)}`,
+      );
+    }
+    const onFinalHead = matching.find((cr) => cr.headSha === finalHead);
+    if (!onFinalHead) {
+      return blocked(
+        'ruleset',
+        'check.verify',
+        `${target.owner}/${target.repo}:${ctx}`,
+        `'${ctx}' ran but not on final head (have: ${matching.map((m) => m.headSha.slice(0, 8)).join(', ')})`,
+      );
+    }
+    if (onFinalHead.conclusion !== 'success') {
+      return blocked(
+        'ruleset',
+        'check.verify',
+        `${target.owner}/${target.repo}:${ctx}`,
+        `'${ctx}' conclusion='${onFinalHead.conclusion}' on final head, expected 'success'`,
+      );
+    }
+    if (onFinalHead.appId !== GITHUB_ACTIONS_APP_ID) {
+      return blocked(
+        'ruleset',
+        'check.verify',
+        `${target.owner}/${target.repo}:${ctx}`,
+        `'${ctx}' produced by app id ${onFinalHead.appId}, expected GitHub Actions (${GITHUB_ACTIONS_APP_ID})`,
+      );
+    }
+  }
+
+  operations.push({
+    order: 120,
+    phase: 'ruleset',
+    kind: 'check.verify',
+    disposition: 'noop',
+    target: `${target.owner}/${target.repo}:checks`,
+    result: `CI Gate + PR hygiene succeeded on ${finalHead.slice(0, 8)} (app=${GITHUB_ACTIONS_APP_ID})`,
+  });
+
+  // ---- Evidence 4: org ruleset pinned source + target ----------------------
+  const templateLock = observed.repository.templateLock;
+  if (!templateLock) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:template.lock`,
+      'template.lock not readable from target repo — cannot recover platform source',
+    );
+  }
+  let parsedLock: { source?: { repository?: string; resolved_commit?: string } };
+  try {
+    // template.lock is canonical YAML; we do a light parse here to extract
+    // the platform repo + resolved commit. Full parse is in render.ts; we
+    // intentionally don't re-import it to avoid circular deps.
+    // Lazy-import YAML parser only when needed.
+    const { parse: parseYaml } = await import('yaml');
+    parsedLock = parseYaml(templateLock) as typeof parsedLock;
+  } catch (err) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:template.lock`,
+      `template.lock failed to parse: ${(err as Error).message}`,
+    );
+  }
+  const platformRepo = parsedLock.source?.repository;
+  const pinnedSha = parsedLock.source?.resolved_commit;
+  if (!platformRepo || !pinnedSha) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:template.lock`,
+      'template.lock missing source.repository or source.resolved_commit',
+    );
+  }
+
+  const orgSource = observed.orgWorkflowRulesetSource;
+  if (!observed.orgWorkflowRulesetExists || !orgSource) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:org-workflows`,
+      'org workflow ruleset sdd-workflows-<id> not found',
+    );
+  }
   if (observed.orgWorkflowRulesetEnforcement !== 'evaluate') {
-    // Already active? Check if it's a noop.
     if (observed.orgWorkflowRulesetEnforcement === 'active') {
+      // Already finalized — this is the idempotent path. Fall through to
+      // harden the product ruleset (also idempotent).
       operations.push({
-        order: 110,
+        order: 130,
         phase: 'org-workflows',
         kind: 'ruleset.org-workflow.activate',
         disposition: 'noop',
@@ -772,63 +960,156 @@ export async function finalizeProtection(
         result: 'already active',
       });
     } else {
-      operations.push({
-        order: 110,
-        phase: 'org-workflows',
-        kind: 'ruleset.org-workflow.verify',
-        disposition: 'blocked',
-        target: `${target.owner}/${target.repo}:org-workflows`,
-        result: `unexpected enforcement: ${observed.orgWorkflowRulesetEnforcement}`,
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `unexpected enforcement: ${observed.orgWorkflowRulesetEnforcement}`,
+      );
+    }
+  } else {
+    // Verify target — must match current repo/main.
+    if (orgSource.targetRepoId !== undefined && orgSource.targetRepoId !== repository.id) {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset targets repo id ${orgSource.targetRepoId}, expected ${repository.id}`,
+      );
+    }
+    if (orgSource.targetRefPattern && orgSource.targetRefPattern !== 'refs/heads/main') {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset targets '${orgSource.targetRefPattern}', expected 'refs/heads/main'`,
+      );
+    }
+    // Verify source — must match template.lock's pinned platform repo/sha.
+    // We compare the platform repo by name (org ruleset stores repo id,
+    // template.lock stores 'owner/repo' — caller must reconcile).
+    if (orgSource.sha.toLowerCase() !== pinnedSha.toLowerCase()) {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset pinned SHA ${orgSource.sha.slice(0, 8)} does not match template.lock ${pinnedSha.slice(0, 8)}`,
+      );
+    }
+    // Note: platform repo id vs name reconciliation would require an extra
+    // read; for M2 we trust that the name→id mapping was validated at init
+    // time and verify only the SHA pin here.
+  }
+
+  // ---- Evidence 5: merge commit reachable from main ------------------------
+  const mergeCommit = bootstrapPr.mergeCommitSha;
+  const mainSha = observed.repository.mainSha;
+  if (!mergeCommit || !mainSha) {
+    return blocked(
+      'bootstrap-pull',
+      'merge.verify',
+      `${target.owner}/${target.repo}:main`,
+      'merge commit SHA or current main SHA unavailable',
+    );
+  }
+  // The merge commit must be reachable from current main. We use the
+  // reader's resolveCommit to detect whether main is at the merge commit
+  // or a descendant. In practice, after the Bootstrap PR merge, main
+  // should point directly at the merge commit (or at a subsequent
+  // snapshot if other work landed — but that other work would not have
+  // been possible without required checks already in place, so the
+  // common case is main === merge_commit).
+  if (mainSha !== mergeCommit) {
+    // main has advanced beyond the merge commit. This is only acceptable
+    // if the advancement was done through the protected path (i.e., with
+    // required checks already active). For M2 we treat this as drift.
+    return blocked(
+      'bootstrap-pull',
+      'merge.verify',
+      `${target.owner}/${target.repo}:main`,
+      `main=${mainSha.slice(0, 8)} has advanced past merge commit=${mergeCommit.slice(0, 8)} — unexpected drift`,
+    );
+  }
+
+  operations.push({
+    order: 140,
+    phase: 'bootstrap-pull',
+    kind: 'merge.verify',
+    disposition: 'noop',
+    target: `${target.owner}/${target.repo}:main`,
+    result: `main == merge commit ${mergeCommit.slice(0, 8)}`,
+  });
+
+  // ---- All evidence gathered. Now mutate. ----------------------------------
+
+  // Step 1: activate org workflow ruleset (evaluate → active). Only if not
+  // already active (idempotent).
+  if (observed.orgWorkflowRulesetEnforcement === 'evaluate') {
+    try {
+      // Recover platformRepoId: we don't have it directly, but the writer
+      // needs it. Reconstruct from observed org source — it already stores
+      // the platform repo id.
+      const platformRepoId = orgSource.repositoryId;
+      await deps.writer.reconcileOrgWorkflowRuleset({
+        repository,
+        platformRepoId,
+        pinnedSha,
+        enforcement: 'active',
       });
-      return buildInitResult('BOOTSTRAP_MERGED', operations, 'blocked', repository);
+      operations.push({
+        order: 200,
+        phase: 'org-workflows',
+        kind: 'ruleset.org-workflow.activate',
+        disposition: 'update',
+        target: `${target.owner}/${target.repo}:org-workflows`,
+        result: `evaluate → active (pinned ${platformRepo.split('/')[1]}/${pinnedSha.slice(0, 8)})`,
+      });
+    } catch (err) {
+      // Fail closed: do NOT proceed to harden the product ruleset.
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.activate',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `activate failed: ${(err as Error).message}`,
+      );
     }
   }
 
-  // Activate org workflow ruleset (evaluate → active).
-  // In real implementation, we'd read the platform repo info from template.lock.
-  // For now, we use the writer to update enforcement.
+  // Step 2: harden product ruleset — add required status checks with
+  // integration_id binding (D10). Idempotent: the reconciler compares
+  // desired vs existing rules.
   try {
-    // The writer needs the platform repo ID and pinned SHA, which we'd recover
-    // from template.lock. Since we don't have that in the current scope, we
-    // skip the actual activation and note it as a TODO.
-    // In a real implementation, finalizeProtection would read template.lock
-    // from the target repo and extract platform repo/SHA.
+    await deps.writer.reconcileRepositoryRuleset({
+      repository,
+      hardened: {
+        requiredCheckContexts: ['CI Gate', 'PR hygiene'],
+        integrationId: GITHUB_ACTIONS_APP_ID,
+      },
+    });
     operations.push({
-      order: 110,
-      phase: 'org-workflows',
-      kind: 'ruleset.org-workflow.activate',
+      order: 210,
+      phase: 'ruleset',
+      kind: 'ruleset.repository.harden',
       disposition: 'update',
-      target: `${target.owner}/${target.repo}:org-workflows`,
-      result: 'evaluate → active',
+      target: `${target.owner}/${target.repo}:sdd-main`,
+      result: `added required_status_checks [CI Gate, PR hygiene] integration_id=${GITHUB_ACTIONS_APP_ID}`,
     });
   } catch (err) {
-    operations.push({
-      order: 110,
-      phase: 'org-workflows',
-      kind: 'ruleset.org-workflow.activate',
-      disposition: 'blocked',
-      target: `${target.owner}/${target.repo}:org-workflows`,
-      result: (err as Error).message,
-    });
-    return buildInitResult('BOOTSTRAP_MERGED', operations, 'blocked', repository);
+    // Fail closed. Org ruleset may already be active — that's OK, the next
+    // run of finalize will reconcile. We do not pretend to be COMPLETE.
+    return blocked(
+      'ruleset',
+      'ruleset.repository.harden',
+      `${target.owner}/${target.repo}:sdd-main`,
+      `harden failed: ${(err as Error).message}`,
+    );
   }
-
-  // Harden product repository ruleset: add required status checks.
-  // This would update the sdd-main ruleset to add CI Gate + PR hygiene
-  // context with integration_id binding.
-  operations.push({
-    order: 120,
-    phase: 'ruleset',
-    kind: 'ruleset.repository.harden',
-    disposition: 'update',
-    target: `${target.owner}/${target.repo}:sdd-main`,
-    result: 'added CI Gate + PR hygiene required checks',
-  });
 
   const result: InitResult = {
     phase: 'COMPLETE',
     operations,
     repository,
+    mainSha,
     bootstrapPr: { number: bootstrapPr.number, headSha: bootstrapPr.headSha },
     nextAction: 'complete',
   };

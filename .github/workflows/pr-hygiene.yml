@@ -11,12 +11,26 @@
 # No secrets, no checkout/execute of product PR blob.
 # Checks out the PLATFORM repo at pinned SHA to get the sdd CLI, then runs
 # `sdd gate hygiene` which reads the product PR via API (not filesystem).
+#
+# Pinned platform identity (§3.6 / D10): SDD_PLATFORM_REPO and
+# SDD_PLATFORM_REF below MUST be kept in lock-step with the dedicated
+# organization ruleset's workflow source (repository_id + path + sha). The
+# workflow runs with on:pull_request (not pull_request_target), so
+# github.sha / github.event.pull_request.head.repo.* are NOT the platform
+# identity — they describe the product PR. Never use them to locate the sdd
+# CLI or the platform source.
 
 name: pr-hygiene
 
 on:
   pull_request:
     branches: [main]
+
+# Platform identity — kept in sync with the org ruleset's pinned SHA.
+# Update together with `reconcileOrgWorkflowRuleset` in factory.
+env:
+  SDD_PLATFORM_REPO: Geeph/sdd-platform
+  SDD_PLATFORM_REF: main   # TODO: pin to a full 40-char commit once the first release is cut
 
 permissions:
   contents: read
@@ -27,12 +41,14 @@ jobs:
     name: PR hygiene
     runs-on: ubuntu-latest
     steps:
-      # Checkout platform repo at pinned SHA to get sdd CLI.
-      # This is the platform repo itself, NOT the product PR.
+      # Checkout the PLATFORM repo at the pinned SHA to get the sdd CLI.
+      # This is NOT the product PR — we use explicit env so fork PRs cannot
+      # redirect the checkout (§3.6 / D10).
       - name: checkout platform repo
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          repository: ${{ env.SDD_PLATFORM_REPO }}
+          ref: ${{ env.SDD_PLATFORM_REF }}
           path: platform
 
       - name: setup node
@@ -53,8 +69,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Extract repo and PR number from the event context.
-          REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          # The product repo is the base repo of the PR — never the head repo,
+          # which for fork PRs belongs to the fork (untrusted).
+          REPO="${{ github.event.pull_request.base.repo.full_name }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
           # Run hygiene check — reads PR via API, does NOT checkout product blob.

@@ -152,12 +152,43 @@ export interface ObservedState {
     number: number;
     headSha: string;
     state: 'open' | 'merged' | 'closed';
+    /** Merge commit SHA (populated when state === 'merged'). */
+    mergeCommitSha?: string;
+    /** PR author login. */
+    author?: string;
+    /** Approved reviews with reviewer login and the head SHA they approved. */
+    approvals?: ReadonlyArray<{ user: string; headSha: string }>;
   };
   /** True if an `sdd-main` repository ruleset already exists. */
   repositoryRulesetExists: boolean;
   /** True if a dedicated org workflow ruleset exists for this repo id. */
   orgWorkflowRulesetExists: boolean;
   orgWorkflowRulesetEnforcement?: 'evaluate' | 'active';
+  /**
+   * Source identity of the org workflow ruleset (recovered during observe).
+   * Used by finalize to verify the pinned workflow source has not drifted.
+   */
+  orgWorkflowRulesetSource?: {
+    repositoryId: number;
+    path: string;
+    sha: string;
+    /** Targeted repo id; must equal `repository.id` for the ruleset to be ours. */
+    targetRepoId?: number;
+    /** Targeted branch pattern; expected `refs/heads/main`. */
+    targetRefPattern?: string;
+  };
+  /**
+   * Check runs emitted on the Bootstrap PR's final head SHA. Used by
+   * finalizeProtection to verify that `CI Gate` and `PR hygiene` both
+   * succeeded on the exact head that was approved/merged.
+   */
+  bootstrapCheckRuns?: ReadonlyArray<{
+    context: string;
+    conclusion: string;
+    headSha: string;
+    /** App id that produced the check run (GitHub Actions = 15368). */
+    appId: number;
+  }>;
 }
 
 /**
@@ -246,8 +277,23 @@ export interface EnvironmentsInput {
 
 export interface RulesetInput {
   repository: RepositoryIdentity;
-  /** Initial ruleset: no required checks yet. */
-  hardened: false;
+  /**
+   * `false` = initial ruleset (no required checks yet — contexts don't exist
+   * before the Bootstrap PR runs). `true` = finalized ruleset with required
+   * status checks bound to GitHub Actions integration_id (D10).
+   */
+  hardened:
+    | false
+    | {
+        /** Required status check contexts (D8: frozen names). */
+        requiredCheckContexts: ReadonlyArray<'CI Gate' | 'PR hygiene'>;
+        /**
+         * GitHub Actions integration_id used to bind the required checks to
+         * runs produced by the trusted platform workflow source (D10). The
+         * well-known GitHub Actions app id is 15368; callers MAY override.
+         */
+        integrationId?: number;
+      };
 }
 
 export interface OrgWorkflowRulesetInput {
@@ -266,7 +312,10 @@ export interface BootstrapPullInput {
   body: string;
   headBranch: string;
   baseBranch: string;
+  /** Bootstrap approver team slugs (≥1, used for the admins wildcard). */
   reviewers: string[];
+  /** CODEOWNERS partition mapping (§3.3). */
+  owners: ProductInitConfig['owners'];
 }
 
 export interface BootstrapPull {
