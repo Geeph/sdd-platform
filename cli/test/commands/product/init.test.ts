@@ -8,8 +8,9 @@
  */
 
 import { execFile, execFileSync } from 'node:child_process';
-import { writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { parseRemoteUrl } from '../../../src/local-reader.js';
@@ -140,22 +141,27 @@ describe('sdd product init', () => {
 
   it('fails with invalid config', async () => {
     const platform = derivePlatformRepo();
-    const badYaml = resolve(FIXTURES, 'product-init-bad.yaml');
-    await writeFile(badYaml, 'schema_version: 1\nunknown_key: oops\n', 'utf8');
-    const { stderr, code } = await runCli([
-      'product',
-      'init',
-      'demo',
-      '--owner',
-      platform.owner,
-      '--platform-repo',
-      `${platform.owner}/${platform.repo}`,
-      '--config',
-      badYaml,
-      '--dry-run',
-    ]);
-    expect(code).not.toBe(0);
-    expect(normalizeError(stderr)).toMatch(/additionalProperties/);
+    const tempDir = await mkdtemp(join(tmpdir(), 'sdd-product-init-'));
+    try {
+      const badYaml = join(tempDir, 'product-init-bad.yaml');
+      await writeFile(badYaml, 'schema_version: 1\nunknown_key: oops\n', 'utf8');
+      const { stderr, code } = await runCli([
+        'product',
+        'init',
+        'demo',
+        '--owner',
+        platform.owner,
+        '--platform-repo',
+        `${platform.owner}/${platform.repo}`,
+        '--config',
+        badYaml,
+        '--dry-run',
+      ]);
+      expect(code).not.toBe(0);
+      expect(normalizeError(stderr)).toMatch(/additionalProperties/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('refuses cross-org --platform-repo (same-org invariant)', async () => {

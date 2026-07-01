@@ -159,8 +159,7 @@ export default class ProductInit extends Command {
       const plan = await compileInitPlan(input, reader);
 
       // Post-process warnings: surface that teams aren't verified in local
-      // mode, that --platform-repo was defaulted, and whether the worktree
-      // is dirty (uncommitted template changes).
+      // mode and that --platform-repo was defaulted.
       if (!platformRepoExplicit) {
         plan.warnings.unshift(
           `--platform-repo defaulted to '${platformRepo}'; pass it explicitly for production runs.`,
@@ -174,13 +173,6 @@ export default class ProductInit extends Command {
           `本地模式下无法校验 team 存在性（${uncheckedTeams.length} 个 team 标记为 missing）；实际执行前将由 GitHub API 验证。`,
         );
       }
-      const worktree = await reader.verifyWorktree();
-      if (worktree.dirty) {
-        plan.warnings.push(
-          '本地 platform 仓有未提交的改动；模板字节归因到 HEAD commit，可能不反映真实来源。',
-        );
-      }
-
       if (flags.format === 'json') {
         process.stdout.write(serializeInitPlan(plan));
       } else {

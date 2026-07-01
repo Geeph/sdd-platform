@@ -16,17 +16,16 @@
  *     `repo`. A mismatch → fail closed. This prevents reporting
  *     `source.repository = 'acme/sdd-platform'` while reading bytes from
  *     `Geeph/sdd-platform` or any other checkout.
- *   - The local worktree MUST be clean (`git status --porcelain` empty).
- *     Uncommitted template changes would be silently attributed to HEAD,
- *     producing a dishonest report.
+ *   - Template bytes are read from the resolved commit with `git show`, not
+ *     from the worktree. Uncommitted changes therefore cannot be attributed
+ *     to HEAD.
  *   - When a commit is supplied, it must match the local HEAD; we do not
  *     read blobs at an arbitrary tree that doesn't correspond to what
  *     `HEAD` points at.
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type {
   GitHubReadPort,
@@ -183,16 +182,27 @@ async function readGitState(dir: string): Promise<{
  */
 export function parseRemoteUrl(url: string): { owner: string; repo: string } | null {
   // SSH shorthand
-  const sshMatch = url.match(/^git@[^:]+:([^/]+)\/([^/]+?)(?:\.git)?$/);
+  const sshMatch = url.match(/^git@([^:]+):([^/]+)\/([^/]+?)(?:\.git)?$/);
   if (sshMatch) {
-    return { owner: sshMatch[1]?.toLowerCase(), repo: sshMatch[2]?.toLowerCase() };
+    const [, host, owner, repo] = sshMatch;
+    if (!host || !owner || !repo || host.toLowerCase() !== 'github.com') return null;
+    return { owner: owner.toLowerCase(), repo: repo.toLowerCase() };
   }
-  // https / ssh URL
-  const urlMatch = url.match(/^(?:https?|ssh):\/\/[^/]+\/([^/]+)\/([^/]+?)(?:\.git)?$/);
-  if (urlMatch) {
-    return { owner: urlMatch[1]?.toLowerCase(), repo: urlMatch[2]?.toLowerCase() };
+  // ProductInitInput identifies a GitHub repository by owner/name only, so
+  // accepting another host would misattribute the source.
+  try {
+    const parsed = new URL(url);
+    if (!['https:', 'ssh:'].includes(parsed.protocol)) return null;
+    if (parsed.hostname.toLowerCase() !== 'github.com') return null;
+    const segments = parsed.pathname.replace(/^\/+|\/+$/g, '').split('/');
+    if (segments.length !== 2) return null;
+    const owner = segments[0];
+    const repo = segments[1]?.replace(/\.git$/, '');
+    if (!owner || !repo) return null;
+    return { owner: owner.toLowerCase(), repo: repo.toLowerCase() };
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /**
@@ -203,13 +213,7 @@ export function parseRemoteUrl(url: string): { owner: string; repo: string } | n
  * sdd-platform checkout); defaults to walking up from CWD looking for
  * `templates/monorepo-root.manifest.json`.
  */
-export function createLocalFsReadPort(platformRoot?: string): GitHubReadPort & {
-  /**
-   * Check whether the underlying platform checkout has uncommitted changes.
-   * Callers (e.g. the CLI) can surface this as a warning in the plan output.
-   */
-  verifyWorktree: () => Promise<{ dirty: boolean }>;
-} {
+export function createLocalFsReadPort(platformRoot?: string): GitHubReadPort {
   const seed = platformRoot ?? process.cwd();
   // Resolve once at creation time so all subsequent calls see the same view.
   let cached: Promise<PlatformRootInfo> | null = null;
@@ -315,31 +319,24 @@ export function createLocalFsReadPort(platformRoot?: string): GitHubReadPort & {
       await verifyRepoIdentity(repo);
       const info = await resolved();
 
-      // Verify the requested commit matches what's on disk. We only ever
-      // read from HEAD, so any other commit → fail closed.
+      // This adapter serves the local checkout's HEAD only. Blob content is
+      // read from the commit object, never from the mutable worktree.
       if (info.headCommit && commit !== info.headCommit) {
         throw new Error(
           `local-reader: caller asked for commit '${commit}' but local HEAD is '${info.headCommit}'. ` +
-            'Refusing to serve blobs at a commit that does not match the working tree.',
+            'Refusing to serve blobs at a commit that does not match this checkout.',
         );
       }
 
-      const templateDir = resolve(info.root, path);
-      const manifestPath = `${templateDir}.manifest.json`;
-      const manifestJson = JSON.parse(await readFile(manifestPath, 'utf8'));
+      const manifestPath = `${path}.manifest.json`;
+      const manifestJson = JSON.parse(
+        readCommitBlob(info.root, commit, manifestPath).toString('utf8'),
+      );
       const manifest = parseManifest(manifestJson);
 
       const entries: TemplateTreeEntry[] = [];
       for (const mf of manifest.files) {
-        const abs = resolve(templateDir, mf.path);
-        if (!abs.startsWith(templateDir)) {
-          throw new Error(`template file escapes root: ${mf.path}`);
-        }
-        const content = await readFile(abs);
-        const s = await stat(abs);
-        if (s.isSymbolicLink()) {
-          throw new Error(`template file is symlink: ${mf.path}`);
-        }
+        const content = readCommitBlob(info.root, commit, `${path}/${mf.path}`);
         entries.push({
           path: mf.path,
           mode: mf.mode,
@@ -361,24 +358,20 @@ export function createLocalFsReadPort(platformRoot?: string): GitHubReadPort & {
         orgWorkflowRulesetExists: false,
       };
     },
-
-    async verifyWorktree(): Promise<{ dirty: boolean }> {
-      const info = await resolved();
-      return { dirty: !info.clean };
-    },
   };
 }
 
-/**
- * Build a content-derived commit identifier from a manifest. Used as a
- * last-resort fallback when the platform checkout is not a git work tree
- * and the caller did not pin a ref. The identifier is a deterministic
- * function of the template bytes, so re-running dry-run against the same
- * template produces the same id.
- */
-export function contentDerivedCommit(manifestJson: string): string {
-  return createHash('sha256').update(manifestJson, 'utf8').digest('hex').slice(0, 40);
+function readCommitBlob(root: string, commit: string, path: string): Buffer {
+  try {
+    return execFileSync('git', ['show', `${commit}:${path}`], {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (err) {
+    const stderr = (err as { stderr?: Buffer }).stderr?.toString().trim();
+    throw new Error(
+      `local-reader: cannot read '${path}' from commit '${commit}'${stderr ? `: ${stderr}` : ''}`,
+    );
+  }
 }
-
-// Re-export readdir so tests can stub the module if needed.
-export { readdir };
