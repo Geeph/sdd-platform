@@ -12,8 +12,11 @@
  *   4. Upstream approvals: architecture/design/plan reference PR/SHA that
  *      exists, merged to main, with correct gate:* label. Plan with no UI
  *      has design=skipped and non-empty skip_design_gate_reason.
- *   5. CODEOWNER: changed paths fall under matching CODEOWNERS rules.
- *   6. Read method: full pagination for changed files; blob at PR head SHA.
+ *   5. CODEOWNER: changed paths fall under matching CODEOWNERS rules, read
+ *      from the BASE branch SHA (PR must not be able to rewrite its own
+ *      CODEOWNERS verdict — §3.6 / D10).
+ *   6. Read method: full pagination for changed files; artifact blobs at PR
+ *      head SHA, CODEOWNERS at PR base SHA.
  *   7. Fail closed: any parse/API/validation failure → non-zero exit.
  *
  * Non-Gate PRs (no gate:* label, e.g. Bootstrap PR) only do generic checks
@@ -49,9 +52,23 @@ const VERSION_LABEL_RE = /^version:(v\d+)$/;
 const VERSION_MARKER_RE = /^v\d+$/;
 const REQ_ID_RE = /^REQ-[A-Z0-9]+-\d+$/;
 const SCR_ID_RE = /^SCR-[A-Z0-9-]+$/;
-const _OPERATION_ID_RE = /^[a-z][a-z0-9_-]*$/;
+const OPERATION_ID_RE = /^[a-z][a-z0-9_-]*$/;
+const UPSTREAM_PR_REF_RE = /^#(\d+)$/;
+const UPSTREAM_SHA_REF_RE = /^[0-9a-f]{40}$/;
 
 const VALID_GATES = new Set(['spec', 'architecture', 'design', 'plan', 'contract']);
+
+// Map from current gate type → upstream gate types that must have been
+// approved before this gate can proceed. Spec has no upstream; architecture
+// depends on spec; design depends on spec+architecture; plan depends on
+// spec+architecture+design.
+const UPSTREAM_GATES_FOR: Record<string, string[]> = {
+  spec: [],
+  architecture: ['spec'],
+  design: ['spec', 'architecture'],
+  plan: ['spec', 'architecture', 'design'],
+  contract: ['spec', 'architecture'],
+};
 
 // ---- Public API ------------------------------------------------------------
 
@@ -73,10 +90,14 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       pull_number: input.pr,
     })) as {
       head: { sha: string };
+      base: { sha: string; ref: string };
       labels: Array<{ name: string }>;
       body: string | null;
       user: { login: string };
     };
+
+    const headSha = pr.head.sha;
+    const baseSha = pr.base.sha;
 
     // Extract gate labels.
     const gateLabels = pr.labels.map((l) => l.name).filter((name) => GATE_LABEL_RE.test(name));
@@ -159,11 +180,13 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       }
     }
 
-    // §3.5.3: Stable IDs — fetch blobs and check content.
+    // §3.5.3: Stable IDs — fetch blobs at PR head SHA and check content.
+    // Artifact blobs are read at head SHA because that is what the PR is
+    // proposing; CODEOWNERS (below) is read at base SHA (D10).
     if (gateType === 'spec') {
       const specPath = `specs/${version}/spec.md`;
       if (changedFilenames.has(specPath)) {
-        const content = await fetchBlobContent(input.octokit, input.repo, specPath, pr.head.sha);
+        const content = await fetchBlobContentStrict(input.octokit, input.repo, specPath, headSha);
         const reqIds = extractReqIds(content);
         if (reqIds.length === 0) {
           violations.push('spec.md must contain at least one REQ-<AREA>-<n> ID');
@@ -174,7 +197,12 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
     if (gateType === 'design') {
       const designPath = `specs/${version}/design.md`;
       if (changedFilenames.has(designPath)) {
-        const content = await fetchBlobContent(input.octokit, input.repo, designPath, pr.head.sha);
+        const content = await fetchBlobContentStrict(
+          input.octokit,
+          input.repo,
+          designPath,
+          headSha,
+        );
         const scrIds = extractScrIds(content);
         if (scrIds.length === 0) {
           violations.push('design.md must contain at least one SCR-<NAME> ID');
@@ -182,12 +210,56 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       }
     }
 
+    // operationId validation in OpenAPI artifacts (architecture gate).
+    if (gateType === 'architecture') {
+      const openapiPath = 'contracts/openapi.yaml';
+      if (changedFilenames.has(openapiPath)) {
+        const content = await fetchBlobContentStrict(
+          input.octokit,
+          input.repo,
+          openapiPath,
+          headSha,
+        );
+        const opIds = extractOperationIds(content);
+        const invalid = opIds.filter((id) => !OPERATION_ID_RE.test(id));
+        if (invalid.length > 0) {
+          violations.push(
+            `openapi.yaml has operationId(s) failing ^[a-z][a-z0-9_-]*$: ${invalid.join(', ')}`,
+          );
+        }
+        const unique = new Set(opIds);
+        if (unique.size !== opIds.length) {
+          const seen = new Set<string>();
+          const dupes: string[] = [];
+          for (const id of opIds) {
+            if (seen.has(id)) dupes.push(id);
+            seen.add(id);
+          }
+          violations.push(
+            `openapi.yaml has duplicate operationIds: ${[...new Set(dupes)].join(', ')}`,
+          );
+        }
+      }
+    }
+
     // §3.5.4: Upstream approvals for architecture/design/plan.
+    //
+    // Each non-skipped reference must point at a PR/SHA that:
+    //   (a) exists,
+    //   (b) is merged into main,
+    //   (c) carried the correct gate:<upstream-type> label.
+    //
+    // This is the anti-spoof core (D10): we do NOT trust the marker's free
+    // text — every reference is re-verified against GitHub state.
     if (['architecture', 'design', 'plan'].includes(gateType)) {
       const upstreamApprovals = marker.upstream_approvals;
+      const requiredUpstream = UPSTREAM_GATES_FOR[gateType] ?? [];
 
-      if (Object.keys(upstreamApprovals).length === 0) {
-        violations.push(`${gateType} gate requires upstream_approvals in marker`);
+      // All required upstream gates must be present in the marker.
+      for (const upstream of requiredUpstream) {
+        if (!(upstream in upstreamApprovals)) {
+          violations.push(`${gateType} gate requires upstream_approvals.${upstream} in marker`);
+        }
       }
 
       // For plan with no UI: design=skipped + skip_design_gate_reason non-empty.
@@ -199,28 +271,59 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
           }
         }
       }
+
+      // Verify each reference against GitHub state.
+      for (const [upstream, reference] of Object.entries(upstreamApprovals)) {
+        if (!requiredUpstream.includes(upstream)) {
+          // Marker references an upstream gate that this gate doesn't depend
+          // on — not an error per se, but don't verify it.
+          continue;
+        }
+        if (reference === 'skipped') {
+          // Only valid for design in plan gate — already checked above.
+          if (!(gateType === 'plan' && upstream === 'design')) {
+            violations.push(
+              `upstream_approvals.${upstream} = 'skipped' is only valid for plan gate's design reference`,
+            );
+          }
+          continue;
+        }
+
+        const verified = await verifyUpstreamReference(
+          input.octokit,
+          input.repo,
+          upstream,
+          reference,
+          baseSha,
+        );
+        if (!verified.ok) {
+          violations.push(`upstream_approvals.${upstream}: ${verified.reason}`);
+        }
+      }
     }
 
     // §3.5.5: CODEOWNER check — changed paths fall under matching rules.
-    // This is a simplified check: we verify that paths have owners.
-    // Full CODEOWNERS parsing is complex; for M2 we do a basic check.
-    const codeownersContent = await fetchBlobContent(
+    //
+    // CODEOWNERS is read from the PR base SHA (not head SHA): a PR must NOT
+    // be able to rewrite the CODEOWNERS file it is being judged against.
+    // See §3.6 / D10 — the trusted verifier reads base-state CODEOWNERS.
+    //
+    // Fail closed: if the base-state CODEOWNERS cannot be read (including
+    // 404 on the very first bootstrap PR), that is a violation — not a pass.
+    const codeownersContent = await fetchBlobContentStrict(
       input.octokit,
       input.repo,
       '.github/CODEOWNERS',
-      pr.head.sha,
+      baseSha,
     );
-
-    if (codeownersContent) {
-      const codeownersRules = parseCodeowners(codeownersContent);
+    const codeownersRules = parseCodeowners(codeownersContent);
+    if (codeownersRules.length === 0) {
+      violations.push('CODEOWNERS at base SHA is empty or unparseable');
+    } else {
       for (const cf of changedFiles) {
         const owner = findCodeownerForPath(codeownersRules, cf.filename);
         if (!owner) {
-          // Fallback to wildcard.
-          const wildcardOwner = findCodeownerForPath(codeownersRules, '*');
-          if (!wildcardOwner) {
-            violations.push(`changed file '${cf.filename}' has no CODEOWNER`);
-          }
+          violations.push(`changed file '${cf.filename}' has no CODEOWNER`);
         }
       }
     }
@@ -335,28 +438,152 @@ async function fetchAllChangedFiles(
   return files;
 }
 
-async function fetchBlobContent(
+/**
+ * Fetch blob content strictly — any failure (404, network, parse) throws.
+ * Used for all security-relevant reads (artifacts, CODEOWNERS at base SHA).
+ * Callers wrap the entire checkPrHygiene in a try/catch that converts throws
+ * to hygiene violations (fail-closed §3.5.7).
+ */
+async function fetchBlobContentStrict(
   octokit: HygieneOctokit,
   repo: { owner: string; repo: string },
   path: string,
   ref: string,
 ): Promise<string> {
+  const resp = (await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+    owner: repo.owner,
+    repo: repo.repo,
+    path,
+    ref,
+    mediaType: { format: 'raw' },
+  })) as { content?: string; encoding?: string };
+
+  if (!resp.content) {
+    throw new Error(`blob '${path}' at ${ref.slice(0, 8)} is empty or missing`);
+  }
+  if (resp.encoding === 'base64') {
+    return Buffer.from(resp.content.replace(/\n/g, ''), 'base64').toString('utf8');
+  }
+  return resp.content;
+}
+
+/**
+ * Verify an upstream approval reference (§3.5.4 / D10).
+ *
+ * Accepted forms:
+ *   - `#<pr-number>` — PR must be merged to base, and carry `gate:<upstream>`
+ *   - `<40-hex-sha>` — commit must be reachable from base (merged to main)
+ *
+ * Anything else is rejected. The check is fail-closed: any API error on the
+ * referenced PR/commit surfaces as a violation, NOT a pass.
+ */
+async function verifyUpstreamReference(
+  octokit: HygieneOctokit,
+  repo: { owner: string; repo: string },
+  upstream: string,
+  reference: string,
+  baseSha: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const expectedLabel = `gate:${upstream}`;
+
+  if (UPSTREAM_PR_REF_RE.test(reference)) {
+    const prNumber = Number.parseInt(reference.slice(1), 10);
+
+    let upstreamPr: {
+      state: string;
+      merged: boolean;
+      merge_commit_sha: string | null;
+      labels: Array<{ name: string }>;
+      base: { ref: string };
+    };
+    try {
+      upstreamPr = (await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+        owner: repo.owner,
+        repo: repo.repo,
+        pull_number: prNumber,
+      })) as typeof upstreamPr;
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `referenced PR #${prNumber} could not be fetched: ${(err as Error).message}`,
+      };
+    }
+
+    if (upstreamPr.state !== 'closed' || !upstreamPr.merged) {
+      return { ok: false, reason: `PR #${prNumber} is not merged (state: ${upstreamPr.state})` };
+    }
+    if (upstreamPr.base.ref !== 'main') {
+      return {
+        ok: false,
+        reason: `PR #${prNumber} target branch is '${upstreamPr.base.ref}', expected 'main'`,
+      };
+    }
+    if (!upstreamPr.labels.some((l) => l.name === expectedLabel)) {
+      return {
+        ok: false,
+        reason: `PR #${prNumber} does not carry required label '${expectedLabel}'`,
+      };
+    }
+
+    // Optional extra: if the merge_commit_sha is known, verify it's reachable
+    // from the current PR's base. We skip this when the merge_commit_sha is
+    // null (squash merges without a recorded merge commit).
+    if (upstreamPr.merge_commit_sha) {
+      const reachable = await isCommitReachableFromBase(
+        octokit,
+        repo,
+        upstreamPr.merge_commit_sha,
+        baseSha,
+      );
+      if (!reachable) {
+        return {
+          ok: false,
+          reason: `PR #${prNumber} merge commit ${upstreamPr.merge_commit_sha.slice(0, 8)} is not on main`,
+        };
+      }
+    }
+
+    return { ok: true };
+  }
+
+  if (UPSTREAM_SHA_REF_RE.test(reference)) {
+    const reachable = await isCommitReachableFromBase(octokit, repo, reference, baseSha);
+    if (!reachable) {
+      return { ok: false, reason: `commit ${reference.slice(0, 8)} is not reachable from main` };
+    }
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    reason: `reference '${reference}' is neither '#<PR>' nor a 40-char SHA`,
+  };
+}
+
+/**
+ * Check whether `commitSha` is an ancestor of `baseSha` via the compare API.
+ * Used to verify that an upstream merge SHA is actually on main.
+ */
+async function isCommitReachableFromBase(
+  octokit: HygieneOctokit,
+  repo: { owner: string; repo: string },
+  commitSha: string,
+  baseSha: string,
+): Promise<boolean> {
   try {
-    const resp = (await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+    const cmp = (await octokit.request('GET /repos/{owner}/{repo}/compare/{base}...{head}', {
       owner: repo.owner,
       repo: repo.repo,
-      path,
-      ref,
-      mediaType: { format: 'raw' },
-    })) as { content?: string; encoding?: string };
-
-    if (!resp.content) return '';
-    if (resp.encoding === 'base64') {
-      return Buffer.from(resp.content.replace(/\n/g, ''), 'base64').toString('utf8');
-    }
-    return resp.content;
+      base: commitSha,
+      head: baseSha,
+    })) as { status: string };
+    // `ahead_by >= 0` and `status` in {ahead, identical} means base is a
+    // descendant of (or equal to) the commit. `behind` or `diverged` means
+    // the commit is NOT reachable from base.
+    return cmp.status === 'identical' || cmp.status === 'ahead';
   } catch {
-    return '';
+    // Fail closed: treat compare errors as "not reachable".
+    return false;
   }
 }
 
@@ -382,6 +609,20 @@ function extractScrIds(content: string): string[] {
         ids.push(m);
       }
     }
+  }
+  return ids;
+}
+
+/**
+ * Extract `operationId` values from a YAML-ish OpenAPI document. This is a
+ * line-level extractor (no YAML parser dependency); it matches lines like
+ * `operationId: listUsers` and returns the token after the colon.
+ */
+function extractOperationIds(content: string): string[] {
+  const ids: string[] = [];
+  for (const line of content.split('\n')) {
+    const m = line.match(/^\s*operationId:\s*"?([^"#]+)"?\s*(?:#.*)?$/);
+    if (m?.[1]) ids.push(m[1].trim());
   }
   return ids;
 }

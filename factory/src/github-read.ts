@@ -327,24 +327,59 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       }
 
       // Organization workflow rulesets — check for sdd-workflows-<id>.
+      // Capture the source identity (platform repo id + path + sha) and
+      // target (repo id + branch pattern) so finalize can verify no drift.
       let orgWorkflowRulesetExists = false;
       let orgWorkflowRulesetEnforcement: 'evaluate' | 'active' | undefined;
+      let orgWorkflowRulesetSource: ObservedState['orgWorkflowRulesetSource'] | undefined;
       try {
         const orgRulesets = (await safeRequest('GET /orgs/{org}/rulesets', {
           org: owner,
           per_page: 100,
-        })) as Array<{ name: string; enforcement: string }>;
+        })) as Array<{
+          id?: number;
+          name: string;
+          enforcement: string;
+          conditions?: Record<string, unknown>;
+          rules?: Array<Record<string, unknown>>;
+        }>;
         const targetName = `sdd-workflows-${repoResp.id}`;
         const found = orgRulesets.find((r) => r.name === targetName);
         if (found) {
           orgWorkflowRulesetExists = true;
           orgWorkflowRulesetEnforcement = found.enforcement as 'evaluate' | 'active';
+
+          // Recover source identity from the `workflows` rule parameters.
+          const conditions = found.conditions ?? {};
+          const targetRepoIds = (conditions.repository_ids as number[] | undefined) ?? [];
+          const refName = conditions.ref_name as { include?: string[] } | undefined;
+          const targetRefPattern = refName?.include?.[0];
+
+          const workflowsRule = (found.rules ?? []).find((r) => r.type === 'workflows');
+          if (workflowsRule) {
+            const params = workflowsRule.parameters as {
+              workflows?: Array<{ repository_id: number; path: string; sha: string }>;
+            };
+            const first = params.workflows?.[0];
+            if (first) {
+              const source: NonNullable<ObservedState['orgWorkflowRulesetSource']> = {
+                repositoryId: first.repository_id,
+                path: first.path,
+                sha: first.sha,
+              };
+              if (targetRepoIds[0] !== undefined) source.targetRepoId = targetRepoIds[0];
+              if (targetRefPattern !== undefined) source.targetRefPattern = targetRefPattern;
+              orgWorkflowRulesetSource = source;
+            }
+          }
         }
       } catch {
         // Org ruleset observation is best-effort.
       }
 
       // Bootstrap PR — check for open PR from sdd/bootstrap branch.
+      // Collect enough detail for finalizeProtection to verify evidence
+      // (approvals bound to final head, author, merge commit).
       let bootstrapPullRequest: ObservedState['bootstrapPullRequest'] | undefined;
       try {
         const prs = (await safeRequest('GET /repos/{owner}/{repo}/pulls', {
@@ -353,17 +388,97 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
           head: `${owner}:sdd/bootstrap`,
           state: 'all',
           per_page: 5,
-        })) as Array<{ number: number; head: { sha: string }; state: string; merged: boolean }>;
+        })) as Array<{
+          number: number;
+          head: { sha: string };
+          state: string;
+          merged: boolean;
+          merge_commit_sha: string | null;
+          user: { login: string };
+        }>;
         const bootstrap = prs[0];
         if (bootstrap) {
+          const state: 'open' | 'merged' | 'closed' = bootstrap.merged
+            ? 'merged'
+            : bootstrap.state === 'open'
+              ? 'open'
+              : 'closed';
+
+          // Approved reviews — only APPROVED state counts; capture the
+          // commit SHA at time of review to bind approval to final head.
+          let approvals: Array<{ user: string; headSha: string }> | undefined;
+          try {
+            const reviews = (await safeRequest(
+              'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews',
+              {
+                owner,
+                repo,
+                pull_number: bootstrap.number,
+                per_page: 100,
+              },
+            )) as Array<{
+              user: { login: string };
+              state: string;
+              commit_id: string;
+            }>;
+            approvals = reviews
+              .filter((r) => r.state === 'APPROVED')
+              .map((r) => ({ user: r.user.login, headSha: r.commit_id }));
+          } catch {
+            // Reviews are best-effort; finalize will fail closed if absent.
+          }
+
           bootstrapPullRequest = {
             number: bootstrap.number,
             headSha: bootstrap.head.sha,
-            state: bootstrap.merged ? 'merged' : bootstrap.state === 'open' ? 'open' : 'closed',
+            state,
+            author: bootstrap.user.login,
           };
+          if (bootstrap.merge_commit_sha) {
+            bootstrapPullRequest.mergeCommitSha = bootstrap.merge_commit_sha;
+          }
+          if (approvals !== undefined) {
+            bootstrapPullRequest.approvals = approvals;
+          }
         }
       } catch {
         // Bootstrap PR observation is best-effort.
+      }
+
+      // Check runs on the Bootstrap PR's final head SHA (used by finalize).
+      // We query by the PR head SHA, which is the commit that ran the
+      // platform workflows when the PR was open.
+      let bootstrapCheckRuns: ObservedState['bootstrapCheckRuns'] | undefined;
+      if (bootstrapPullRequest) {
+        try {
+          const checkRunsResp = (await safeRequest(
+            'GET /repos/{owner}/{repo}/commits/{ref}/check-runs',
+            {
+              owner,
+              repo,
+              ref: bootstrapPullRequest.headSha,
+              per_page: 100,
+            },
+          )) as {
+            check_runs: Array<{
+              name: string;
+              status: string;
+              conclusion: string | null;
+              head_sha: string;
+              app: { id: number };
+            }>;
+          };
+          bootstrapCheckRuns = checkRunsResp.check_runs
+            .filter((cr) => cr.status === 'completed')
+            .map((cr) => ({
+              context: cr.name,
+              conclusion: cr.conclusion ?? 'unknown',
+              headSha: cr.head_sha,
+              appId: cr.app.id,
+            }));
+        } catch {
+          // Check runs observation is best-effort; finalize will fail closed.
+        }
       }
 
       const repoState: ObservedState['repository'] = {
@@ -397,6 +512,12 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       }
       if (orgWorkflowRulesetEnforcement !== undefined) {
         result.orgWorkflowRulesetEnforcement = orgWorkflowRulesetEnforcement;
+      }
+      if (orgWorkflowRulesetSource !== undefined) {
+        result.orgWorkflowRulesetSource = orgWorkflowRulesetSource;
+      }
+      if (bootstrapCheckRuns !== undefined) {
+        result.bootstrapCheckRuns = bootstrapCheckRuns;
       }
       return result;
     },

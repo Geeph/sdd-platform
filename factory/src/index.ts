@@ -31,7 +31,7 @@ export {
   upsertBootstrapPull,
 } from './github-write.js';
 // Init orchestrator (M2b + M2c)
-export type { ApplyInitPlanDeps } from './init.js';
+export type { ApplyInitPlanDeps, FinalizeConfig } from './init.js';
 export { applyInitPlan, finalizeProtection } from './init.js';
 
 // Core functions
