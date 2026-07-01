@@ -52,7 +52,7 @@ const VERSION_LABEL_RE = /^version:(v\d+)$/;
 const VERSION_MARKER_RE = /^v\d+$/;
 const REQ_ID_RE = /^REQ-[A-Z0-9]+-\d+$/;
 const SCR_ID_RE = /^SCR-[A-Z0-9-]+$/;
-const OPERATION_ID_RE = /^[a-z][a-z0-9_-]*$/;
+const OPERATION_ID_RE = /^[a-z][a-zA-Z0-9_-]*$/;
 const UPSTREAM_PR_REF_RE = /^#(\d+)$/;
 const UPSTREAM_SHA_REF_RE = /^[0-9a-f]{40}$/;
 

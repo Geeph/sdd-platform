@@ -14,6 +14,8 @@ import {
   createWriteGitHubPort,
   type OctokitMutate,
   publishSnapshot,
+  reconcileOrgWorkflowRuleset,
+  reconcileRepositoryRuleset,
   seedMainViaContents,
   updateRepositorySettings,
 } from '../src/index.js';
@@ -686,4 +688,263 @@ describe('createWriteGitHubPort', () => {
 
   // M2c methods are now implemented (reconcileLabels, grantTeamPermissions, etc.).
   // Individual reconciler tests are in separate describe blocks.
+});
+
+// ---- reconcileRepositoryRuleset -------------------------------------------
+
+describe('reconcileRepositoryRuleset', () => {
+  const repository: RepositoryIdentity = {
+    owner: 'acme',
+    name: 'demo',
+    id: 12345,
+    defaultBranch: 'main',
+    visibility: 'private',
+  };
+
+  it('creates initial ruleset with conditions as an object (not array)', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
+    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    // Read-back response
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-main',
+      enforcement: 'active',
+    });
+
+    const { octokit, calls } = createFakeOctokit(responses);
+    await reconcileRepositoryRuleset(octokit, { repository, hardened: false });
+
+    const createCall = calls.find((c) => c.route.startsWith('POST /repos'));
+    expect(createCall).toBeDefined();
+    const conditions = (createCall!.params as { conditions: unknown }).conditions;
+    // §P0 #2 fix: conditions must be a plain object, not an array
+    expect(Array.isArray(conditions)).toBe(false);
+    expect(typeof conditions).toBe('object');
+    expect(conditions).toEqual({
+      ref_name: { include: ['refs/heads/main'], exclude: [] },
+    });
+  });
+
+  it('hardened=true adds required_status_checks with integration_id', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
+    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-main',
+      enforcement: 'active',
+    });
+
+    const { octokit, calls } = createFakeOctokit(responses);
+    await reconcileRepositoryRuleset(octokit, {
+      repository,
+      hardened: {
+        requiredCheckContexts: ['CI Gate', 'PR hygiene'],
+        integrationId: 15368,
+      },
+    });
+
+    const createCall = calls.find((c) => c.route.startsWith('POST /repos'));
+    expect(createCall).toBeDefined();
+    const rules = (createCall!.params as { rules: Array<Record<string, unknown>> }).rules;
+    const statusChecksRule = rules.find((r) => r.type === 'required_status_checks');
+    expect(statusChecksRule).toBeDefined();
+    const params = statusChecksRule!.parameters as {
+      required_status_checks: Array<{ context: string; integration_id: number }>;
+    };
+    expect(params.required_status_checks).toEqual([
+      { context: 'CI Gate', integration_id: 15368 },
+      { context: 'PR hygiene', integration_id: 15368 },
+    ]);
+  });
+
+  it('hardened without explicit integration_id defaults to 15368 (GitHub Actions)', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
+    responses.set('POST /repos/{owner}/{repo}/rulesets', { id: 1 });
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-main',
+      enforcement: 'active',
+    });
+
+    const { octokit, calls } = createFakeOctokit(responses);
+    await reconcileRepositoryRuleset(octokit, {
+      repository,
+      hardened: { requiredCheckContexts: ['CI Gate', 'PR hygiene'] },
+    });
+
+    const createCall = calls.find((c) => c.route.startsWith('POST /repos'));
+    const rules = (createCall!.params as { rules: Array<Record<string, unknown>> }).rules;
+    const statusChecksRule = rules.find((r) => r.type === 'required_status_checks');
+    const params = statusChecksRule!.parameters as {
+      required_status_checks: Array<{ context: string; integration_id: number }>;
+    };
+    expect(params.required_status_checks[0]!.integration_id).toBe(15368);
+  });
+});
+
+// ---- reconcileOrgWorkflowRuleset ------------------------------------------
+
+describe('reconcileOrgWorkflowRuleset', () => {
+  const repository: RepositoryIdentity = {
+    owner: 'acme',
+    name: 'demo',
+    id: 12345,
+    defaultBranch: 'main',
+    visibility: 'private',
+  };
+
+  it('uses repository_ids (plural) and sha: for pinned commit', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /orgs/{org}/rulesets', []);
+    responses.set('POST /orgs/{org}/rulesets', { id: 1 });
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      enforcement: 'evaluate',
+    });
+
+    const { octokit, calls } = createFakeOctokit(responses);
+    await reconcileOrgWorkflowRuleset(octokit, {
+      repository,
+      platformRepoId: 99999,
+      pinnedSha: 'a'.repeat(40),
+      enforcement: 'evaluate',
+    });
+
+    const createCall = calls.find((c) => c.route.startsWith('POST /orgs'));
+    expect(createCall).toBeDefined();
+    const params = createCall!.params as {
+      conditions: Record<string, unknown>;
+      rules: Array<Record<string, unknown>>;
+    };
+
+    // conditions must be an object, not an array (P0 #2 fix)
+    expect(Array.isArray(params.conditions)).toBe(false);
+
+    // Must use repository_ids (plural, array form), NOT repository_id: {include: ...}
+    expect(params.conditions.repository_ids).toEqual([12345]);
+    expect(params.conditions.repository_id).toBeUndefined();
+
+    // ref_name is a nested condition inside the same conditions object
+    expect(params.conditions.ref_name).toEqual({
+      include: ['refs/heads/main'],
+      exclude: [],
+    });
+
+    // Workflow source must use sha: (not ref:) for pinned commits (P0 #2 fix)
+    const workflowsRule = params.rules.find((r) => r.type === 'workflows');
+    expect(workflowsRule).toBeDefined();
+    const wfParams = workflowsRule!.parameters as {
+      workflows: Array<{ repository_id: number; path: string; sha: string; ref?: string }>;
+    };
+    expect(wfParams.workflows.length).toBe(2);
+    for (const wf of wfParams.workflows) {
+      expect(wf.repository_id).toBe(99999);
+      expect(wf.sha).toBe('a'.repeat(40));
+      // ref must NOT be present for pinned commits (P0 #2 fix)
+      expect(wf.ref).toBeUndefined();
+    }
+    expect(wfParams.workflows.map((w) => w.path)).toEqual([
+      '.github/workflows/ci-gate.yml',
+      '.github/workflows/pr-hygiene.yml',
+    ]);
+  });
+
+  it('honors enforcement=active for finalize', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /orgs/{org}/rulesets', [
+      {
+        id: 1,
+        name: 'sdd-workflows-12345',
+        enforcement: 'evaluate',
+        conditions: { repository_ids: [12345] },
+        rules: [],
+      },
+    ]);
+    responses.set('PUT /orgs/{org}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      enforcement: 'active',
+    });
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      enforcement: 'active',
+    });
+
+    const { octokit, calls } = createFakeOctokit(responses);
+    const result = await reconcileOrgWorkflowRuleset(octokit, {
+      repository,
+      platformRepoId: 99999,
+      pinnedSha: 'a'.repeat(40),
+      enforcement: 'active',
+    });
+
+    expect(result.updated).toEqual(['sdd-workflows-12345']);
+    const putCall = calls.find((c) => c.route.startsWith('PUT /orgs'));
+    expect(putCall).toBeDefined();
+    expect((putCall!.params as { enforcement: string }).enforcement).toBe('active');
+  });
+
+  it('detects conflict when existing ruleset has different target repo', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /orgs/{org}/rulesets', [
+      {
+        id: 1,
+        name: 'sdd-workflows-12345',
+        enforcement: 'evaluate',
+        conditions: { repository_ids: [77777] }, // different repo id
+        rules: [],
+      },
+    ]);
+
+    const { octokit } = createFakeOctokit(responses);
+    await expect(
+      reconcileOrgWorkflowRuleset(octokit, {
+        repository,
+        platformRepoId: 99999,
+        pinnedSha: 'a'.repeat(40),
+        enforcement: 'evaluate',
+      }),
+    ).rejects.toThrow(/conflict/);
+  });
+
+  it('detects conflict when pinned SHA has drifted', async () => {
+    const responses = new Map<string, unknown>();
+    responses.set('GET /orgs/{org}/rulesets', [
+      {
+        id: 1,
+        name: 'sdd-workflows-12345',
+        enforcement: 'evaluate',
+        conditions: { repository_ids: [12345] },
+        rules: [
+          {
+            type: 'workflows',
+            parameters: {
+              workflows: [
+                {
+                  repository_id: 99999,
+                  path: '.github/workflows/ci-gate.yml',
+                  sha: 'b'.repeat(40),
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ]);
+
+    const { octokit } = createFakeOctokit(responses);
+    await expect(
+      reconcileOrgWorkflowRuleset(octokit, {
+        repository,
+        platformRepoId: 99999,
+        pinnedSha: 'a'.repeat(40), // different from existing 'b'.repeat(40)
+        enforcement: 'evaluate',
+      }),
+    ).rejects.toThrow(/conflict/);
+  });
 });
