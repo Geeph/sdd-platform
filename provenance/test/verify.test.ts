@@ -487,7 +487,9 @@ describe('verifyGateApproval', () => {
       baseInput({
         octokit: fakeOctokit({
           pr: {
-            labels: [{ name: 'gate:architecture' }, { name: 'version:v1' }],
+            // Has expected gate:spec AND conflicting gate:architecture (D22: existence
+            // check must pass first, then the conflict loop catches the extra label).
+            labels: [{ name: 'gate:spec' }, { name: 'gate:architecture' }, { name: 'version:v1' }],
           },
         }),
       }),
@@ -496,6 +498,39 @@ describe('verifyGateApproval', () => {
     if (!result.ok) {
       expect(result.reason).toMatch(/gate:architecture/);
     }
+  });
+
+  // D22 regression: PR without any gate:* or version:* label must fail.
+  // Before the fix, the label loop only checked conflicts; a PR with no labels
+  // at all would pass through to CODEOWNER checks and succeed if those passed.
+  it('fails when required gate label is missing entirely (D22)', async () => {
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          pr: {
+            labels: [], // no gate:*, no version:*
+          },
+        }),
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toMatch(/required label.*gate:spec/);
+    }
+  });
+
+  it('passes when gate label present but version label absent (version is optional)', async () => {
+    // version:* label remains "if present, must match" per M2 D5.
+    const result = await verifyGateApproval(
+      baseInput({
+        octokit: fakeOctokit({
+          pr: {
+            labels: [{ name: 'gate:spec' }], // no version:*
+          },
+        }),
+      }),
+    );
+    expect(result.ok).toBe(true);
   });
 
   it('fails when version label conflicts', async () => {

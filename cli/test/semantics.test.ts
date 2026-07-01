@@ -2,6 +2,9 @@ import type { SDDProjects } from '@sdd/schemas';
 import { describe, expect, it } from 'vitest';
 import { semanticValidateProjects } from '../src/semantics.js';
 
+// Valid 40-hex SHA fixture (matches projects.schema.json `template_ref` pattern).
+const VALID_SHA = 'a'.repeat(40);
+
 // Helper to build a minimal valid SDDProjects document around a components array.
 function docWith(components: SDDProjects['components']): SDDProjects {
   return {
@@ -19,7 +22,7 @@ describe('semanticValidateProjects', () => {
         id: 'backend',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1.0.0',
+        template_ref: VALID_SHA,
         owner: 'backend-team',
         ci: 'java',
       },
@@ -27,7 +30,7 @@ describe('semanticValidateProjects', () => {
         id: 'web',
         path: 'apps/web',
         template: 'web',
-        template_ref: 'v1.0.0',
+        template_ref: VALID_SHA,
         owner: 'web-team',
         ci: 'web',
       },
@@ -41,16 +44,16 @@ describe('semanticValidateProjects', () => {
         id: 'backend',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
       {
         id: 'backend',
         path: 'apps/backend-v2',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
     ]);
@@ -64,16 +67,16 @@ describe('semanticValidateProjects', () => {
         id: 'backend-a',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
       {
         id: 'backend-b',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
     ]);
@@ -87,16 +90,16 @@ describe('semanticValidateProjects', () => {
         id: 'backend',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
       {
         id: 'backend-inner',
         path: 'apps/backend/inner',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'java',
       },
     ]);
@@ -110,8 +113,8 @@ describe('semanticValidateProjects', () => {
         id: 'backend',
         path: 'apps/backend',
         template: 'spring-boot',
-        template_ref: 'v1',
-        owner: 't',
+        template_ref: VALID_SHA,
+        owner: 'team',
         ci: 'web', // mismatch: spring-boot should pair with java
       },
     ]);
@@ -135,8 +138,8 @@ describe('semanticValidateProjects', () => {
           id: 'c',
           path: 'apps/c',
           template,
-          template_ref: 'v1',
-          owner: 't',
+          template_ref: VALID_SHA,
+          owner: 'team',
           ci,
         },
       ]);

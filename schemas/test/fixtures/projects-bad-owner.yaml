@@ -6,11 +6,5 @@ components:
     path: apps/backend
     template: spring-boot
     template_ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    owner: backend-team
+    owner: BackendTeam
     ci: java
-  - id: web
-    path: apps/web
-    template: web
-    template_ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    owner: web-team
-    ci: web

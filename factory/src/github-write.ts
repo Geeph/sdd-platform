@@ -1074,7 +1074,7 @@ export async function reconcileRepositoryRuleset(
           context,
           integration_id: integrationId,
         })),
-        strict_required_status_checks: true,
+        strict_required_status_checks_policy: true,
       },
     });
   }
@@ -1185,13 +1185,16 @@ function checkRulesetNeedsUpdate(
     const desired = desiredByType.get(type);
     if (!desired) return true; // Existing rule type not in desired set
 
-    // For required_status_checks, compare the actual contexts and integration_ids.
+    // For required_status_checks, compare the actual contexts, integration_ids,
+    // and strict_required_status_checks_policy (D24).
     if (type === 'required_status_checks') {
       const existingParams = existingRule.parameters as {
         required_status_checks?: Array<{ context: string; integration_id?: number }>;
+        strict_required_status_checks_policy?: boolean;
       };
       const desiredParams = desired.parameters as {
         required_status_checks: Array<{ context: string; integration_id: number }>;
+        strict_required_status_checks_policy: boolean;
       };
       const existingChecks = existingParams.required_status_checks ?? [];
       const desiredChecks = desiredParams.required_status_checks;
@@ -1203,6 +1206,13 @@ function checkRulesetNeedsUpdate(
       for (const desiredCheck of desiredChecks) {
         const existingId = existingMap.get(desiredCheck.context);
         if (existingId !== desiredCheck.integration_id) return true;
+      }
+      // Compare strict_required_status_checks_policy (D24).
+      if (
+        (existingParams.strict_required_status_checks_policy ?? false) !==
+        desiredParams.strict_required_status_checks_policy
+      ) {
+        return true;
       }
     } else {
       // For other rule types, do a shallow comparison of parameters.

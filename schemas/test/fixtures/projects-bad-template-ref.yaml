@@ -5,6 +5,6 @@ components:
   - id: backend
     path: apps/backend
     template: spring-boot
-    template_ref: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    template_ref: not-a-sha
     owner: backend-team
-    ci: web
+    ci: java
