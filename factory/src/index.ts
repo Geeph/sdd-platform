@@ -58,6 +58,8 @@ export {
 export type { CompiledScaffoldPlan, CompileScaffoldPlanInput } from './scaffold/plan.js';
 // Scaffold (M3)
 export { compileScaffoldPlan } from './scaffold/plan.js';
+export type { OctokitMutate as ScaffoldOctokitMutate } from './scaffold/publish.js';
+export { publishComponentBranch, upsertScaffoldPull } from './scaffold/publish.js';
 export type { RenderComponentInput, RenderedComponent } from './scaffold/render.js';
 export { expectedFilesForComponent, renderComponent } from './scaffold/render.js';
 export type {
