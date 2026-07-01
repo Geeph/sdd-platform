@@ -1,12 +1,16 @@
 /**
  * build-template-manifest.ts
  *
- * Generate `templates/monorepo-root.manifest.json` by walking the
- * `templates/monorepo-root/` directory tree and producing a canonical
+ * Generate `templates/<name>.manifest.json` by walking the
+ * `templates/<name>/` directory tree and producing a canonical
  * manifest: sorted `relative path → mode + render + source sha256` plus a
  * `tree_sha256` derived from the sorted file list.
  *
- * Run: `pnpm run build:template-manifest` (root workspace script).
+ * Run: `pnpm run build:template-manifest --template <name>` (root workspace
+ * script). Defaults to `monorepo-root` for backwards compatibility.
+ *
+ * Supported template names: monorepo-root, spring-boot, web, ios-tuist,
+ * android (closed set, matches factory TEMPLATE_NAMES).
  *
  * Deterministic: output is stable given the same tree content; no timestamps,
  * mtimes, or platform-dependent ordering.
@@ -16,8 +20,32 @@ import { createHash } from 'node:crypto';
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { posix, resolve } from 'node:path';
 
-const TEMPLATE_ROOT = 'templates/monorepo-root';
-const MANIFEST_PATH = 'templates/monorepo-root.manifest.json';
+const TEMPLATE_NAMES = new Set([
+  'monorepo-root',
+  'spring-boot',
+  'web',
+  'ios-tuist',
+  'android',
+]);
+
+// Dotfiles allowed in templates. Other hidden files (e.g. .DS_Store, .env)
+// remain skipped — they are developer-local artifacts, not project config.
+const ALLOWED_DOTFILES = new Set([
+  '.gitignore',
+  '.nvmrc',
+  '.swiftlint.yml',
+  '.tuist-version',
+  '.xcode-version',
+]);
+
+// Parse --template <name> from argv.
+function parseArgs(argv: string[]): string {
+  const idx = argv.indexOf('--template');
+  if (idx === -1 || idx + 1 >= argv.length) {
+    return 'monorepo-root';
+  }
+  return argv[idx + 1] as string;
+}
 
 // Match {{token}} syntax. Used to flag files that need rendering.
 const TOKEN_RE = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g;
@@ -30,7 +58,7 @@ interface ManifestFile {
 }
 
 interface Manifest {
-  template: 'monorepo-root';
+  template: string;
   path: string;
   tree_sha256: string; // "sha256:<hex>"
   files: ManifestFile[];
@@ -46,8 +74,14 @@ async function walk(root: string, base: string): Promise<string[]> {
     if (entry.isSymbolicLink()) {
       throw new Error(`Manifest refuses symlink: ${rel}`);
     }
-    if (entry.name.startsWith('.') && entry.name !== '.github') {
-      // Skip hidden files except the managed .github dir.
+    // Skip hidden files except the managed .github dir and a whitelist of
+    // legitimate project config files used by the four platform templates
+    // (.gitignore, .nvmrc, .swiftlint.yml, .tuist-version, .xcode-version).
+    if (
+      entry.name.startsWith('.') &&
+      entry.name !== '.github' &&
+      !ALLOWED_DOTFILES.has(entry.name)
+    ) {
       continue;
     }
     if (entry.isDirectory()) {
@@ -102,7 +136,7 @@ function rejectCRLF(data: Buffer, rel: string): void {
   }
 }
 
-async function buildManifest(rootAbs: string): Promise<Manifest> {
+async function buildManifest(rootAbs: string, templateName: string, templatePath: string): Promise<Manifest> {
   const rels = await walk(rootAbs, '');
   rels.sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
 
@@ -137,8 +171,8 @@ async function buildManifest(rootAbs: string): Promise<Manifest> {
   const treeHash = await sha256Hex(Buffer.from(`${treeLines}\n`, 'utf8'));
 
   return {
-    template: 'monorepo-root',
-    path: TEMPLATE_ROOT,
+    template: templateName,
+    path: templatePath,
     tree_sha256: treeHash,
     files,
   };
@@ -151,13 +185,21 @@ function canonicalJson(manifest: Manifest): string {
 }
 
 async function main(): Promise<void> {
+  const templateName = parseArgs(process.argv);
+  if (!TEMPLATE_NAMES.has(templateName)) {
+    throw new Error(
+      `Unknown template '${templateName}'. Supported: ${[...TEMPLATE_NAMES].join(', ')}`,
+    );
+  }
   const cwd = process.cwd();
-  const rootAbs = resolve(cwd, TEMPLATE_ROOT);
-  const manifest = await buildManifest(rootAbs);
-  const outPath = resolve(cwd, MANIFEST_PATH);
+  const templatePath = `templates/${templateName}`;
+  const rootAbs = resolve(cwd, templatePath);
+  const manifestPath = `templates/${templateName}.manifest.json`;
+  const manifest = await buildManifest(rootAbs, templateName, templatePath);
+  const outPath = resolve(cwd, manifestPath);
   await writeFile(outPath, canonicalJson(manifest), 'utf8');
   process.stdout.write(
-    `Wrote ${MANIFEST_PATH} (${manifest.files.length} files, tree=${manifest.tree_sha256})\n`,
+    `Wrote ${manifestPath} (${manifest.files.length} files, tree=${manifest.tree_sha256})\n`,
   );
 }
 

@@ -1,0 +1,79 @@
+{
+  "template": "android",
+  "path": "templates/android",
+  "tree_sha256": "sha256:c845bf9b18b5d51b1aa9e7d4a35d76c1db2e59b6880cd67b8c6b40f3636a7393",
+  "files": [
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:0bc0205fec2194ae2c0b155214a47e3158db4a6902cb6c83fc497a3abecb933f"
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:4c41ac0ba18a86083ba1cb81573e23e85be1c54ddba113c8a91fc4c794c77d07"
+    },
+    {
+      "path": "app/src/main/AndroidManifest.xml",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:fae4fe5f4b2b65494ec76584f555e2efb168821d6f7ae502efb7894e3c6f9215"
+    },
+    {
+      "path": "app/src/main/java/dev/sdd/MainActivity.kt",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:ffe3733fa0d0c213515420bfa49692e427f6d55e065281b809701dffe4a4d1b4"
+    },
+    {
+      "path": "app/src/test/java/dev/sdd/MainActivityUnitTest.kt",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:d80ea57065942242d1a33c1c1ae2af9527df4a110f82f693063ccb54c0dcf511"
+    },
+    {
+      "path": "build.gradle.kts",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:f209b9adc57eda11229414b45615ba4988a7ad51f86763cee14255bb8908a05c"
+    },
+    {
+      "path": "gradle/libs.versions.toml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:edd6468f4ba68f1d2e65d03a0dfff1e3bab03851837f37f6becb2e9c8f18e7ca"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.properties",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:f0b2060d483a15e115abfa1f99bc271a9a5e09be5c33f2714eda59a3d2e9d7cf"
+    },
+    {
+      "path": "gradlew",
+      "mode": "100755",
+      "render": false,
+      "sha256": "sha256:e192b4e7bea4b55eb458f8fdcbdb22b4db64ebdb1234031f525b8821dcaf2c67"
+    },
+    {
+      "path": "gradlew.bat",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:0e13ac7f2e81a6b90b249dc0598d693d0e9a50dba9b56183afd2574cb03da690"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:5a383cead6fe9de8efa779661a1a2575755a6da50d6c222be2d7ea73cf8a7835"
+    },
+    {
+      "path": "settings.gradle.kts",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:cf3e727a12b0992af5b77daffb6018b4cd7b8ecc30156812fa2216bed64ec45b"
+    }
+  ]
+}

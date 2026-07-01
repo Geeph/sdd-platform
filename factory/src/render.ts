@@ -14,12 +14,18 @@
 import { createHash } from 'node:crypto';
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import { sha256Hex } from './resolve.js';
-import type { RenderContext, RenderedTree, RenderInput, TemplateManifest } from './types.js';
+import type {
+  ComponentRenderContext,
+  RenderContext,
+  RenderedTree,
+  RenderInput,
+  TemplateManifest,
+} from './types.js';
 
 const TOKEN_RE = /\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g;
 
 /** Build a token→replacement lookup from the render context. */
-function tokenMap(context: RenderContext): Map<string, string> {
+function tokenMap(context: RenderContext | ComponentRenderContext): Map<string, string> {
   const m = new Map<string, string>();
   m.set('product', context.product);
   m.set('repo', context.repo);
@@ -37,6 +43,12 @@ function tokenMap(context: RenderContext): Map<string, string> {
     if (!m.has(`owners.${k}`) && adminsFallback) {
       m.set(`owners.${k}`, adminsFallback);
     }
+  }
+  // M3: per-component tokens (D2 / §1.0).
+  if ('component' in context && context.component) {
+    m.set('component_id', context.component.id);
+    m.set('component_owner', context.component.owner);
+    m.set('component_path', context.component.path);
   }
   return m;
 }
@@ -139,6 +151,8 @@ export function renderTree(input: RenderInput): RenderedTree {
   const outputTreeSha256 = outputTreeDigest(rendered);
 
   // Build template.lock as canonical YAML (fixed key order, sorted files).
+  // Template name/path come from the manifest (D2: no longer hardcoded to
+  // monorepo-root).
   const sortedDigests = [...fileDigests].sort((a, b) => a.path.localeCompare(b.path));
   const lock = {
     schema_version: 1,
@@ -149,8 +163,8 @@ export function renderTree(input: RenderInput): RenderedTree {
       resolved_commit: input.source.resolvedCommit,
     },
     template: {
-      name: 'monorepo-root',
-      path: 'templates/monorepo-root',
+      name: manifest.template,
+      path: manifest.path,
       manifest_sha256: sha256Hex(
         new TextEncoder().encode(`${JSON.stringify(canonicalManifestJson(manifest), null, 2)}\n`),
       ),

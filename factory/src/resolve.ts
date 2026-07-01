@@ -15,6 +15,7 @@ import type {
   TemplateManifest,
   TemplateTreeEntry,
 } from './types.js';
+import { TEMPLATE_NAMES, type TemplateName } from './types.js';
 
 const SHA256_HEX_RE = /^sha256:[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
@@ -60,8 +61,10 @@ export async function resolveRef(
  *  - tree_sha256 matches recomputed digest of the sorted file list
  */
 export function validateManifest(manifest: TemplateManifest): void {
-  if (manifest.template !== 'monorepo-root') {
-    throw new Error(`manifest.template must be 'monorepo-root', got '${manifest.template}'`);
+  if (!(TEMPLATE_NAMES as readonly string[]).includes(manifest.template)) {
+    throw new Error(
+      `manifest.template must be one of [${TEMPLATE_NAMES.join(', ')}], got '${manifest.template}'`,
+    );
   }
   if (!isSha256(manifest.tree_sha256)) {
     throw new Error(`manifest.tree_sha256 is malformed: ${manifest.tree_sha256}`);
@@ -175,8 +178,13 @@ export function parseManifest(json: unknown): TemplateManifest {
     throw new Error('manifest must be an object');
   }
   const obj = json as Record<string, unknown>;
-  if (obj.template !== 'monorepo-root') {
-    throw new Error(`manifest.template must be 'monorepo-root'`);
+  if (
+    typeof obj.template !== 'string' ||
+    !(TEMPLATE_NAMES as readonly string[]).includes(obj.template)
+  ) {
+    throw new Error(
+      `manifest.template must be one of [${TEMPLATE_NAMES.join(', ')}], got '${String(obj.template)}'`,
+    );
   }
   if (typeof obj.path !== 'string') throw new Error('manifest.path must be string');
   if (typeof obj.tree_sha256 !== 'string') {
@@ -216,7 +224,7 @@ export function parseManifest(json: unknown): TemplateManifest {
   });
 
   return Object.freeze({
-    template: 'monorepo-root',
+    template: obj.template as TemplateName,
     path: obj.path,
     tree_sha256: obj.tree_sha256,
     files,

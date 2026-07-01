@@ -92,11 +92,24 @@ export interface TemplateTreeEntry {
 }
 
 /**
+ * Closed set of supported template names (D2). `monorepo-root` is the M2
+ * product skeleton; the four platform templates are added by M3.
+ */
+export const TEMPLATE_NAMES = [
+  'monorepo-root',
+  'spring-boot',
+  'web',
+  'ios-tuist',
+  'android',
+] as const;
+export type TemplateName = (typeof TEMPLATE_NAMES)[number];
+
+/**
  * Manifest as loaded from `templates/<name>.manifest.json`. Same shape as the
  * on-disk JSON but frozen once loaded.
  */
 export interface TemplateManifest {
-  readonly template: 'monorepo-root';
+  readonly template: TemplateName;
   readonly path: string;
   readonly tree_sha256: string;
   readonly files: ReadonlyArray<{
@@ -506,9 +519,25 @@ export interface RenderContext {
   owners: ProductInitConfig['owners'];
 }
 
+/**
+ * Per-component render context (M3). Extends `RenderContext` with the
+ * component's identity so template tokens `{{component_id}}` and
+ * `{{component_owner}}` can be substituted. The base `owners` map is kept
+ * as a placeholder for the monorepo-root path; per-component rendering
+ * uses `component.owner` (the team slug for that component) rather than
+ * the monorepo-level owner map.
+ */
+export interface ComponentRenderContext extends RenderContext {
+  component: {
+    id: string;
+    path: string;
+    owner: string;
+  };
+}
+
 export interface RenderInput {
   tree: ReadonlyTree;
-  context: RenderContext;
+  context: RenderContext | ComponentRenderContext;
   source: { repository: string; requestedRef: string; resolvedCommit: string };
   generator: { package: string; version: string };
 }

@@ -1,0 +1,4 @@
+.tuist-generated
+DerivedData/
+.build/
+.DS_Store

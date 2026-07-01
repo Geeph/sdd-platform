@@ -1,0 +1,67 @@
+{
+  "template": "ios-tuist",
+  "path": "templates/ios-tuist",
+  "tree_sha256": "sha256:ad58b105641fcada611f5ea5238186f96b9a49ba71218efa5a2f29c81063820d",
+  "files": [
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:f724a598bcabec0276fa84985f82d6c03f66ad8ae4da7b83f02bdb83de3b61f0"
+    },
+    {
+      "path": ".swiftlint.yml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:fe5b79862a555445b511be62f13f1ce635087095a5bc5c5155a8a155102efeb3"
+    },
+    {
+      "path": ".tuist-version",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:6ac91050471a0baddd4ddba847a7adfd6a2ae09898c54968a291095438cc3de3"
+    },
+    {
+      "path": ".xcode-version",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:f4be95edf93790cfa7d5f2607c6227dd525c46c1f14103f22c7c7e5bedec8c4e"
+    },
+    {
+      "path": "Project.swift",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:7b5e60856f39c807b4fba943c009544818b2413b7553e29b72464d98a87772a5"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:e83072adf62357404ac389e47a340eb134cda68587a10d83e65c0aee9f082b9b"
+    },
+    {
+      "path": "Sources/App/ContentView.swift",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:cc87b2b4d0b4eb539383d4f504df0fad571cd1f9e5269da51aaa814bafdf2adb"
+    },
+    {
+      "path": "Sources/App/SDDApp.swift",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:fa085ac4e77a010411c3f4db8365644587c1259eb64baa2ed8264809a4b2976d"
+    },
+    {
+      "path": "Tests/AppTests/ContentViewTests.swift",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:26622f9368d5005e2000022c3d9640e38f2a386cbec84eb044897b31d6209277"
+    },
+    {
+      "path": "Tuist.swift",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:5109f8f1f3187a69623aa0b3cc676a5eb358323a11ef87897aaa75d0b48e7297"
+    }
+  ]
+}

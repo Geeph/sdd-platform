@@ -62,6 +62,7 @@ export type {
   BootstrapPull,
   BootstrapPullInput,
   CommitIdentity,
+  ComponentRenderContext,
   CreateRepoInput,
   Disposition,
   EnvironmentsInput,
@@ -96,6 +97,8 @@ export type {
   TargetPlan,
   TeamsInput,
   TemplateManifest,
+  TemplateName,
   TemplatePlan,
   TemplateTreeEntry,
 } from './types.js';
+export { TEMPLATE_NAMES } from './types.js';
