@@ -4,7 +4,10 @@
  * relaxations (TEMPLATE_NAMES closed set).
  */
 
-import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { TemplateTreeEntry } from '../src/index.js';
@@ -230,5 +233,98 @@ describe('ComponentRenderContext tokens', () => {
     expect(projects).toBeDefined();
     const text = new TextDecoder().decode(projects!.content);
     expect(text).toContain('acmeproduct');
+  });
+});
+
+describe('Template toolchain smoke test', () => {
+  const testContext: ComponentRenderContext = {
+    product: 'demo',
+    repo: 'acme',
+    owners: {
+      product: 'product-team',
+      api: 'api-team',
+      design: 'design-team',
+      admins: 'admins',
+    },
+    component: {
+      id: 'web',
+      path: 'apps/web',
+      owner: 'web-team',
+    },
+  };
+
+  it('web: rendered template passes tsc --noEmit', async () => {
+    const manifest = await loadManifest('web');
+    const entries: TemplateTreeEntry[] = [];
+    for (const mf of manifest.files) {
+      const content = await loadEntry('web', mf.path);
+      entries.push({ path: mf.path, mode: mf.mode, content });
+    }
+    const tree = assembleTree(manifest, entries);
+    const rendered = renderTree({
+      tree,
+      context: testContext,
+      source: {
+        repository: 'acme/sdd-platform',
+        requestedRef: 'a'.repeat(40),
+        resolvedCommit: 'a'.repeat(40),
+      },
+      generator: { package: '@sdd/factory', version: '0.1.0' },
+    });
+
+    // Write rendered files to a temp directory. Use POSIX temp path to avoid
+    // parent workspace interference with pnpm install.
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const tmpDir = mkdtempSync(`${tmpdir()}/sdd-web-`);
+    try {
+      // mkdtempSync already created the dir; write files directly.
+      for (const entry of rendered.entries) {
+        const filePath = resolve(tmpDir, entry.path);
+        const dir = resolve(filePath, '..');
+        await mkdir(dir, { recursive: true });
+        await writeFile(filePath, entry.content);
+      }
+
+      // Run pnpm install.
+      execFileSync('pnpm', ['install', '--frozen-lockfile'], {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
+      });
+
+      // Run tsc --noEmit (typecheck).
+      execFileSync('pnpm', ['tsc', '--noEmit'], {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+      });
+    } catch (err) {
+      const msg = (err as { stderr?: string; message?: string }).stderr ?? (err as Error).message;
+      throw new Error(`web template toolchain check failed: ${msg}`);
+    }
+    // Success proves the template is structurally sound.
+  }, 180_000);
+
+  it('spring-boot template: toolchain not run (requires JDK 21 + Gradle)', () => {
+    // The spring-boot template requires a JDK and Gradle wrapper JAR.
+    // This test documents the gap; full validation requires a CI runner
+    // with JDK 21 (e.g. actions/setup-java).
+    expect(true).toBe(true); // Documented skip — not a failure.
+  });
+
+  it('android template: toolchain not run (requires JDK + Android SDK)', () => {
+    // The android template requires JDK, Android SDK cmdline-tools,
+    // and a gradle-wrapper.jar. Full validation requires a CI runner
+    // with both JDK and Android SDK.
+    expect(true).toBe(true); // Documented skip.
+  });
+
+  it('ios-tuist template: toolchain not run (requires macOS + Xcode + Tuist)', () => {
+    // The ios-tuist template requires macOS, Xcode 16+, and Tuist CLI.
+    // Full validation requires a GitHub Actions macOS runner.
+    expect(true).toBe(true); // Documented skip.
   });
 });
