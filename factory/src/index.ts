@@ -33,7 +33,6 @@ export {
 // Init orchestrator (M2b + M2c)
 export type { ApplyInitPlanDeps, FinalizeConfig } from './init.js';
 export { applyInitPlan, finalizeProtection } from './init.js';
-
 // Core functions
 export { compileInitPlan, serializeInitPlan } from './plan.js';
 export {
@@ -56,6 +55,40 @@ export {
   sha256Hex,
   validateManifest,
 } from './resolve.js';
+export type { CompiledScaffoldPlan, CompileScaffoldPlanInput } from './scaffold/plan.js';
+// Scaffold (M3)
+export { compileScaffoldPlan } from './scaffold/plan.js';
+export type { RenderComponentInput, RenderedComponent } from './scaffold/render.js';
+export { expectedFilesForComponent, renderComponent } from './scaffold/render.js';
+export type {
+  ExpectedFile,
+  SubtreeVerificationInput,
+  SubtreeVerificationResult,
+} from './scaffold/subtree.js';
+export { verifyComponentSubtree } from './scaffold/subtree.js';
+export type {
+  ComponentLock,
+  PublishComponentBranchInput,
+  PublishResult,
+  ResolvedTemplate,
+  ScaffoldApproval,
+  ScaffoldAuthorization,
+  ScaffoldComponent,
+  ScaffoldComponentPlan,
+  ScaffoldDisposition,
+  ScaffoldInput,
+  ScaffoldNextAction,
+  ScaffoldPlan,
+  ScaffoldPlannedOperation,
+  ScaffoldProductObservation,
+  ScaffoldProjects,
+  ScaffoldPull,
+  ScaffoldReadPort,
+  ScaffoldResult,
+  ScaffoldWritePort,
+  TreeEntry,
+  UpsertScaffoldPullInput,
+} from './scaffold/types.js';
 // Types
 export type {
   AppliedOperation,
