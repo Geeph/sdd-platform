@@ -111,6 +111,26 @@ describe('sdd product init', () => {
     expect(normalizeError(stderr)).toMatch(/GITHUB_TOKEN/);
   });
 
+  it('requires config for finalize so bootstrap approver policy cannot be skipped', async () => {
+    const platform = derivePlatformRepo();
+    const { stderr, code } = await runCli(
+      [
+        'product',
+        'init',
+        'demo',
+        '--owner',
+        platform.owner,
+        '--platform-repo',
+        `${platform.owner}/${platform.repo}`,
+        '--finalize-protection',
+      ],
+      undefined,
+      { GITHUB_TOKEN: 'test-token' },
+    );
+    expect(code).toBe(2);
+    expect(normalizeError(stderr)).toMatch(/--config is required/);
+  });
+
   it('dry-run JSON produces byte-identical output', async () => {
     const platform = derivePlatformRepo();
     const args = [

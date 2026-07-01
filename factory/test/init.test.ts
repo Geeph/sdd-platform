@@ -164,7 +164,23 @@ function createFakeReader(observed: ObservedState): GitHubReadPort {
     async readTemplateTree() {
       return assembleTree(makeTestManifest(), makeTestEntries());
     },
-    async observe() {
+    async observe(input) {
+      if (input.target.repo === 'sdd-platform') {
+        return {
+          repositoryExists: true,
+          repository: {
+            id: 99999,
+            defaultBranch: 'main',
+            visibility: 'private',
+            empty: false,
+          },
+          existingLabels: [],
+          knownTeams: [],
+          existingEnvironments: [],
+          repositoryRulesetExists: false,
+          orgWorkflowRulesetExists: false,
+        };
+      }
       return observed;
     },
   };

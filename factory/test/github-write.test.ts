@@ -14,10 +14,12 @@ import {
   createWriteGitHubPort,
   type OctokitMutate,
   publishSnapshot,
+  reconcileEnvironments,
   reconcileOrgWorkflowRuleset,
   reconcileRepositoryRuleset,
   seedMainViaContents,
   updateRepositorySettings,
+  upsertBootstrapPull,
 } from '../src/index.js';
 import type { RepositoryIdentity } from '../src/types.js';
 
@@ -690,6 +692,118 @@ describe('createWriteGitHubPort', () => {
   // Individual reconciler tests are in separate describe blocks.
 });
 
+// ---- upsertBootstrapPull --------------------------------------------------
+
+describe('upsertBootstrapPull', () => {
+  it('re-requests configured approver teams when converging an existing PR', async () => {
+    const responses = new Map<string, unknown>([
+      [
+        'GET /repos/{owner}/{repo}/pulls',
+        [
+          {
+            number: 7,
+            head: { sha: 'head-sha', ref: 'sdd/bootstrap' },
+            html_url: 'https://github.com/acme/demo/pull/7',
+            state: 'open',
+          },
+        ],
+      ],
+      ['POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers', {}],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    await upsertBootstrapPull(octokit, {
+      repository: {
+        owner: 'acme',
+        name: 'demo',
+        id: 12345,
+        defaultBranch: 'main',
+        visibility: 'private',
+      },
+      title: 'bootstrap',
+      body: 'body',
+      headBranch: 'sdd/bootstrap',
+      baseBranch: 'main',
+      reviewers: ['platform-admins'],
+      owners: {
+        product: 'product-team',
+        api: 'api-team',
+        design: 'design-team',
+        admins: 'platform-admins',
+      },
+    });
+
+    const request = calls.find((call) => call.route.includes('requested_reviewers'));
+    expect(request?.params).toMatchObject({
+      pull_number: 7,
+      team_reviewers: ['platform-admins'],
+    });
+  });
+});
+
+// ---- reconcileEnvironments -----------------------------------------------
+
+describe('reconcileEnvironments', () => {
+  const repository: RepositoryIdentity = {
+    owner: 'acme',
+    name: 'demo',
+    id: 12345,
+    defaultBranch: 'main',
+    visibility: 'private',
+  };
+
+  it('writes and reads back team reviewers and prevent_self_review', async () => {
+    const responses = new Map<string, unknown>([
+      ['GET /repos/{owner}/{repo}/environments', { environments: [] }],
+      ['GET /orgs/{org}/teams/{team_slug}', { id: 88 }],
+      ['PUT /repos/{owner}/{repo}/environments/{environment_name}', { id: 1, name: 'preview' }],
+      [
+        'GET /repos/{owner}/{repo}/environments/{environment_name}',
+        {
+          id: 1,
+          name: 'preview',
+          protection_rules: [
+            {
+              type: 'required_reviewers',
+              prevent_self_review: true,
+              reviewers: [{ type: 'Team', reviewer: { id: 88 } }],
+            },
+          ],
+        },
+      ],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    await expect(
+      reconcileEnvironments(octokit, {
+        repository,
+        desired: [{ name: 'preview', reviewers: ['product-team'], preventSelfReview: true }],
+      }),
+    ).resolves.toEqual({ created: ['preview'], updated: [], noop: [] });
+    const put = calls.find((call) => call.route.startsWith('PUT'));
+    expect(put?.params).toMatchObject({
+      reviewers: [{ type: 'Team', id: 88 }],
+      prevent_self_review: true,
+    });
+  });
+
+  it('fails before environment mutation when a reviewer team cannot be resolved', async () => {
+    const responses = new Map<string, unknown>([
+      ['GET /repos/{owner}/{repo}/environments', { environments: [] }],
+      ['GET /orgs/{org}/teams/{team_slug}', {}],
+    ]);
+    const { octokit, calls } = createFakeOctokit(responses);
+
+    await expect(
+      reconcileEnvironments(octokit, {
+        repository,
+        desired: [{ name: 'preview', reviewers: ['missing-team'], preventSelfReview: true }],
+      }),
+    ).rejects.toThrow('has no id');
+    expect(calls.some((call) => call.route.startsWith('PUT'))).toBe(false);
+  });
+});
+
 // ---- reconcileRepositoryRuleset -------------------------------------------
 
 describe('reconcileRepositoryRuleset', () => {
@@ -703,21 +817,13 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('creates initial ruleset with conditions as an object (not array)', async () => {
     const responses = new Map<string, unknown>();
-    let created = false;
-    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
-      // Return empty initially, then return the created ruleset after POST
-      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
-    });
+    let detail: Record<string, unknown> = {};
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
     responses.set('POST /repos/{owner}/{repo}/rulesets', (params: Record<string, unknown>) => {
-      created = true;
-      return { id: 1 };
+      detail = { ...params, id: 1 };
+      return detail;
     });
-    // Read-back response
-    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-main',
-      enforcement: 'active',
-    });
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', () => detail);
 
     const { octokit, calls } = createFakeOctokit(responses);
     await reconcileRepositoryRuleset(octokit, { repository, hardened: false });
@@ -735,19 +841,13 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('hardened=true adds required_status_checks with integration_id', async () => {
     const responses = new Map<string, unknown>();
-    let created = false;
-    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
-      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
+    let detail: Record<string, unknown> = {};
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
+    responses.set('POST /repos/{owner}/{repo}/rulesets', (params: Record<string, unknown>) => {
+      detail = { ...params, id: 1 };
+      return detail;
     });
-    responses.set('POST /repos/{owner}/{repo}/rulesets', () => {
-      created = true;
-      return { id: 1 };
-    });
-    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-main',
-      enforcement: 'active',
-    });
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', () => detail);
 
     const { octokit, calls } = createFakeOctokit(responses);
     await reconcileRepositoryRuleset(octokit, {
@@ -774,19 +874,13 @@ describe('reconcileRepositoryRuleset', () => {
 
   it('hardened without explicit integration_id defaults to 15368 (GitHub Actions)', async () => {
     const responses = new Map<string, unknown>();
-    let created = false;
-    responses.set('GET /repos/{owner}/{repo}/rulesets', () => {
-      return created ? [{ id: 1, name: 'sdd-main', enforcement: 'active' }] : [];
+    let detail: Record<string, unknown> = {};
+    responses.set('GET /repos/{owner}/{repo}/rulesets', []);
+    responses.set('POST /repos/{owner}/{repo}/rulesets', (params: Record<string, unknown>) => {
+      detail = { ...params, id: 1 };
+      return detail;
     });
-    responses.set('POST /repos/{owner}/{repo}/rulesets', () => {
-      created = true;
-      return { id: 1 };
-    });
-    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-main',
-      enforcement: 'active',
-    });
+    responses.set('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', () => detail);
 
     const { octokit, calls } = createFakeOctokit(responses);
     await reconcileRepositoryRuleset(octokit, {
@@ -817,13 +911,13 @@ describe('reconcileOrgWorkflowRuleset', () => {
 
   it('uses repository_id.repository_ids (nested) and sha: for pinned commit', async () => {
     const responses = new Map<string, unknown>();
+    let detail: Record<string, unknown> = {};
     responses.set('GET /orgs/{org}/rulesets', []);
-    responses.set('POST /orgs/{org}/rulesets', { id: 1 });
-    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-workflows-12345',
-      enforcement: 'evaluate',
+    responses.set('POST /orgs/{org}/rulesets', (params: Record<string, unknown>) => {
+      detail = { ...params, id: 1 };
+      return detail;
     });
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', () => detail);
 
     const { octokit, calls } = createFakeOctokit(responses);
     await reconcileOrgWorkflowRuleset(octokit, {
@@ -874,24 +968,46 @@ describe('reconcileOrgWorkflowRuleset', () => {
 
   it('honors enforcement=active for finalize', async () => {
     const responses = new Map<string, unknown>();
+    let detail: Record<string, unknown> = {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      target: 'branch',
+      enforcement: 'evaluate',
+      conditions: {
+        repository_id: { repository_ids: [12345] },
+        ref_name: { include: ['refs/heads/main'], exclude: [] },
+      },
+      rules: [
+        {
+          type: 'workflows',
+          parameters: {
+            workflows: [
+              {
+                repository_id: 99999,
+                path: '.github/workflows/ci-gate.yml',
+                sha: 'a'.repeat(40),
+              },
+              {
+                repository_id: 99999,
+                path: '.github/workflows/pr-hygiene.yml',
+                sha: 'a'.repeat(40),
+              },
+            ],
+          },
+        },
+      ],
+    };
     responses.set('GET /orgs/{org}/rulesets', [
       {
         id: 1,
         name: 'sdd-workflows-12345',
         enforcement: 'evaluate',
-        conditions: { repository_id: { repository_ids: [12345] } },
-        rules: [],
       },
     ]);
-    responses.set('PUT /orgs/{org}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-workflows-12345',
-      enforcement: 'active',
-    });
-    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', {
-      id: 1,
-      name: 'sdd-workflows-12345',
-      enforcement: 'active',
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', () => detail);
+    responses.set('PUT /orgs/{org}/rulesets/{ruleset_id}', (params: Record<string, unknown>) => {
+      detail = { ...params, id: 1 };
+      return detail;
     });
 
     const { octokit, calls } = createFakeOctokit(responses);
@@ -910,15 +1026,15 @@ describe('reconcileOrgWorkflowRuleset', () => {
 
   it('detects conflict when existing ruleset has different target repo', async () => {
     const responses = new Map<string, unknown>();
-    responses.set('GET /orgs/{org}/rulesets', [
-      {
-        id: 1,
-        name: 'sdd-workflows-12345',
-        enforcement: 'evaluate',
-        conditions: { repository_id: { repository_ids: [77777] } }, // different repo id
-        rules: [],
-      },
-    ]);
+    const existing = {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      enforcement: 'evaluate',
+      conditions: { repository_id: { repository_ids: [77777] } }, // different repo id
+      rules: [],
+    };
+    responses.set('GET /orgs/{org}/rulesets', [existing]);
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', existing);
 
     const { octokit } = createFakeOctokit(responses);
     await expect(
@@ -933,28 +1049,28 @@ describe('reconcileOrgWorkflowRuleset', () => {
 
   it('detects conflict when pinned SHA has drifted', async () => {
     const responses = new Map<string, unknown>();
-    responses.set('GET /orgs/{org}/rulesets', [
-      {
-        id: 1,
-        name: 'sdd-workflows-12345',
-        enforcement: 'evaluate',
-        conditions: { repository_id: { repository_ids: [12345] } },
-        rules: [
-          {
-            type: 'workflows',
-            parameters: {
-              workflows: [
-                {
-                  repository_id: 99999,
-                  path: '.github/workflows/ci-gate.yml',
-                  sha: 'b'.repeat(40),
-                },
-              ],
-            },
+    const existing = {
+      id: 1,
+      name: 'sdd-workflows-12345',
+      enforcement: 'evaluate',
+      conditions: { repository_id: { repository_ids: [12345] } },
+      rules: [
+        {
+          type: 'workflows',
+          parameters: {
+            workflows: [
+              {
+                repository_id: 99999,
+                path: '.github/workflows/ci-gate.yml',
+                sha: 'b'.repeat(40),
+              },
+            ],
           },
-        ],
-      },
-    ]);
+        },
+      ],
+    };
+    responses.set('GET /orgs/{org}/rulesets', [existing]);
+    responses.set('GET /orgs/{org}/rulesets/{ruleset_id}', existing);
 
     const { octokit } = createFakeOctokit(responses);
     await expect(

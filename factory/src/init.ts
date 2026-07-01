@@ -371,6 +371,7 @@ export async function applyInitPlan(
       const teamsResult = await deps.writer.grantTeamPermissions({
         repository,
         assignments: teamAssignments,
+        requiredTeams: buildRequiredTeams(input),
       });
       operations.push({
         order: 50,
@@ -406,9 +407,14 @@ export async function applyInitPlan(
           order: 60,
           phase: 'environments',
           kind: 'environments.upsert',
-          disposition: envsResult.created.length > 0 ? 'create' : 'noop',
+          disposition:
+            envsResult.created.length > 0
+              ? 'create'
+              : envsResult.updated.length > 0
+                ? 'update'
+                : 'noop',
           target: `${input.target.owner}/${input.target.repo}:environments`,
-          result: `created=${envsResult.created.length}, noop=${envsResult.noop.length}`,
+          result: `created=${envsResult.created.length}, updated=${envsResult.updated.length}, noop=${envsResult.noop.length}`,
         });
       } catch (err) {
         operations.push({
@@ -524,7 +530,18 @@ export async function applyInitPlan(
       ...input,
       target: { owner: platformRepoRef.owner, repo: platformRepoRef.repo, visibility: 'private' },
     });
-    const platformRepoId = platformObserved.repository?.id ?? 0;
+    const platformRepoId = platformObserved.repository?.id;
+    if (!platformObserved.repositoryExists || platformRepoId === undefined) {
+      operations.push({
+        order: 80,
+        phase: 'org-workflows',
+        kind: 'ruleset.org-workflow',
+        disposition: 'blocked',
+        target: input.platform.repository,
+        result: 'platform repository is not readable; cannot configure required workflows',
+      });
+      return buildInitResult(currentPhase, operations, 'blocked', repository, mainSha);
+    }
 
     try {
       const orgRulesetResult = await deps.writer.reconcileOrgWorkflowRuleset({
@@ -849,20 +866,18 @@ export async function finalizeProtection(
   // Resolve each team slug to its member logins, then verify that at least
   // one valid approval is from a member of one of those teams.
   if (config.bootstrapApprovers && config.bootstrapApprovers.length > 0) {
+    if (!deps.reader.resolveTeamMembers) {
+      return blocked(
+        'bootstrap-pull',
+        'approval.verify',
+        `${target.owner}/${target.repo}:bootstrap`,
+        'reader cannot resolve bootstrap approver team membership',
+      );
+    }
     const allowedLogins = new Set<string>();
     for (const teamSlug of config.bootstrapApprovers) {
-      // If the reader doesn't implement resolveTeamMembers, fall back to
-      // treating the slug as a literal login (legacy behavior).
-      if (deps.reader.resolveTeamMembers) {
-        try {
-          const members = await deps.reader.resolveTeamMembers(target.owner, teamSlug);
-          for (const m of members) allowedLogins.add(m);
-        } catch {
-          // Team doesn't exist or no access — skip
-        }
-      } else {
-        allowedLogins.add(teamSlug);
-      }
+      const members = await deps.reader.resolveTeamMembers(target.owner, teamSlug);
+      for (const m of members) allowedLogins.add(m);
     }
     const validFromAllowed = validApprovals.filter((a) => allowedLogins.has(a.user));
     if (validFromAllowed.length === 0) {
@@ -897,8 +912,8 @@ export async function finalizeProtection(
         `no check run for '${ctx}' on head ${finalHead.slice(0, 8)}`,
       );
     }
-    const onFinalHead = matching.find((cr) => cr.headSha === finalHead);
-    if (!onFinalHead) {
+    const onFinalHead = matching.filter((cr) => cr.headSha === finalHead);
+    if (onFinalHead.length === 0) {
       return blocked(
         'ruleset',
         'check.verify',
@@ -906,20 +921,21 @@ export async function finalizeProtection(
         `'${ctx}' ran but not on final head (have: ${matching.map((m) => m.headSha.slice(0, 8)).join(', ')})`,
       );
     }
-    if (onFinalHead.conclusion !== 'success') {
+    const successful = onFinalHead.filter((cr) => cr.conclusion === 'success');
+    if (successful.length === 0) {
       return blocked(
         'ruleset',
         'check.verify',
         `${target.owner}/${target.repo}:${ctx}`,
-        `'${ctx}' conclusion='${onFinalHead.conclusion}' on final head, expected 'success'`,
+        `'${ctx}' conclusion='${onFinalHead[0]?.conclusion ?? 'unknown'}' on final head, expected 'success'`,
       );
     }
-    if (onFinalHead.appId !== GITHUB_ACTIONS_APP_ID) {
+    if (!successful.some((cr) => cr.appId === GITHUB_ACTIONS_APP_ID)) {
       return blocked(
         'ruleset',
         'check.verify',
         `${target.owner}/${target.repo}:${ctx}`,
-        `'${ctx}' produced by app id ${onFinalHead.appId}, expected GitHub Actions (${GITHUB_ACTIONS_APP_ID})`,
+        `'${ctx}' was not produced by GitHub Actions (${GITHUB_ACTIONS_APP_ID})`,
       );
     }
   }
@@ -961,7 +977,7 @@ export async function finalizeProtection(
   }
   const platformRepo = parsedLock.source?.repository;
   const pinnedSha = parsedLock.source?.resolved_commit;
-  if (!platformRepo || !pinnedSha) {
+  if (!platformRepo || !pinnedSha || !/^[0-9a-f]{40}$/i.test(pinnedSha)) {
     return blocked(
       'org-workflows',
       'ruleset.org-workflow.verify',
@@ -980,9 +996,28 @@ export async function finalizeProtection(
     );
   }
 
+  const platformRepoRef = parseRepoRef(platformRepo);
+  const platformObserved = await deps.reader.observe({
+    ...observeInput,
+    target: {
+      owner: platformRepoRef.owner,
+      repo: platformRepoRef.repo,
+      visibility: 'private',
+    },
+  });
+  const expectedPlatformRepoId = platformObserved.repository?.id;
+  if (!platformObserved.repositoryExists || expectedPlatformRepoId === undefined) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      platformRepo,
+      'platform repository from template.lock is not readable',
+    );
+  }
+
   // Verify target — must match current repo/main.
   // ALWAYS validate, regardless of enforcement mode (evaluate or active).
-  if (orgSource.targetRepoId !== undefined && orgSource.targetRepoId !== repository.id) {
+  if (orgSource.targetRepoId !== repository.id) {
     return blocked(
       'org-workflows',
       'ruleset.org-workflow.verify',
@@ -990,7 +1025,7 @@ export async function finalizeProtection(
       `org ruleset targets repo id ${orgSource.targetRepoId}, expected ${repository.id}`,
     );
   }
-  if (orgSource.targetRefPattern && orgSource.targetRefPattern !== 'refs/heads/main') {
+  if (orgSource.targetRefPattern !== 'refs/heads/main') {
     return blocked(
       'org-workflows',
       'ruleset.org-workflow.verify',
@@ -1006,9 +1041,25 @@ export async function finalizeProtection(
     '.github/workflows/ci-gate.yml',
     '.github/workflows/pr-hygiene.yml',
   ]);
+  if (orgSource.workflows.length !== expectedPaths.size) {
+    return blocked(
+      'org-workflows',
+      'ruleset.org-workflow.verify',
+      `${target.owner}/${target.repo}:org-workflows`,
+      `org ruleset has ${orgSource.workflows.length} workflows, expected ${expectedPaths.size}`,
+    );
+  }
   const foundPaths = new Set<string>();
   for (const wf of orgSource.workflows) {
     foundPaths.add(wf.path);
+    if (wf.repositoryId !== expectedPlatformRepoId) {
+      return blocked(
+        'org-workflows',
+        'ruleset.org-workflow.verify',
+        `${target.owner}/${target.repo}:org-workflows`,
+        `org ruleset workflow '${wf.path}' uses repository id ${wf.repositoryId}, expected ${expectedPlatformRepoId}`,
+      );
+    }
     if (wf.sha.toLowerCase() !== pinnedSha.toLowerCase()) {
       return blocked(
         'org-workflows',
@@ -1029,9 +1080,33 @@ export async function finalizeProtection(
       );
     }
   }
-  // Note: platform repo id vs name reconciliation would require an extra
-  // read; for M2 we trust that the name→id mapping was validated at init
-  // time and verify only the SHA pin here.
+
+  // Bind successful check runs to the exact required workflow source. App id
+  // and check name alone are forgeable by another Actions workflow.
+  const contextPaths = new Map<string, string>([
+    ['CI Gate', '.github/workflows/ci-gate.yml'],
+    ['PR hygiene', '.github/workflows/pr-hygiene.yml'],
+  ]);
+  for (const [context, expectedPath] of contextPaths) {
+    const trusted = checkRuns.find(
+      (run) =>
+        run.context === context &&
+        run.headSha === finalHead &&
+        run.conclusion === 'success' &&
+        run.appId === GITHUB_ACTIONS_APP_ID &&
+        run.workflowRepository.toLowerCase() === platformRepo.toLowerCase() &&
+        run.workflowPath === expectedPath &&
+        run.workflowSha.toLowerCase() === pinnedSha.toLowerCase(),
+    );
+    if (!trusted) {
+      return blocked(
+        'ruleset',
+        'check.verify',
+        `${target.owner}/${target.repo}:${context}`,
+        `'${context}' is not bound to ${platformRepo}/${expectedPath}@${pinnedSha.slice(0, 8)}`,
+      );
+    }
+  }
 
   // Handle enforcement mode.
   if (observed.orgWorkflowRulesetEnforcement !== 'evaluate') {
@@ -1075,15 +1150,27 @@ export async function finalizeProtection(
   // been possible without required checks already in place, so the
   // common case is main === merge_commit).
   if (mainSha !== mergeCommit) {
-    // main has advanced beyond the merge commit. This is only acceptable
-    // if the advancement was done through the protected path (i.e., with
-    // required checks already active). For M2 we treat this as drift.
-    return blocked(
-      'bootstrap-pull',
-      'merge.verify',
-      `${target.owner}/${target.repo}:main`,
-      `main=${mainSha.slice(0, 8)} has advanced past merge commit=${mergeCommit.slice(0, 8)} — unexpected drift`,
+    if (!deps.reader.isCommitReachable) {
+      return blocked(
+        'bootstrap-pull',
+        'merge.verify',
+        `${target.owner}/${target.repo}:main`,
+        'reader cannot verify merge commit reachability',
+      );
+    }
+    const reachable = await deps.reader.isCommitReachable(
+      { owner: target.owner, repo: target.repo },
+      mergeCommit,
+      mainSha,
     );
+    if (!reachable) {
+      return blocked(
+        'bootstrap-pull',
+        'merge.verify',
+        `${target.owner}/${target.repo}:main`,
+        `merge commit ${mergeCommit.slice(0, 8)} is not reachable from main ${mainSha.slice(0, 8)}`,
+      );
+    }
   }
 
   operations.push({
@@ -1092,7 +1179,7 @@ export async function finalizeProtection(
     kind: 'merge.verify',
     disposition: 'noop',
     target: `${target.owner}/${target.repo}:main`,
-    result: `main == merge commit ${mergeCommit.slice(0, 8)}`,
+    result: `merge commit ${mergeCommit.slice(0, 8)} is reachable from main ${mainSha.slice(0, 8)}`,
   });
 
   // ---- All evidence gathered. Now mutate. ----------------------------------
@@ -1218,6 +1305,18 @@ function buildTeamAssignments(
     assignments.push({ team, permission });
   }
   return assignments.sort((a, b) => a.team.localeCompare(b.team));
+}
+
+function buildRequiredTeams(input: ProductInitInput): string[] {
+  const teams = new Set<string>([
+    ...Object.values(input.config.owners).filter(Boolean),
+    ...input.config.bootstrap.approvers,
+    ...Object.keys(input.config.team_permissions ?? {}),
+  ]);
+  for (const environment of Object.values(input.config.environments ?? {})) {
+    for (const reviewer of environment.reviewers) teams.add(reviewer);
+  }
+  return [...teams].sort();
 }
 
 function buildDesiredEnvironments(

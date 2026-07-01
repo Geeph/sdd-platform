@@ -65,8 +65,7 @@ export default class ProductInit extends Command {
         'Platform repo release tag or full commit SHA (optional in dry-run; required for real execution)',
     }),
     config: Flags.string({
-      description:
-        'Path to product-init.yaml (required for init; optional for --finalize-protection)',
+      description: 'Path to product-init.yaml (required)',
     }),
     format: Flags.string({
       description: 'Output format',
@@ -102,10 +101,10 @@ export default class ProductInit extends Command {
       this.error('GITHUB_TOKEN environment variable is required', { exit: 2 });
     }
 
-    // --finalize-protection doesn't need --config (it recovers pin from template.lock)
-    // but if provided, we use it for bootstrap.approvers. All other paths require --config.
-    if (!flags['finalize-protection'] && !flags.config) {
-      this.error('--config is required for init (optional for --finalize-protection)', { exit: 2 });
+    // Finalize recovers the platform pin from template.lock, but it still
+    // needs the original bootstrap approver team policy as trusted input.
+    if (!flags.config) {
+      this.error('--config is required', { exit: 2 });
     }
 
     // Detect whether user passed --platform-repo explicitly.
@@ -138,36 +137,24 @@ export default class ProductInit extends Command {
     }
 
     // Load + validate the product-init.yaml config.
-    // For --finalize-protection, --config is optional; if not provided, use
-    // a minimal config with empty bootstrap.approvers.
-    let config: ProductInitConfig;
-    if (flags.config) {
-      let rawConfig: unknown;
-      try {
-        const configPath = resolve(flags.config);
-        const content = await readFile(configPath, 'utf8');
-        rawConfig = parseYaml(content);
-      } catch (err) {
-        this.error(`Failed to read --config: ${(err as Error).message}`, { exit: 2 });
-      }
-      const configResult = await validateProductInitDocument(rawConfig);
-      if (!configResult.ok) {
-        for (const e of configResult.errors) {
-          this.error(`${flags.config}${e.path}: ${e.message} (${e.keyword})`, {
-            exit: false,
-          });
-        }
-        this.exit(2);
-      }
-      config = validateProductInitConfig(rawConfig as ProductInitConfig);
-    } else {
-      // --finalize-protection without --config: use minimal config.
-      config = {
-        schema_version: 1,
-        bootstrap: { approvers: [] },
-        owners: { product: '', api: '', design: '', admins: '' },
-      };
+    let rawConfig: unknown;
+    try {
+      const configPath = resolve(flags.config);
+      const content = await readFile(configPath, 'utf8');
+      rawConfig = parseYaml(content);
+    } catch (err) {
+      this.error(`Failed to read --config: ${(err as Error).message}`, { exit: 2 });
     }
+    const configResult = await validateProductInitDocument(rawConfig);
+    if (!configResult.ok) {
+      for (const e of configResult.errors) {
+        this.error(`${flags.config}${e.path}: ${e.message} (${e.keyword})`, {
+          exit: false,
+        });
+      }
+      this.exit(2);
+    }
+    const config = validateProductInitConfig(rawConfig as ProductInitConfig);
 
     // Visibility: CLI flag not exposed in M2a, fall back to config or default.
     const visibility = config.repository?.visibility ?? 'private';

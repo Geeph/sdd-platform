@@ -76,8 +76,26 @@ function happyObserved(overrides: Partial<ObservedState> = {}): ObservedState {
       approvals: [{ user: 'reviewer-1', headSha: FINAL_HEAD }],
     },
     bootstrapCheckRuns: [
-      { context: 'CI Gate', conclusion: 'success', headSha: FINAL_HEAD, appId: 15368 },
-      { context: 'PR hygiene', conclusion: 'success', headSha: FINAL_HEAD, appId: 15368 },
+      {
+        context: 'CI Gate',
+        conclusion: 'success',
+        headSha: FINAL_HEAD,
+        appId: 15368,
+        checkSuiteId: 1,
+        workflowRepository: 'acme/sdd-platform',
+        workflowPath: '.github/workflows/ci-gate.yml',
+        workflowSha: PINNED_SHA,
+      },
+      {
+        context: 'PR hygiene',
+        conclusion: 'success',
+        headSha: FINAL_HEAD,
+        appId: 15368,
+        checkSuiteId: 2,
+        workflowRepository: 'acme/sdd-platform',
+        workflowPath: '.github/workflows/pr-hygiene.yml',
+        workflowSha: PINNED_SHA,
+      },
     ],
     ...overrides,
   };
@@ -91,8 +109,20 @@ function createFakeReader(observed: ObservedState): GitHubReadPort {
     async readTemplateTree() {
       throw new Error('not used by finalize');
     },
-    async observe() {
+    async observe(input) {
+      if (input.target.repo === 'sdd-platform') {
+        return {
+          ...observed,
+          repository: { ...observed.repository!, id: PLATFORM_REPO_ID },
+        };
+      }
       return observed;
+    },
+    async resolveTeamMembers(_org, teamSlug) {
+      return teamSlug === 'reviewer-1' ? ['reviewer-1'] : [];
+    },
+    async isCommitReachable() {
+      return true;
     },
   };
 }
@@ -316,6 +346,20 @@ describe('finalizeProtection', () => {
     expect(calls.length).toBe(0);
   });
 
+  it('blocked: same-name Actions check came from an untrusted workflow repository', async () => {
+    const baseline = happyObserved();
+    const checks = (baseline.bootstrapCheckRuns ?? []).map((check) =>
+      check.context === 'CI Gate'
+        ? { ...check, workflowRepository: 'acme/untrusted-workflows' }
+        : check,
+    );
+    const reader = createFakeReader(happyObserved({ bootstrapCheckRuns: checks }));
+    const { writer, calls } = createFakeWriter({});
+    const result = await finalizeProtection(target, { reader, writer });
+    expect(result.nextAction).toBe('blocked');
+    expect(calls).toHaveLength(0);
+  });
+
   it('blocked: template.lock missing', async () => {
     const observed = happyObserved();
     if (observed.repository) observed.repository.templateLock = undefined;
@@ -400,6 +444,24 @@ describe('finalizeProtection', () => {
     expect(calls.length).toBe(0);
   });
 
+  it('blocked: org ruleset omits its target repository evidence', async () => {
+    const source = happyObserved().orgWorkflowRulesetSource;
+    const reader = createFakeReader(
+      happyObserved({
+        orgWorkflowRulesetSource: source
+          ? {
+              workflows: source.workflows,
+              targetRefPattern: 'refs/heads/main',
+            }
+          : undefined,
+      }),
+    );
+    const { writer, calls } = createFakeWriter({});
+    const result = await finalizeProtection(target, { reader, writer });
+    expect(result.nextAction).toBe('blocked');
+    expect(calls).toHaveLength(0);
+  });
+
   it('blocked: merge commit != current main (drift)', async () => {
     const reader = createFakeReader(
       happyObserved({
@@ -413,6 +475,7 @@ describe('finalizeProtection', () => {
         },
       }),
     );
+    reader.isCommitReachable = async () => false;
     const { writer, calls } = createFakeWriter({});
     const result = await finalizeProtection(target, { reader, writer });
     expect(result.nextAction).toBe('blocked');

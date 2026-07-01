@@ -193,6 +193,12 @@ export interface ObservedState {
     headSha: string;
     /** App id that produced the check run (GitHub Actions = 15368). */
     appId: number;
+    /** Check suite used to correlate this job with an Actions workflow run. */
+    checkSuiteId: number;
+    /** Trusted workflow identity recovered from the correlated run. */
+    workflowRepository: string;
+    workflowPath: string;
+    workflowSha: string;
   }>;
 }
 
@@ -210,6 +216,8 @@ export interface GitHubReadPort {
    * Returns an empty array if the team doesn't exist or has no members.
    */
   resolveTeamMembers?(org: string, teamSlug: string): Promise<string[]>;
+  /** True when ancestor is equal to or reachable from descendant. */
+  isCommitReachable?(repo: RepoRef, ancestor: string, descendant: string): Promise<boolean>;
 }
 
 // ---- GitHub write port (real execution only) -----------------------------
@@ -275,6 +283,8 @@ export interface LabelsInput {
 export interface TeamsInput {
   repository: RepositoryIdentity;
   assignments: ReadonlyArray<{ team: string; permission: string }>;
+  /** Referenced teams that must exist with active members even without an assignment. */
+  requiredTeams?: ReadonlyArray<string>;
 }
 
 export interface EnvironmentsInput {

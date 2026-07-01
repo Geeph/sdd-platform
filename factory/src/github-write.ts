@@ -826,6 +826,20 @@ export async function grantTeamPermissions(
     teamBySlug.set(team.slug, team);
   }
 
+  for (const requiredTeam of input.requiredTeams ?? []) {
+    const team = teamBySlug.get(requiredTeam);
+    if (!team) {
+      throw new Error(
+        `grantTeamPermissions: referenced team '${requiredTeam}' does not exist in org '${owner}'`,
+      );
+    }
+    if (team.members_count < 1) {
+      throw new Error(
+        `grantTeamPermissions: referenced team '${requiredTeam}' has 0 active members`,
+      );
+    }
+  }
+
   for (const assignment of input.assignments) {
     const team = teamBySlug.get(assignment.team);
 
@@ -878,6 +892,14 @@ interface EnvironmentResponse {
   name: string;
 }
 
+interface EnvironmentDetail extends EnvironmentResponse {
+  protection_rules?: Array<{
+    type: string;
+    prevent_self_review?: boolean;
+    reviewers?: Array<{ type: string; reviewer: { id: number } }>;
+  }>;
+}
+
 /**
  * Reconcile environments on a repository: create missing, noop already
  * existing. M2 does not configure secrets (→ M7). Reviewer configuration is
@@ -907,63 +929,59 @@ export async function reconcileEnvironments(
   const existingNames = new Set(envResp.environments.map((e) => e.name.toLowerCase()));
 
   for (const desired of input.desired) {
-    if (existingNames.has(desired.name.toLowerCase())) {
-      // Environment exists. For M2, we don't update existing environments
-      // to avoid overwriting manual configuration. In a production system,
-      // we'd compare and update only if different.
-      result.noop.push(desired.name);
-    } else {
-      // Create environment with reviewers and prevent_self_review.
-      // Resolve team slugs to team IDs for the reviewers array.
-      const reviewerIds: Array<{ type: 'Team'; id: number }> = [];
-      for (const teamSlug of desired.reviewers) {
-        try {
-          const teamResp = (await withRetry(
-            () =>
-              octokit.request('GET /orgs/{org}/teams/{team_slug}', {
-                org: owner,
-                team_slug: teamSlug,
-              }),
-            `reconcileEnvironments:resolve-team:${teamSlug}`,
-          )) as { id: number };
-          reviewerIds.push({ type: 'Team', id: teamResp.id });
-        } catch (_err) {
-          // Team doesn't exist or no access — skip this reviewer
-          // In production, we might want to fail fast instead.
-        }
-      }
-
-      await withRetry(
+    const reviewerIds: Array<{ type: 'Team'; id: number }> = [];
+    for (const teamSlug of desired.reviewers) {
+      const teamResp = (await withRetry(
         () =>
-          octokit.request('PUT /repos/{owner}/{repo}/environments/{environment_name}', {
-            owner,
-            repo,
-            environment_name: desired.name,
-            reviewers: reviewerIds,
-            prevent_self_review: desired.preventSelfReview,
+          octokit.request('GET /orgs/{org}/teams/{team_slug}', {
+            org: owner,
+            team_slug: teamSlug,
           }),
-        `reconcileEnvironments:create:${desired.name}`,
-      );
-      result.created.push(desired.name);
+        `reconcileEnvironments:resolve-team:${teamSlug}`,
+      )) as { id?: number };
+      if (!teamResp.id) {
+        throw new Error(`reconcileEnvironments: reviewer team '${teamSlug}' has no id`);
+      }
+      reviewerIds.push({ type: 'Team', id: teamResp.id });
     }
-  }
 
-  // Read-back verification.
-  const afterResp = (await withRetry(
-    () =>
-      octokit.request('GET /repos/{owner}/{repo}/environments', {
-        owner,
-        repo,
-        per_page: 100,
-      }),
-    'reconcileEnvironments:readback',
-  )) as { environments: EnvironmentResponse[] };
-  const afterNames = new Set(afterResp.environments.map((e) => e.name.toLowerCase()));
-  for (const desired of input.desired) {
-    if (!afterNames.has(desired.name.toLowerCase())) {
-      throw new Error(
-        `reconcileEnvironments: read-back failed — environment '${desired.name}' not found`,
-      );
+    await withRetry(
+      () =>
+        octokit.request('PUT /repos/{owner}/{repo}/environments/{environment_name}', {
+          owner,
+          repo,
+          environment_name: desired.name,
+          reviewers: reviewerIds,
+          prevent_self_review: desired.preventSelfReview,
+        }),
+      `reconcileEnvironments:upsert:${desired.name}`,
+    );
+    if (existingNames.has(desired.name.toLowerCase())) result.updated.push(desired.name);
+    else result.created.push(desired.name);
+
+    const after = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/environments/{environment_name}', {
+          owner,
+          repo,
+          environment_name: desired.name,
+        }),
+      `reconcileEnvironments:readback:${desired.name}`,
+    )) as EnvironmentDetail;
+    const reviewerRule = (after.protection_rules ?? []).find(
+      (rule) => rule.type === 'required_reviewers',
+    );
+    const actualIds = (reviewerRule?.reviewers ?? [])
+      .filter((reviewer) => reviewer.type === 'Team')
+      .map((reviewer) => reviewer.reviewer.id)
+      .sort((a, b) => a - b);
+    const expectedIds = reviewerIds.map((reviewer) => reviewer.id).sort((a, b) => a - b);
+    if (
+      after.name.toLowerCase() !== desired.name.toLowerCase() ||
+      canonicalJson(actualIds) !== canonicalJson(expectedIds) ||
+      (reviewerRule?.prevent_self_review ?? false) !== desired.preventSelfReview
+    ) {
+      throw new Error(`reconcileEnvironments: read-back mismatch for '${desired.name}'`);
     }
   }
 
@@ -979,6 +997,7 @@ interface RulesetResponse {
   target?: string;
   conditions?: Record<string, unknown>;
   rules?: Array<Record<string, unknown>>;
+  bypass_actors?: Array<Record<string, unknown>>;
 }
 
 /**
@@ -1011,7 +1030,18 @@ export async function reconcileRepositoryRuleset(
     'reconcileRepositoryRuleset:list',
   );
 
-  const found = existing.find((r) => r.name === rulesetName);
+  const foundSummary = existing.find((r) => r.name === rulesetName);
+  const found = foundSummary
+    ? ((await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+            owner,
+            repo,
+            ruleset_id: foundSummary.id,
+          }),
+        'reconcileRepositoryRuleset:readExisting',
+      )) as RulesetResponse)
+    : undefined;
 
   // Common base rules (§3.2 table, both stages): no push / no force push /
   // no deletion; requires PR + ≥1 human approval; requires CODEOWNER
@@ -1056,6 +1086,7 @@ export async function reconcileRepositoryRuleset(
     },
   };
 
+  let readbackId: number;
   if (!found) {
     // Create the ruleset.
     const resp = (await withRetry(
@@ -1076,8 +1107,10 @@ export async function reconcileRepositoryRuleset(
     if (!resp.id) {
       throw new Error('reconcileRepositoryRuleset: create returned no id');
     }
+    readbackId = resp.id;
     result.created.push(rulesetName);
   } else {
+    readbackId = found.id;
     // Check if update is needed. For the initial ruleset, we compare rules.
     // If already correct → noop. Otherwise → update.
     const needsUpdate = checkRulesetNeedsUpdate(found, desiredRules, desiredConditions);
@@ -1104,29 +1137,7 @@ export async function reconcileRepositoryRuleset(
     }
   }
 
-  // Read-back verification.
-  // After create, `found` is undefined, so we need to re-query by name to get
-  // the actual ruleset ID (GitHub API doesn't support 'latest' as an ID).
-  let readbackId = found?.id;
-  if (!readbackId && result.created.length > 0) {
-    const allRulesets = await paginateAll<RulesetResponse>(
-      octokit,
-      'GET /repos/{owner}/{repo}/rulesets',
-      { owner, repo, per_page: 100 },
-      'reconcileRepositoryRuleset:readback-list',
-    );
-    const created = allRulesets.find((r) => r.name === rulesetName);
-    if (!created?.id) {
-      throw new Error(
-        `reconcileRepositoryRuleset: created ruleset '${rulesetName}' but could not find it for read-back`,
-      );
-    }
-    readbackId = created.id;
-  }
-  if (!readbackId) {
-    throw new Error('reconcileRepositoryRuleset: no ruleset ID available for read-back');
-  }
-
+  // Read-back verification against the complete desired state.
   const after = (await withRetry(
     () =>
       octokit.request('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
@@ -1137,10 +1148,11 @@ export async function reconcileRepositoryRuleset(
     'reconcileRepositoryRuleset:readback',
   )) as RulesetResponse;
 
-  if (after.name !== rulesetName) {
-    throw new Error(
-      `reconcileRepositoryRuleset: read-back mismatch — expected '${rulesetName}', got '${after.name}'`,
-    );
+  if (
+    after.name !== rulesetName ||
+    checkRulesetNeedsUpdate(after, desiredRules, desiredConditions)
+  ) {
+    throw new Error('reconcileRepositoryRuleset: read-back does not match desired state');
   }
 
   return result;
@@ -1149,10 +1161,13 @@ export async function reconcileRepositoryRuleset(
 function checkRulesetNeedsUpdate(
   existing: RulesetResponse,
   desiredRules: Array<Record<string, unknown>>,
-  _desiredConditions: Record<string, unknown>,
+  desiredConditions: Record<string, unknown>,
 ): boolean {
   // Compare enforcement mode.
   if (existing.enforcement !== 'active') return true;
+  if (existing.target !== 'branch') return true;
+  if ((existing.bypass_actors?.length ?? 0) !== 0) return true;
+  if (canonicalJson(existing.conditions ?? {}) !== canonicalJson(desiredConditions)) return true;
 
   // Compare rule count.
   if (!existing.rules || existing.rules.length !== desiredRules.length) return true;
@@ -1201,12 +1216,24 @@ function checkRulesetNeedsUpdate(
   return false;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 // ---- reconcileOrgWorkflowRuleset (§3.2: sdd-workflows-<id>) ----------------
 
 interface OrgRulesetResponse {
   id: number;
   name: string;
   enforcement: string;
+  target?: string;
   conditions?: Record<string, unknown>;
   rules?: Array<Record<string, unknown>>;
 }
@@ -1241,7 +1268,17 @@ export async function reconcileOrgWorkflowRuleset(
     'reconcileOrgWorkflowRuleset:list',
   );
 
-  const found = existing.find((r) => r.name === rulesetName);
+  const foundSummary = existing.find((r) => r.name === rulesetName);
+  const found = foundSummary
+    ? ((await withRetry(
+        () =>
+          octokit.request('GET /orgs/{org}/rulesets/{ruleset_id}', {
+            org: owner,
+            ruleset_id: foundSummary.id,
+          }),
+        'reconcileOrgWorkflowRuleset:readExisting',
+      )) as OrgRulesetResponse)
+    : undefined;
 
   // GitHub REST API (organization ruleset): `conditions` is an object whose
   // keys name each condition. The repository condition uses the key
@@ -1282,6 +1319,7 @@ export async function reconcileOrgWorkflowRuleset(
     },
   ];
 
+  let rulesetId: number;
   if (!found) {
     // Create org ruleset.
     const resp = (await withRetry(
@@ -1301,8 +1339,10 @@ export async function reconcileOrgWorkflowRuleset(
     if (!resp.id) {
       throw new Error('reconcileOrgWorkflowRuleset: create returned no id');
     }
+    rulesetId = resp.id;
     result.created.push(rulesetName);
   } else {
+    rulesetId = found.id;
     // Check if the existing ruleset matches our target/source.
     // If name matches but target/source differs → conflict (D10/§3.6).
     const hasConflict = checkOrgRulesetConflict(
@@ -1340,6 +1380,23 @@ export async function reconcileOrgWorkflowRuleset(
     }
   }
 
+  const after = (await withRetry(
+    () =>
+      octokit.request('GET /orgs/{org}/rulesets/{ruleset_id}', {
+        org: owner,
+        ruleset_id: rulesetId,
+      }),
+    'reconcileOrgWorkflowRuleset:readback',
+  )) as OrgRulesetResponse;
+  if (
+    after.name !== rulesetName ||
+    after.target !== 'branch' ||
+    after.enforcement !== input.enforcement ||
+    checkOrgRulesetConflict(after, repoId, input.platformRepoId, input.pinnedSha)
+  ) {
+    throw new Error('reconcileOrgWorkflowRuleset: read-back does not match desired state');
+  }
+
   return result;
 }
 
@@ -1353,26 +1410,39 @@ function checkOrgRulesetConflict(
   const conditions = existing.conditions ?? {};
   const repositoryIdCond = conditions.repository_id as { repository_ids?: number[] } | undefined;
   const repositoryIds = repositoryIdCond?.repository_ids ?? [];
-  if (!repositoryIds.includes(targetRepoId)) return true;
+  if (repositoryIds.length !== 1 || repositoryIds[0] !== targetRepoId) return true;
+  const refName = conditions.ref_name as { include?: string[]; exclude?: string[] } | undefined;
+  if (
+    refName?.include?.length !== 1 ||
+    refName.include[0] !== 'refs/heads/main' ||
+    (refName.exclude?.length ?? 0) !== 0
+  ) {
+    return true;
+  }
 
   // Check rules for workflow source match. Required workflows carry the
   // pinned commit in `sha` (not `ref`).
-  const rules = existing.rules ?? [];
-  for (const rule of rules) {
-    if (rule.type === 'workflows') {
-      const params = rule.parameters as {
-        workflows?: Array<{ repository_id: number; path: string; sha: string }>;
-      };
-      if (params.workflows) {
-        for (const wf of params.workflows) {
-          if (wf.repository_id !== platformRepoId || wf.sha !== pinnedSha) {
-            return true;
-          }
-        }
-      }
+  const workflowRules = (existing.rules ?? []).filter((rule) => rule.type === 'workflows');
+  if (workflowRules.length !== 1) return true;
+  const params = workflowRules[0]?.parameters as {
+    workflows?: Array<{ repository_id: number; path: string; sha: string }>;
+  };
+  const workflows = params.workflows ?? [];
+  const expectedPaths = new Set([
+    '.github/workflows/ci-gate.yml',
+    '.github/workflows/pr-hygiene.yml',
+  ]);
+  if (workflows.length !== expectedPaths.size) return true;
+  for (const wf of workflows) {
+    if (
+      !expectedPaths.delete(wf.path) ||
+      wf.repository_id !== platformRepoId ||
+      wf.sha.toLowerCase() !== pinnedSha.toLowerCase()
+    ) {
+      return true;
     }
   }
-  return false;
+  return expectedPaths.size !== 0;
 }
 
 // ---- upsertBootstrapPull (§3.3: Bootstrap PR with CODEOWNERS) --------------
@@ -1422,6 +1492,7 @@ export async function upsertBootstrapPull(
   if (existingPrs.length > 0) {
     // PR already exists — noop.
     const pr = existingPrs[0]!;
+    await requestBootstrapTeamReviewers(octokit, owner, repo, pr.number, input.reviewers);
     return {
       number: pr.number,
       headSha: pr.head.sha,
@@ -1549,11 +1620,33 @@ export async function upsertBootstrapPull(
     'upsertBootstrapPull:createPR',
   )) as PullResponse;
 
+  await requestBootstrapTeamReviewers(octokit, owner, repo, prResp.number, input.reviewers);
+
   return {
     number: prResp.number,
     headSha: prResp.head.sha,
     htmlUrl: prResp.html_url,
   };
+}
+
+async function requestBootstrapTeamReviewers(
+  octokit: OctokitMutate,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  teamReviewers: string[],
+): Promise<void> {
+  if (teamReviewers.length === 0) return;
+  await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers', {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        team_reviewers: [...new Set(teamReviewers)].sort(),
+      }),
+    'upsertBootstrapPull:requestTeamReviewers',
+  );
 }
 
 /**

@@ -218,24 +218,27 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
         })) as { message?: string; tree: { sha: string }; parents?: Array<{ sha: string }> };
         mainTreeSha = commit.tree.sha;
         mainParentShas = (commit.parents ?? []).map((parent) => parent.sha);
-        // M2b owns exactly seed + snapshot. Recover the seed only when main
-        // is the root seed or its direct child; deeper/branched history is not
-        // silently adopted and does not require walking the full repo history.
-        if (mainParentShas.length === 0) {
-          seedCommitSha = mainSha;
-          seedOperationId = extractSeedOperationId(commit.message);
-        } else if (mainParentShas.length === 1) {
-          const parentSha = mainParentShas[0];
-          if (parentSha) {
-            const parentCommit = (await safeRequest(
-              'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
-              { owner, repo, commit_sha: parentSha },
-            )) as { message?: string; parents?: Array<{ sha: string }> };
-            if ((parentCommit.parents ?? []).length === 0) {
-              seedCommitSha = parentSha;
-              seedOperationId = extractSeedOperationId(parentCommit.message);
-            }
+        // Follow first-parent history to the root seed. This remains stable
+        // after the Bootstrap PR merge (merge/squash/rebase) while avoiding
+        // adoption of a second-parent branch. Bound the walk to fail closed
+        // on unexpectedly deep or cyclic history.
+        let cursorSha = mainSha;
+        let cursorCommit = commit;
+        for (let hops = 0; hops < 64; hops++) {
+          const parents = cursorCommit.parents ?? [];
+          if (parents.length === 0) {
+            seedCommitSha = cursorSha;
+            seedOperationId = extractSeedOperationId(cursorCommit.message);
+            break;
           }
+          const firstParent = parents[0]?.sha;
+          if (!firstParent || firstParent === cursorSha) break;
+          cursorSha = firstParent;
+          cursorCommit = (await safeRequest('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+            owner,
+            repo,
+            commit_sha: cursorSha,
+          })) as { message?: string; tree: { sha: string }; parents?: Array<{ sha: string }> };
         }
         try {
           const lockResponse = (await safeRequest('GET /repos/{owner}/{repo}/contents/{path}', {
@@ -349,14 +352,24 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
           orgWorkflowRulesetExists = true;
           orgWorkflowRulesetEnforcement = found.enforcement as 'evaluate' | 'active';
 
+          // List responses are not a sufficient security contract. Read the
+          // exact ruleset so conditions and workflow parameters are complete.
+          const detail = found.id
+            ? ((await safeRequest('GET /orgs/{org}/rulesets/{ruleset_id}', {
+                org: owner,
+                ruleset_id: found.id,
+              })) as typeof found)
+            : found;
+          orgWorkflowRulesetEnforcement = detail.enforcement as 'evaluate' | 'active';
+
           // Recover source identity from the `workflows` rule parameters.
-          const conditions = found.conditions ?? {};
+          const conditions = detail.conditions ?? {};
           const repoIdCond = conditions.repository_id as { repository_ids?: number[] } | undefined;
           const targetRepoIds = repoIdCond?.repository_ids ?? [];
           const refName = conditions.ref_name as { include?: string[] } | undefined;
           const targetRefPattern = refName?.include?.[0];
 
-          const workflowsRule = (found.rules ?? []).find((r) => r.type === 'workflows');
+          const workflowsRule = (detail.rules ?? []).find((r) => r.type === 'workflows');
           if (workflowsRule) {
             const params = workflowsRule.parameters as {
               workflows?: Array<{ repository_id: number; path: string; sha: string }>;
@@ -454,6 +467,23 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       let bootstrapCheckRuns: ObservedState['bootstrapCheckRuns'] | undefined;
       if (bootstrapPullRequest) {
         try {
+          const workflowRunsResp = (await safeRequest('GET /repos/{owner}/{repo}/actions/runs', {
+            owner,
+            repo,
+            head_sha: bootstrapPullRequest.headSha,
+            event: 'pull_request',
+            per_page: 100,
+          })) as {
+            workflow_runs?: Array<{
+              check_suite_id: number;
+              head_sha: string;
+              path: string;
+              workflow_url: string;
+            }>;
+          };
+          const workflowBySuite = new Map(
+            (workflowRunsResp.workflow_runs ?? []).map((run) => [run.check_suite_id, run]),
+          );
           const checkRunsResp = (await safeRequest(
             'GET /repos/{owner}/{repo}/commits/{ref}/check-runs',
             {
@@ -469,16 +499,25 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
               conclusion: string | null;
               head_sha: string;
               app: { id: number };
+              check_suite: { id: number };
             }>;
           };
           bootstrapCheckRuns = checkRunsResp.check_runs
             .filter((cr) => cr.status === 'completed')
-            .map((cr) => ({
-              context: cr.name,
-              conclusion: cr.conclusion ?? 'unknown',
-              headSha: cr.head_sha,
-              appId: cr.app.id,
-            }));
+            .map((cr) => {
+              const workflow = workflowBySuite.get(cr.check_suite.id);
+              const identity = parseWorkflowRunIdentity(workflow?.workflow_url, workflow?.path);
+              return {
+                context: cr.name,
+                conclusion: cr.conclusion ?? 'unknown',
+                headSha: cr.head_sha,
+                appId: cr.app.id,
+                checkSuiteId: cr.check_suite.id,
+                workflowRepository: identity.repository,
+                workflowPath: identity.path,
+                workflowSha: identity.sha,
+              };
+            });
         } catch {
           // Check runs observation is best-effort; finalize will fail closed.
         }
@@ -546,6 +585,40 @@ export function createReadonlyGitHubPort(octokit: OctokitReadOnly): GitHubReadPo
       }
       return members;
     },
+
+    async isCommitReachable(repoRef: RepoRef, ancestor: string, descendant: string) {
+      const comparison = (await safeRequest('GET /repos/{owner}/{repo}/compare/{base}...{head}', {
+        owner: repoRef.owner,
+        repo: repoRef.repo,
+        base: ancestor,
+        head: descendant,
+      })) as { status?: string };
+      return comparison.status === 'identical' || comparison.status === 'ahead';
+    },
+  };
+}
+
+function parseWorkflowRunIdentity(
+  workflowUrl: string | undefined,
+  runPath: string | undefined,
+): { repository: string; path: string; sha: string } {
+  const urlRepository =
+    workflowUrl?.match(
+      /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/actions\/workflows\//,
+    )?.[1] ?? '';
+  if (!runPath) return { repository: urlRepository, path: '', sha: '' };
+  const separator = runPath.lastIndexOf('@');
+  const rawPath = separator >= 0 ? runPath.slice(0, separator) : runPath;
+  const ref = separator >= 0 ? runPath.slice(separator + 1) : '';
+  const marker = '/.github/workflows/';
+  const markerIndex = rawPath.indexOf(marker);
+  const pathRepository = markerIndex >= 0 ? rawPath.slice(0, markerIndex) : '';
+  const repository = /^[^/]+\/[^/]+$/.test(pathRepository) ? pathRepository : urlRepository;
+  const path = markerIndex >= 0 ? rawPath.slice(markerIndex + 1) : rawPath.replace(/^\//, '');
+  return {
+    repository,
+    path,
+    sha: /^[0-9a-f]{40}$/i.test(ref) ? ref.toLowerCase() : '',
   };
 }
 

@@ -157,7 +157,7 @@ describe('createReadonlyGitHubPort', () => {
     expect(result.commit).toBe(result.commit.toLowerCase());
   });
 
-  it('observes main, seed parent, and template.lock for crash recovery', async () => {
+  it('walks first-parent history to recover the seed after Bootstrap merge', async () => {
     const responses = new Map<string, unknown>([
       [
         'GET /repos/{owner}/{repo}',
@@ -171,21 +171,27 @@ describe('createReadonlyGitHubPort', () => {
           description: 'Demo product',
         },
       ],
-      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'snapshot-sha' } }],
+      ['GET /repos/{owner}/{repo}/git/ref/{ref}', { object: { sha: 'merge-sha' } }],
       [
         'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
         (params: { commit_sha: string }) =>
-          params.commit_sha === 'snapshot-sha'
+          params.commit_sha === 'merge-sha'
             ? {
-                message: 'snapshot',
-                tree: { sha: 'snapshot-tree' },
-                parents: [{ sha: 'seed-sha' }],
+                message: 'bootstrap merge',
+                tree: { sha: 'merge-tree' },
+                parents: [{ sha: 'snapshot-sha' }, { sha: 'bootstrap-head' }],
               }
-            : {
-                message: `sdd-init: seed template.lock [sha256:${'a'.repeat(64)}]`,
-                tree: { sha: 'seed-tree' },
-                parents: [],
-              },
+            : params.commit_sha === 'snapshot-sha'
+              ? {
+                  message: 'snapshot',
+                  tree: { sha: 'snapshot-tree' },
+                  parents: [{ sha: 'seed-sha' }],
+                }
+              : {
+                  message: `sdd-init: seed template.lock [sha256:${'a'.repeat(64)}]`,
+                  tree: { sha: 'seed-tree' },
+                  parents: [],
+                },
       ],
       [
         'GET /repos/{owner}/{repo}/contents/{path}',
@@ -208,9 +214,9 @@ describe('createReadonlyGitHubPort', () => {
     });
 
     expect(observed.repository).toMatchObject({
-      mainSha: 'snapshot-sha',
-      mainTreeSha: 'snapshot-tree',
-      mainParentShas: ['seed-sha'],
+      mainSha: 'merge-sha',
+      mainTreeSha: 'merge-tree',
+      mainParentShas: ['snapshot-sha', 'bootstrap-head'],
       seedCommitSha: 'seed-sha',
       seedOperationId: `sha256:${'a'.repeat(64)}`,
       templateLock: 'schema_version: 1\n',

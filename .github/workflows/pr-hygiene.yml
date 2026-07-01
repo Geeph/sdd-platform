@@ -32,13 +32,6 @@ on:
 # repository. This closes the pin loop: the workflow runs from exactly the
 # commit that the ruleset pinned, not from a movable branch like `main`.
 #
-# SDD_PLATFORM_REPO is still needed because actions/checkout requires an
-# explicit repository. It MUST match the source repo configured in the
-# organization ruleset; if they drift, the workflow will fail or produce
-# incorrect results.
-env:
-  SDD_PLATFORM_REPO: Geeph/sdd-platform   # MUST match org ruleset source repo
-
 permissions:
   contents: read
   pull-requests: read
@@ -48,6 +41,18 @@ jobs:
     name: PR hygiene
     runs-on: ubuntu-latest
     steps:
+      - name: resolve trusted workflow source
+        id: workflow-source
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          SOURCE_REPO="${WORKFLOW_REF%%/.github/workflows/*}"
+          if ! [[ "$SOURCE_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "Invalid GITHUB_WORKFLOW_REF: $WORKFLOW_REF" >&2
+            exit 1
+          fi
+          echo "repository=$SOURCE_REPO" >> "$GITHUB_OUTPUT"
+
       # Checkout the PLATFORM repo at the workflow's own SHA (the pinned
       # commit from the organization ruleset). This is NOT the product PR —
       # we use github.workflow_sha so fork PRs cannot redirect the checkout
@@ -56,7 +61,7 @@ jobs:
       - name: checkout platform repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.SDD_PLATFORM_REPO }}
+          repository: ${{ steps.workflow-source.outputs.repository }}
           ref: ${{ github.workflow_sha }}
           path: platform
 
