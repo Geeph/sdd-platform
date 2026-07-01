@@ -1,7 +1,7 @@
 {
   "template": "android",
   "path": "templates/android",
-  "tree_sha256": "sha256:6c3291d7d58cc183227a0dd094d3d2392e5a7642d34b1475096ba1a2a23fbbbb",
+  "tree_sha256": "sha256:d528819ce69f8315fd88c7ea4b1f09bf72cfeacc9215dbc607ed5adc469b5791",
   "files": [
     {
       "path": ".gitignore",
@@ -44,6 +44,12 @@
       "mode": "100644",
       "render": false,
       "sha256": "sha256:488d16e173c126ae633940cf5540831be7d68dc059c740e59b27142ffa0eb5be"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.jar",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
     },
     {
       "path": "gradle/wrapper/gradle-wrapper.properties",

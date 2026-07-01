@@ -38,6 +38,13 @@ const ALLOWED_DOTFILES = new Set([
   '.xcode-version',
 ]);
 
+// Binary files allowed in templates. The Gradle wrapper JAR is a fixed,
+// untemplated binary required by Gradle; the official Gradle documentation
+// says it should always be committed.
+const BINARY_ALLOWLIST = new Set([
+  'gradle/wrapper/gradle-wrapper.jar',
+]);
+
 // Parse --template <name> from argv.
 function parseArgs(argv: string[]): string {
   const idx = argv.indexOf('--template');
@@ -116,21 +123,28 @@ async function fileMode(abs: string): Promise<'100644' | '100755'> {
   return '100644';
 }
 
-function needsRender(data: Buffer): boolean {
+function needsRender(data: Buffer, rel: string): boolean {
+  // Binary files never need rendering.
+  if (BINARY_ALLOWLIST.has(rel)) return false;
   // Reset the regex state.
   TOKEN_RE.lastIndex = 0;
   // Treat binary / CRLF as rejection later; here only detect render tokens.
   return TOKEN_RE.test(data.toString('utf8'));
 }
 
-function rejectBinary(data: Buffer): void {
+function rejectBinary(data: Buffer, rel: string): void {
+  // Allow binary files explicitly listed as safe (e.g. Gradle wrapper JAR —
+  // the official Gradle documentation requires the wrapper JAR to be committed).
+  if (BINARY_ALLOWLIST.has(rel)) return;
   // Reject files that contain NUL bytes (binary).
   if (data.includes(0)) {
-    throw new Error('Manifest refuses binary file content');
+    throw new Error(`Manifest refuses binary file content: ${rel}`);
   }
 }
 
 function rejectCRLF(data: Buffer, rel: string): void {
+  // Skip binary files (already in BINARY_ALLOWLIST).
+  if (BINARY_ALLOWLIST.has(rel)) return;
   if (data.includes(0x0d)) {
     throw new Error(`Manifest refuses CRLF line endings in ${rel}`);
   }
@@ -155,14 +169,14 @@ async function buildManifest(rootAbs: string, templateName: string, templatePath
   for (const rel of rels) {
     const abs = `${rootAbs}/${rel}`;
     const data = await readFile(abs);
-    rejectBinary(data);
+    rejectBinary(data, rel);
     rejectCRLF(data, rel);
     const mode = await fileMode(abs);
     if (mode !== '100644' && mode !== '100755') {
       throw new Error(`Manifest refuses mode ${mode} on ${rel}`);
     }
     const sha = await sha256Hex(data);
-    const render = needsRender(data);
+    const render = needsRender(data, rel);
     files.push({ path: rel, mode, render, sha256: sha });
   }
 

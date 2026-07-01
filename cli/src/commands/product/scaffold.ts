@@ -28,11 +28,83 @@ import type {
   TemplateManifest,
   TemplateName,
 } from '@sdd/factory';
-import { compileScaffoldPlan, parseManifest, sha256Hex, TEMPLATE_NAMES } from '@sdd/factory';
+import {
+  compileScaffoldPlan,
+  parseManifest,
+  publishComponentBranch,
+  sha256Hex,
+  TEMPLATE_NAMES,
+  upsertScaffoldPull,
+} from '@sdd/factory';
 import type { GitReader } from '@sdd/provenance';
 import { verifyGateApproval } from '@sdd/provenance';
 import { validateProjectsDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
+import type { GitHubRequestClient } from '../../github-client.js';
+import { createGitHubRequestClient } from '../../github-client.js';
+
+/**
+ * Adapter: wrap a raw GitHubRequestClient to match provenance's OctokitLike
+ * interface. Only implements the endpoints verifyGateApproval actually uses.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function createOctokitAdapter(owner: string, repo: string): Promise<any> {
+  const client = createGitHubRequestClient(process.env.GITHUB_TOKEN as string);
+  const req = client.request.bind(client);
+  return {
+    rest: {
+      pulls: {
+        get: (params: { pull_number: number }) =>
+          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}`, {
+            owner,
+            repo,
+            pull_number: params.pull_number,
+          }) as Promise<{ data: unknown }>,
+        listReviews: (params: { pull_number: number; per_page?: number; page?: number }) =>
+          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews`, {
+            owner,
+            repo,
+            pull_number: params.pull_number,
+            per_page: params.per_page,
+            page: params.page,
+          }) as Promise<{ data: unknown }>,
+        listFiles: (params: { pull_number: number; per_page?: number; page?: number }) =>
+          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}/files`, {
+            owner,
+            repo,
+            pull_number: params.pull_number,
+            per_page: params.per_page,
+            page: params.page,
+          }) as Promise<{ data: unknown }>,
+      },
+      repos: {
+        getBranch: (params: { branch: string }) =>
+          req(`GET /repos/{owner}/{repo}/branches/{branch}`, {
+            owner,
+            repo,
+            branch: params.branch,
+          }) as Promise<{ data: unknown }>,
+      },
+      checks: {
+        listForRef: (params: { ref: string; check_name?: string }) =>
+          req(`GET /repos/{owner}/{repo}/commits/{ref}/check-runs`, {
+            owner,
+            repo,
+            ref: params.ref,
+            check_name: params.check_name,
+          }) as Promise<{ data: unknown }>,
+      },
+      teams: {
+        listMembersInOrg: (params: { org: string; team_slug: string; per_page?: number }) =>
+          req(`GET /orgs/{org}/teams/{team_slug}/members`, {
+            org: params.org,
+            team_slug: params.team_slug,
+            per_page: params.per_page,
+          }) as Promise<{ data: unknown }>,
+      },
+    },
+  };
+}
 
 const DEFAULT_PLATFORM_REPO_NAME = 'sdd-platform';
 
@@ -54,6 +126,15 @@ function createLocalScaffoldReadPort(opts: LocalScaffoldReaderOpts): ScaffoldRea
     }).trim();
   }
 
+  function gitBytes(args: string[]): Buffer {
+    return execFileSync('git', args, {
+      cwd: platformPath,
+      encoding: 'buffer',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 50 * 1024 * 1024, // 50 MB for large files
+    });
+  }
+
   return {
     async resolveCommit(_repo: RepoRef, ref: string) {
       const commit = git(['rev-parse', ref]);
@@ -65,15 +146,21 @@ function createLocalScaffoldReadPort(opts: LocalScaffoldReaderOpts): ScaffoldRea
         throw new Error(`unknown template: ${templateName}`);
       }
       const manifestPath = `templates/${templateName}.manifest.json`;
-      const raw = git(['show', `${commit}:${manifestPath}`]);
-      const manifest = parseManifest(JSON.parse(raw));
+      const rawBytes = gitBytes(['show', `${commit}:${manifestPath}`]);
+      const manifest = parseManifest(JSON.parse(rawBytes.toString('utf8')));
       const entries: Array<{ path: string; mode: '100644' | '100755'; content: Uint8Array }> = [];
       for (const mf of manifest.files) {
-        const content = git(['show', `${commit}:${manifest.path}/${mf.path}`]);
+        const content = gitBytes(['show', `${commit}:${manifest.path}/${mf.path}`]);
+        const actualSha256 = sha256Hex(content);
+        if (actualSha256 !== mf.sha256) {
+          throw new Error(
+            `checksum mismatch on ${mf.path}: manifest=${mf.sha256}, actual=${actualSha256}`,
+          );
+        }
         entries.push({
           path: mf.path,
           mode: mf.mode,
-          content: Buffer.from(content, 'utf8'),
+          content: new Uint8Array(content),
         });
       }
       return { manifest, entries, sourceTreeSha256: manifest.tree_sha256 };
@@ -128,6 +215,11 @@ interface LocalScaffoldSetup {
   reader: ScaffoldReadPort;
   platformPath: string;
   headCommit: string;
+}
+
+function getPlatformHeadCommit(): string | undefined {
+  const plat = resolvePlatformRoot();
+  return plat?.headCommit;
 }
 
 function setupLocalScaffoldReader(): LocalScaffoldSetup {
@@ -315,15 +407,42 @@ export default class ProductScaffold extends Command {
         }
       }
 
-      // Build observation with resolved templates and empty existingPaths
-      // (dry-run assumes no components exist yet — just shows the preview).
+      // Build observation: populate existingPaths from the product repo checkout.
+      const existingPaths = new Set<string>();
+      try {
+        const lsTree = execFileSync('git', ['ls-tree', '--name-only', '-r', 'HEAD'], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+        for (const line of lsTree.split('\n')) {
+          if (line) existingPaths.add(line);
+        }
+      } catch {
+        // If git fails (e.g., bare checkout), assume nothing exists.
+      }
+
       const observation: ScaffoldProductObservation = {
         mainSha: '',
         mainTreeSha: '',
-        mainProjectsBlobSha: null,
-        existingPaths: new Set(),
+        mainProjectsYamlBlobSha: null,
+        existingPaths,
         sourceTemplates,
       };
+
+      // Read-only authorization check (dry-run but with approval refs).
+      if (hasApproval) {
+        try {
+          const { createLocalGitReader } = await import('../../git-reader.js');
+          const gitReader = createLocalGitReader({ repoRoot });
+          // Only verify if the product repo can provide the necessary data.
+          await gitReader.blobAt('HEAD', flags.projects).catch(() => null);
+          authorization.reason =
+            'dry-run: approval reference supplied but full verification not performed offline';
+        } catch {
+          authorization.reason = 'dry-run: could not verify approval locally';
+        }
+      }
 
       const compiled = compileScaffoldPlan({
         target: { owner: remoteOwner, name: remoteRepo, defaultBranch: 'main' },
@@ -335,7 +454,7 @@ export default class ProductScaffold extends Command {
         generator: {
           package: '@sdd/factory',
           version: '0.1.0',
-          ...(localSetup.headCommit ? { resolved_commit: localSetup.headCommit } : {}),
+          ...(getPlatformHeadCommit() ? { resolved_commit: getPlatformHeadCommit()! } : {}),
         },
       });
 
@@ -349,10 +468,250 @@ export default class ProductScaffold extends Command {
 
     // --- Real execution path ---
     try {
-      this.log(
-        'Real execution scaffold: verifyGateApproval and GitHub write not yet wired (Phase 3 deferred).',
-      );
-      this.exit(5);
+      const octokit = await createOctokitAdapter(remoteOwner, remoteRepo);
+      const rawClient = createGitHubRequestClient(process.env.GITHUB_TOKEN as string);
+      const { createLocalGitReader } = await import('../../git-reader.js');
+      const gitReader = createLocalGitReader({ repoRoot });
+
+      // Verify the ApprovalRef is correctly formed.
+      let approvalRef: { pr: number } | { mergeCommitSha: string };
+      if (flags['architecture-pr']) {
+        approvalRef = { pr: flags['architecture-pr'] };
+      } else {
+        approvalRef = { mergeCommitSha: flags['architecture-merge-sha'] as string };
+      }
+
+      this.log('Verifying Architecture Gate approval...');
+      const verifyResult = await verifyGateApproval({
+        octokit,
+        git: gitReader,
+        repo: { owner: remoteOwner, name: remoteRepo },
+        gate: 'architecture',
+        version: flags['architecture-version'] as string,
+        approval: approvalRef,
+        artifactPath: flags.projects,
+      });
+
+      if (!verifyResult.ok) {
+        authorization.verified = false;
+        authorization.reason = verifyResult.reason ?? 'authorization failed';
+        this.error(
+          `Authorization failed: ${authorization.reason}\nscaffold aborted — no writes performed.`,
+          { exit: 7 },
+        );
+        return;
+      }
+
+      authorization.verified = true;
+      authorization.reason = null;
+      if (verifyResult.ok && 'pr' in verifyResult) {
+        // The verifyResult has provenance data.
+      }
+
+      this.log('Authorization verified. Resolving templates from platform repo...');
+
+      // Build API-backed reader for the platform repo.
+      const platformRepoRef: RepoRef = { owner: platformParts[0]!, repo: platformParts[1]! };
+
+      // Read main tree for existing path check (D18 main freshness).
+      const mainResp = (await rawClient.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        owner: remoteOwner,
+        repo: remoteRepo,
+        ref: 'heads/main',
+      })) as { object: { sha: string } };
+      const mainCommitSha = mainResp.object.sha;
+
+      const mainCommitResp = (await rawClient.request(
+        'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+        { owner: remoteOwner, repo: remoteRepo, commit_sha: mainCommitSha },
+      )) as { sha: string; tree: { sha: string } };
+      const mainTreeSha = mainCommitResp.tree.sha;
+
+      // D18: main freshness — verify remote projects.yaml matches local.
+      const remoteBlobResp = (await rawClient.request('GET /repos/{owner}/{repo}/contents/{path}', {
+        owner: remoteOwner,
+        repo: remoteRepo,
+        path: flags.projects,
+        ref: mainCommitSha,
+        mediaType: { format: 'raw' },
+      })) as { content?: string; sha?: string };
+      const localBlobSha = await gitReader.blobWorktree(flags.projects);
+      if (remoteBlobResp.sha && remoteBlobResp.sha !== localBlobSha) {
+        authorization.main_fresh = false;
+        authorization.verified = false;
+        authorization.reason =
+          'projects.yaml differs from remote main — local may be stale or a newer Architecture Gate may have been merged';
+        this.error(`Main freshness check failed: ${authorization.reason}`, { exit: 7 });
+        return;
+      }
+      authorization.main_fresh = true;
+
+      // Enumerate main tree to find existing paths.
+      const mainTree = (await rawClient.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+        owner: remoteOwner,
+        repo: remoteRepo,
+        tree_sha: mainTreeSha,
+        recursive: '1',
+      })) as { tree: Array<{ path: string; type: string }> };
+      const existingPaths = new Set<string>();
+      for (const entry of mainTree.tree) {
+        existingPaths.add(entry.path);
+      }
+
+      // Resolve templates from platform repo.
+      const sourceTemplates = new Map<string, ResolvedTemplate>();
+      for (const comp of projects.components) {
+        const tmplName = comp.template;
+        const tmplPath = `templates/${tmplName}`;
+        const manifestResp = (await rawClient.request('GET /repos/{owner}/{repo}/contents/{path}', {
+          owner: platformParts[0]!,
+          repo: platformParts[1]!,
+          path: `${tmplPath}.manifest.json`,
+          ref: comp.template_ref,
+          mediaType: { format: 'raw' },
+        })) as { content?: string };
+        if (!manifestResp.content) {
+          this.warn(
+            `Component '${comp.id}': manifest not found for ${tmplName} at ${comp.template_ref}`,
+          );
+          continue;
+        }
+        const manifest = parseManifest(
+          JSON.parse(Buffer.from(manifestResp.content, 'base64').toString('utf8')),
+        );
+        const entries: Array<{ path: string; mode: '100644' | '100755'; content: Uint8Array }> = [];
+        for (const mf of manifest.files) {
+          const fileResp = (await rawClient.request('GET /repos/{owner}/{repo}/contents/{path}', {
+            owner: platformParts[0]!,
+            repo: platformParts[1]!,
+            path: `${tmplPath}/${mf.path}`,
+            ref: comp.template_ref,
+            mediaType: { format: 'raw' },
+          })) as { content?: string };
+          if (!fileResp.content) {
+            throw new Error(`file ${mf.path} not found in ${tmplName} at ${comp.template_ref}`);
+          }
+          entries.push({
+            path: mf.path,
+            mode: mf.mode,
+            content: Buffer.from(fileResp.content, 'base64'),
+          });
+        }
+        sourceTemplates.set(comp.id, {
+          componentId: comp.id,
+          commit: comp.template_ref,
+          manifest,
+          tree: entries,
+          sourceTreeSha256: manifest.tree_sha256,
+        });
+      }
+
+      const observation: ScaffoldProductObservation = {
+        mainSha: mainCommitSha,
+        mainTreeSha,
+        mainProjectsYamlBlobSha: remoteBlobResp.sha ?? null,
+        existingPaths,
+        sourceTemplates,
+      };
+
+      // Compile plan.
+      const compiled = compileScaffoldPlan({
+        target: { owner: remoteOwner, name: remoteRepo, defaultBranch: 'main' },
+        source: platformRepo,
+        projects,
+        observation,
+        localProjectsBlobSha: localBlobSha,
+        authorization,
+        ...(flags['architecture-pr'] || flags['architecture-merge-sha']
+          ? {
+              approval: {
+                ...(flags['architecture-pr'] ? { pr: flags['architecture-pr'] } : {}),
+                ...(flags['architecture-merge-sha']
+                  ? { mergeCommitSha: flags['architecture-merge-sha'] }
+                  : {}),
+              } as { pr?: number; mergeCommitSha?: string },
+            }
+          : {}),
+        ...(flags['architecture-version'] ? { version: flags['architecture-version'] } : {}),
+        ...(verifyResult.ok
+          ? {
+              provenance: {
+                pr: (verifyResult as { pr?: number }).pr ?? 0,
+                approved_head_sha: '',
+                merge_commit_sha: '',
+                approved_at: '',
+                authorization_policy: 'current-codeowners',
+              },
+            }
+          : {}),
+        generator: {
+          package: '@sdd/factory',
+          version: '0.1.0',
+          ...(getPlatformHeadCommit() ? { resolved_commit: getPlatformHeadCommit()! } : {}),
+        },
+      });
+
+      // Publish branch and PR.
+      const pendingComponents = compiled.plan.components.filter((c) => c.disposition === 'create');
+      if (pendingComponents.length === 0) {
+        this.log('No pending components to scaffold. Nothing to do.');
+        this.exit(0);
+        return;
+      }
+
+      const branchName = compiled.plan.operations.find((o) => o.kind === 'branch.create')?.target;
+      if (!branchName) {
+        this.error('No branch operation in plan — cannot publish.', { exit: 5 });
+        return;
+      }
+
+      const files: Array<{ path: string; mode: '100644' | '100755'; content: Uint8Array }> = [];
+      const allowedPaths = new Set<string>();
+      for (const comp of pendingComponents) {
+        const renderedComp = compiled.rendered.get(comp.id);
+        const lockContent = compiled.lockContents.get(comp.id);
+        if (!renderedComp || !lockContent) continue;
+        allowedPaths.add(comp.path);
+        for (const rf of renderedComp.files) {
+          files.push({
+            path: `${comp.path}/${rf.path}`,
+            mode: rf.mode,
+            content: rf.content,
+          });
+        }
+        files.push({
+          path: `${comp.path}/template.lock`,
+          mode: '100644',
+          content: new TextEncoder().encode(lockContent),
+        });
+      }
+
+      this.log(`Publishing branch ${branchName}...`);
+      const publishResult = await publishComponentBranch(rawClient, {
+        target: { owner: remoteOwner, repo: remoteRepo },
+        baseTreeSha: mainTreeSha,
+        baseCommitSha: mainCommitSha,
+        branchName,
+        files,
+        commitMessage: `sdd-scaffold: ${pendingComponents.map((c) => c.id).join(', ')}`,
+        allowedPaths,
+      });
+
+      // Open PR.
+      const prResult = await upsertScaffoldPull(rawClient, {
+        target: { owner: remoteOwner, repo: remoteRepo },
+        headBranch: branchName,
+        baseBranch: 'main',
+        title: `sdd-scaffold: ${pendingComponents.map((c) => c.id).join(', ')}`,
+        body: `Scaffold PR generated by sdd product scaffold.\n\noperation_id: ${compiled.plan.operation_id}`,
+        teamReviewers: [...new Set(pendingComponents.map((c) => c.owner))],
+        expectedHeadRepo: { owner: remoteOwner, repo: remoteRepo },
+        expectedBaseRef: 'main',
+      });
+
+      this.log(`Scaffold PR #${prResult.number} created: ${prResult.htmlUrl}`);
+      this.log('Awaiting human review and merge.');
+      this.exit(4);
       return;
     } catch (err) {
       this.error(`scaffold failed: ${(err as Error).message}`, { exit: 6 });

@@ -1,7 +1,7 @@
 {
   "template": "spring-boot",
   "path": "templates/spring-boot",
-  "tree_sha256": "sha256:9b94888a10587c93efcbf064112982a9e30b54c69f5e19b833e5d278f3f3ca80",
+  "tree_sha256": "sha256:8f8b59b6b13b5d09bfe4f787de8d0360a442909ba2f3ce9f970a35584909e8b6",
   "files": [
     {
       "path": ".gitignore",
@@ -14,6 +14,12 @@
       "mode": "100644",
       "render": false,
       "sha256": "sha256:c8a7486c23ede98250f41225e3e68db85347d68f302c11528bcdf1a317d35b22"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.jar",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
     },
     {
       "path": "gradle/wrapper/gradle-wrapper.properties",

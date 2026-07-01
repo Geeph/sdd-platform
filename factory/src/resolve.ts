@@ -20,6 +20,9 @@ import { TEMPLATE_NAMES, type TemplateName } from './types.js';
 const SHA256_HEX_RE = /^sha256:[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
+/** Known binary files permitted in templates (e.g. Gradle wrapper JAR). */
+const ALLOWED_BINARY_FILES = new Set(['gradle/wrapper/gradle-wrapper.jar']);
+
 export function isSha256(s: string): boolean {
   return SHA256_HEX_RE.test(s);
 }
@@ -137,11 +140,17 @@ export function assembleTree(
         `source blob checksum mismatch on ${mf.path}: manifest=${mf.sha256}, actual=${actual}`,
       );
     }
-    // Reject binary / CRLF content.
-    if (entry.content instanceof Uint8Array && entry.content.includes(0)) {
-      throw new Error(`binary content rejected on ${mf.path}`);
+    // Reject binary / CRLF content. Binary files are only allowed when
+    // they are explicitly declared in the manifest (e.g. gradle-wrapper.jar).
+    const isBinary = entry.content instanceof Uint8Array && entry.content.includes(0);
+    const hasCRLF = entry.content instanceof Uint8Array && entry.content.includes(0x0d);
+    if (isBinary) {
+      // Permit known binary files: gradle-wrapper.jar (Gradle wrapper).
+      if (!ALLOWED_BINARY_FILES.has(mf.path)) {
+        throw new Error(`binary content rejected on ${mf.path}`);
+      }
     }
-    if (entry.content instanceof Uint8Array && entry.content.includes(0x0d)) {
+    if (hasCRLF && !isBinary) {
       throw new Error(`CRLF rejected on ${mf.path}`);
     }
   }
