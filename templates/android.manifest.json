@@ -1,7 +1,7 @@
 {
   "template": "android",
   "path": "templates/android",
-  "tree_sha256": "sha256:c845bf9b18b5d51b1aa9e7d4a35d76c1db2e59b6880cd67b8c6b40f3636a7393",
+  "tree_sha256": "sha256:6c3291d7d58cc183227a0dd094d3d2392e5a7642d34b1475096ba1a2a23fbbbb",
   "files": [
     {
       "path": ".gitignore",
@@ -13,7 +13,7 @@
       "path": "app/build.gradle.kts",
       "mode": "100644",
       "render": true,
-      "sha256": "sha256:4c41ac0ba18a86083ba1cb81573e23e85be1c54ddba113c8a91fc4c794c77d07"
+      "sha256": "sha256:21eee33c8910fc6e374ef4c39b26c9df4ce3298e2382b79ebdf67d3a1ae97590"
     },
     {
       "path": "app/src/main/AndroidManifest.xml",
@@ -43,7 +43,7 @@
       "path": "gradle/libs.versions.toml",
       "mode": "100644",
       "render": false,
-      "sha256": "sha256:edd6468f4ba68f1d2e65d03a0dfff1e3bab03851837f37f6becb2e9c8f18e7ca"
+      "sha256": "sha256:488d16e173c126ae633940cf5540831be7d68dc059c740e59b27142ffa0eb5be"
     },
     {
       "path": "gradle/wrapper/gradle-wrapper.properties",
@@ -55,7 +55,7 @@
       "path": "gradlew",
       "mode": "100755",
       "render": false,
-      "sha256": "sha256:e192b4e7bea4b55eb458f8fdcbdb22b4db64ebdb1234031f525b8821dcaf2c67"
+      "sha256": "sha256:6381155bb1621e2d11a5371aa94efe9e1b12d0066520da424d847a816d69f240"
     },
     {
       "path": "gradlew.bat",

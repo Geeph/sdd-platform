@@ -56,9 +56,7 @@ export async function publishComponentBranch(
 
   // D4: every file must be under a pending component's path prefix.
   for (const file of files) {
-    const ok = [...input.allowedPaths].some((prefix) =>
-      file.path.startsWith(`${prefix}/`),
-    );
+    const ok = [...input.allowedPaths].some((prefix) => file.path.startsWith(`${prefix}/`));
     if (!ok) {
       throw new Error(
         `publishComponentBranch: file '${file.path}' is not under any pending component path. Allowed: [${[...input.allowedPaths].join(', ')}]`,
@@ -151,7 +149,16 @@ export async function upsertScaffoldPull(
   octokit: OctokitMutate,
   input: UpsertScaffoldPullInput,
 ): Promise<ScaffoldPull> {
-  const { target, headBranch, baseBranch, title, body, teamReviewers, expectedHeadRepo, expectedBaseRef } = input;
+  const {
+    target,
+    headBranch,
+    baseBranch,
+    title,
+    body,
+    teamReviewers,
+    expectedHeadRepo,
+    expectedBaseRef,
+  } = input;
 
   // Check for existing PR.
   const existingPrs = (await withRetry(
@@ -164,7 +171,12 @@ export async function upsertScaffoldPull(
         per_page: 10,
       }),
     'upsertScaffoldPull:listPRs',
-  )) as Array<{ number: number; head: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } }; base: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } }; html_url: string }>;
+  )) as Array<{
+    number: number;
+    head: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } };
+    base: { sha: string; ref: string; repo?: { owner?: { login: string }; name: string } };
+    html_url: string;
+  }>;
 
   if (existingPrs.length > 0) {
     const pr = existingPrs[0]!;
@@ -179,24 +191,21 @@ export async function upsertScaffoldPull(
       ) {
         throw new Error(
           `upsertScaffoldPull: conflict — existing PR #${pr.number} head repo ` +
-          `(${headRepoOwner}/${headRepoName}) does not match expected ` +
-          `(${expectedHeadRepo.owner}/${expectedHeadRepo.repo})`,
+            `(${headRepoOwner}/${headRepoName}) does not match expected ` +
+            `(${expectedHeadRepo.owner}/${expectedHeadRepo.repo})`,
         );
       }
     }
-    if (
-      expectedBaseRef &&
-      pr.base.ref !== expectedBaseRef
-    ) {
+    if (expectedBaseRef && pr.base.ref !== expectedBaseRef) {
       throw new Error(
         `upsertScaffoldPull: conflict — existing PR #${pr.number} base ref ` +
-        `'${pr.base.ref}' does not match expected '${expectedBaseRef}'`,
+          `'${pr.base.ref}' does not match expected '${expectedBaseRef}'`,
       );
     }
     if (pr.head.ref !== headBranch) {
       throw new Error(
         `upsertScaffoldPull: conflict — existing PR #${pr.number} head ref ` +
-        `'${pr.head.ref}' does not match expected '${headBranch}'`,
+          `'${pr.head.ref}' does not match expected '${headBranch}'`,
       );
     }
 

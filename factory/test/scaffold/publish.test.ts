@@ -5,18 +5,16 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  type OctokitMutate,
   publishComponentBranch,
   upsertScaffoldPull,
-  type OctokitMutate,
 } from '../../src/scaffold/publish.js';
 import type {
   PublishComponentBranchInput,
   UpsertScaffoldPullInput,
 } from '../../src/scaffold/types.js';
 
-function createFakeOctokit(
-  handlers: Record<string, (params: Record<string, unknown>) => unknown>,
-) {
+function createFakeOctokit(handlers: Record<string, (params: Record<string, unknown>) => unknown>) {
   const calls: Array<{ route: string; params: Record<string, unknown> }> = [];
   const octokit: OctokitMutate = {
     request: async (route, params = {}) => {
@@ -109,13 +107,9 @@ describe('publishComponentBranch', () => {
     const treeCall = calls[2]!;
     expect((treeCall.params as { base_tree: string }).base_tree).toBe('main-tree-sha');
     const commitCall = calls[3]!;
-    expect((commitCall.params as { parents: string[] }).parents).toEqual([
-      'main-commit-sha',
-    ]);
+    expect((commitCall.params as { parents: string[] }).parents).toEqual(['main-commit-sha']);
     const refCall = calls[4]!;
-    expect((refCall.params as { ref: string }).ref).toBe(
-      'refs/heads/sdd/scaffold-abc123',
-    );
+    expect((refCall.params as { ref: string }).ref).toBe('refs/heads/sdd/scaffold-abc123');
   });
 });
 
