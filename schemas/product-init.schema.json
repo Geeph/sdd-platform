@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sdd.dev/schemas/product-init.schema.json",
+  "title": "SDD Product Init Config",
+  "description": "Configuration for `sdd product init --config product-init.yaml`.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "repository": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["private", "internal", "public"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "bootstrap": {
+      "type": "object",
+      "properties": {
+        "approvers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": ["approvers"],
+      "additionalProperties": false
+    },
+    "owners": {
+      "type": "object",
+      "properties": {
+        "product": { "$ref": "#/$defs/teamSlug" },
+        "api": { "$ref": "#/$defs/teamSlug" },
+        "design": { "$ref": "#/$defs/teamSlug" },
+        "admins": { "$ref": "#/$defs/teamSlug" },
+        "backend": { "$ref": "#/$defs/teamSlug" },
+        "web": { "$ref": "#/$defs/teamSlug" },
+        "ios": { "$ref": "#/$defs/teamSlug" },
+        "android": { "$ref": "#/$defs/teamSlug" }
+      },
+      "required": ["product", "api", "design", "admins"],
+      "additionalProperties": false
+    },
+    "team_permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z0-9][a-z0-9-]*$": {
+          "$ref": "#/$defs/permission"
+        }
+      }
+    },
+    "environments": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "reviewers": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/teamSlug" },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "prevent_self_review": {
+            "type": "boolean"
+          }
+        },
+        "required": ["reviewers"],
+        "additionalProperties": false
+      }
+    },
+    "required_secrets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": ["schema_version", "bootstrap", "owners"],
+  "additionalProperties": false,
+  "$defs": {
+    "teamSlug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "permission": {
+      "type": "string",
+      "enum": ["pull", "triage", "push", "maintain", "admin"]
+    }
+  }
+}

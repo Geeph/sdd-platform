@@ -21,6 +21,10 @@
     "lint": "biome check .",
     "clean": "rimraf dist"
   },
+  "dependencies": {
+    "@sdd/schemas": "workspace:*",
+    "yaml": "^2.5.0"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "tsup": "^8.3.0",

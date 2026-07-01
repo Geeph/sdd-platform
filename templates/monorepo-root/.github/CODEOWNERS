@@ -1,0 +1,17 @@
+# CODEOWNERS — bootstrap 兜底
+#
+# 初始 owner 由 Bootstrap PR 写入分区映射；本节只保证仓库自建起"有主"。
+# 渲染 token：{{repo}} = 目标 org；{{owners.<key>}} = config.owners 映射中的 team slug。
+
+*                           @{{repo}}/{{owners.admins}}
+/specs/                     @{{repo}}/{{owners.product}}
+/projects.yaml              @{{repo}}/{{owners.product}}
+/contracts/                 @{{repo}}/{{owners.api}}
+/design/                    @{{repo}}/{{owners.design}}
+/AGENTS.md                  @{{repo}}/{{owners.product}}
+/.github/                   @{{repo}}/{{owners.admins}}
+/template.lock              @{{repo}}/{{owners.admins}}
+/apps/backend/              @{{repo}}/{{owners.backend}}
+/apps/web/                  @{{repo}}/{{owners.web}}
+/apps/ios/                  @{{repo}}/{{owners.ios}}
+/apps/android/              @{{repo}}/{{owners.android}}

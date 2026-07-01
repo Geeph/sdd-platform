@@ -10,7 +10,8 @@
     },
     "./projects.schema.json": "./projects.schema.json",
     "./task.schema.json": "./task.schema.json",
-    "./impact.schema.json": "./impact.schema.json"
+    "./impact.schema.json": "./impact.schema.json",
+    "./product-init.schema.json": "./product-init.schema.json"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

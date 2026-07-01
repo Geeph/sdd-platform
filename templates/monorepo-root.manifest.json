@@ -1,0 +1,91 @@
+{
+  "template": "monorepo-root",
+  "path": "templates/monorepo-root",
+  "tree_sha256": "sha256:e41c58e6b446b2ef9cd458c25bb4b820dc3a3be8509aece9c6eaaa5ef7d37799",
+  "files": [
+    {
+      "path": ".github/CODEOWNERS",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:7d27f7e1d1d7010130940ed2470a215d8e1c224412dfa0bdbb48458b4b0c528b"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/config.yml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:d6ef2de819ae66a72f34f7cb0c4c9e02ee7bc161a949cc6f30ec57484397227a"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/intake.yml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:6bfb4a1cc5cc6b1daeee4864260e71e4d4389f4a998ca3435bdcddc3dabfd995"
+    },
+    {
+      "path": ".github/pull_request_template.md",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:790cc1858065fcaa1002a498408a76392d084d90bc94ca697a4068ebc6b93702"
+    },
+    {
+      "path": ".github/PULL_REQUEST_TEMPLATE/gate.md",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:46969c6947a17150af36ebad6eece3a33b14f77770241d623793878f38e19323"
+    },
+    {
+      "path": "AGENTS.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:63a65aa7111019776b4e67ba6686fbb1547aeced52387042b9406478ac027c34"
+    },
+    {
+      "path": "contracts/README.md",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:809676e31e9590545b5e94f4e05fdfa92e3e5c29c97d7480621bc92235ff7e17"
+    },
+    {
+      "path": "design/tokens/README.md",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:b6bc79bd777a19167fc81819aa53567caa6b2ff615b46f7374e953663c68ac21"
+    },
+    {
+      "path": "projects.yaml",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:4ceff245e4f1d66bc46a349e3c4f0e0c0d4818e2158bce4874133888c430065d"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:fdd160a70bab945c385f42e4daec22740a8b301e0cfc3565c54a0bac84173333"
+    },
+    {
+      "path": "specs/_template/architecture.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:9fc78a10272aaa1763f0f029efc181b21907ce3433d9ed9b4ac7b1d16b84ecaa"
+    },
+    {
+      "path": "specs/_template/design.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:a89172d90b4504ffe1396a2dff4537395acfb5e8b97ca6dcc7ffd7e1f2c5a870"
+    },
+    {
+      "path": "specs/_template/plan.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:e113220d9b3110c425d7ddf13a445b21c777c63431ab54de37102043f6178dcd"
+    },
+    {
+      "path": "specs/_template/spec.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:1691660e9926c2a74491245964980a6857ed349f472424cef13939e03e5f39a5"
+    }
+  ]
+}

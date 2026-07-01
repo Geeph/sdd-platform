@@ -1,0 +1,1752 @@
+/**
+ * github-write.ts — mutation-side GitHub port for M2b.
+ *
+ * Implements only the three endpoints needed for Contents seed + Git Data
+ * bootstrap (D9): createRepository, seedMainViaContents, publishSnapshot.
+ *
+ * Labels / teams / environments / ruleset / PR endpoints are M2c scope and
+ * intentionally NOT implemented here — their types remain declared in
+ * types.ts but calling them at runtime throws.
+ *
+ * Invariants enforced:
+ *   - Empty-repo bootstrap: Contents API first (seed commit builds main),
+ *     then Git Data non-force ref advance. Never createRef on empty repo.
+ *   - Ref advance safety: only when main still points to seed; snapshot →
+ *     noop; other SHA → conflict. Never force.
+ *   - Retry: 429 / 5xx with Retry-After + capped backoff + jitter. Mutation
+ *     only retried when idempotent or confirmable via GET. 403 secondary
+ *     limit never blindly replayed.
+ */
+
+import { createHash } from 'node:crypto';
+import type {
+  BootstrapPull,
+  BootstrapPullInput,
+  CommitIdentity,
+  CreateRepoInput,
+  EnvironmentsInput,
+  GitHubWritePort,
+  LabelsInput,
+  OrgWorkflowRulesetInput,
+  ReconcileResult,
+  RepositoryIdentity,
+  RepositorySettingsInput,
+  RulesetInput,
+  SeedInput,
+  SnapshotInput,
+  TeamsInput,
+} from './types.js';
+
+// ---- Octokit mutation interface -------------------------------------------
+
+/**
+ * Shape of the octokit-like client we depend on for mutations.
+ * Mirrors `OctokitReadOnly` from github-read.ts but for POST/PUT/PATCH/DELETE.
+ */
+export interface OctokitMutate {
+  request: (route: string, parameters?: Record<string, unknown>) => Promise<unknown>;
+}
+
+// ---- Retry helpers --------------------------------------------------------
+
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const MAX_RETRIES = 5;
+const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 30_000;
+const SECONDARY_RATE_LIMIT_RE = /secondary rate limit/i;
+
+interface RetryState {
+  attempt: number;
+  lastError?: Error;
+}
+
+/**
+ * Sleep for `ms` milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Compute backoff delay with full jitter.
+ */
+function backoffWithJitter(attempt: number, retryAfterMs?: number): number {
+  if (retryAfterMs !== undefined) {
+    return Math.min(retryAfterMs, MAX_DELAY_MS);
+  }
+  const exponential = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+  // Full jitter: random value in [0, exponential].
+  return Math.floor(Math.random() * exponential);
+}
+
+/**
+ * Retry wrapper: retries 429/5xx with backoff+jitter. 403 secondary rate
+ * limit is NOT blindly replayed. Callers use this only for reads and
+ * content-addressed Git object writes; repository/Contents/commit/ref
+ * mutations use explicit read-after-error confirmation instead.
+ */
+async function withRetry<T>(fn: (attempt: number) => Promise<T>, label: string): Promise<T> {
+  const state: RetryState = { attempt: 0 };
+
+  while (state.attempt <= MAX_RETRIES) {
+    try {
+      return await fn(state.attempt);
+    } catch (err) {
+      state.lastError = err as Error;
+      const httpErr = err as {
+        status?: number;
+        message?: string;
+        transient?: boolean;
+        response?: { headers?: Record<string, string | undefined> };
+      };
+      const status = httpErr.status;
+
+      // 403 secondary rate limit: do NOT blindly replay.
+      if (status === 403 && SECONDARY_RATE_LIMIT_RE.test(httpErr.message ?? '')) {
+        throw new Error(`${label}: 403 secondary rate limit — not retrying`);
+      }
+
+      if (httpErr.transient === true || (status !== undefined && RETRYABLE_STATUS.has(status))) {
+        if (state.attempt >= MAX_RETRIES) break;
+
+        // Extract Retry-After header if present (value in seconds).
+        let retryAfterMs: number | undefined;
+        const retryAfterHeader = httpErr.response?.headers?.['retry-after'];
+        if (retryAfterHeader) {
+          const seconds = Number(retryAfterHeader);
+          if (!Number.isNaN(seconds)) {
+            retryAfterMs = seconds * 1000;
+          }
+        }
+
+        const delay = backoffWithJitter(state.attempt, retryAfterMs);
+        state.attempt++;
+        await sleep(delay);
+        continue;
+      }
+
+      // Non-retryable error.
+      throw err;
+    }
+  }
+
+  throw state.lastError ?? new Error(`${label}: exhausted retries`);
+}
+
+// ---- createRepository -----------------------------------------------------
+
+interface CreateRepoResponse {
+  id: number;
+  name: string;
+  owner: { login: string };
+  private: boolean;
+  visibility: string;
+  default_branch: string;
+  description?: string | null;
+}
+
+function repositoryIdentity(resp: CreateRepoResponse): RepositoryIdentity {
+  return {
+    owner: resp.owner.login,
+    name: resp.name,
+    id: resp.id,
+    defaultBranch: resp.default_branch,
+    visibility: normalizeVisibility(resp.visibility, resp.private),
+  };
+}
+
+function repositoryMatchesCreateInput(resp: CreateRepoResponse, input: CreateRepoInput): boolean {
+  return (
+    resp.owner.login.toLowerCase() === input.owner.toLowerCase() &&
+    resp.name.toLowerCase() === input.name.toLowerCase() &&
+    resp.description === input.description &&
+    normalizeVisibility(resp.visibility, resp.private) === input.visibility
+  );
+}
+
+function errorStatus(err: unknown): number | undefined {
+  return (err as { status?: number }).status;
+}
+
+function isRetryableError(err: unknown): boolean {
+  const candidate = err as { status?: number; transient?: boolean };
+  return (
+    candidate.transient === true ||
+    (candidate.status !== undefined && RETRYABLE_STATUS.has(candidate.status))
+  );
+}
+
+/**
+ * Create an empty repository (auto_init=false). Returns the repository
+ * identity including the immutable GitHub repo id.
+ *
+ * Idempotent by name: if the repo already exists with the same name under
+ * the same owner, GitHub returns 422. The caller (applyInitPlan) treats
+ * this as a conflict or resume signal — we surface the error.
+ */
+export async function createRepository(
+  octokit: OctokitMutate,
+  input: CreateRepoInput,
+): Promise<RepositoryIdentity> {
+  let resp: CreateRepoResponse;
+  try {
+    resp = (await octokit.request('POST /orgs/{org}/repos', {
+      org: input.owner,
+      name: input.name,
+      description: input.description,
+      private: input.visibility !== 'public',
+      visibility: input.visibility,
+      auto_init: false,
+    })) as CreateRepoResponse;
+  } catch (err) {
+    // POST is not blindly replayed. A 422 or ambiguous transient failure may
+    // mean the server committed the create but the response was lost.
+    if (errorStatus(err) !== 422 && !isRetryableError(err)) throw err;
+    let observed: CreateRepoResponse;
+    try {
+      observed = (await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}', {
+            owner: input.owner,
+            repo: input.name,
+          }) as Promise<CreateRepoResponse>,
+        'createRepository:confirm',
+      )) as CreateRepoResponse;
+    } catch {
+      throw err;
+    }
+    if (!repositoryMatchesCreateInput(observed, input)) throw err;
+    resp = observed;
+  }
+
+  if (!repositoryMatchesCreateInput(resp, input)) {
+    throw new Error('createRepository: GitHub read-back does not match requested repository');
+  }
+
+  return repositoryIdentity(resp);
+}
+
+function normalizeVisibility(
+  apiVisibility: string,
+  isPrivate: boolean,
+): RepositoryIdentity['visibility'] {
+  if (apiVisibility === 'public') return 'public';
+  if (apiVisibility === 'internal') return 'internal';
+  return isPrivate ? 'private' : 'public';
+}
+
+export async function updateRepositorySettings(
+  octokit: OctokitMutate,
+  input: RepositorySettingsInput,
+): Promise<RepositoryIdentity> {
+  const { repository, description, defaultBranch } = input;
+  let mutationError: unknown;
+  try {
+    await octokit.request('PATCH /repos/{owner}/{repo}', {
+      owner: repository.owner,
+      repo: repository.name,
+      description,
+      default_branch: defaultBranch,
+    });
+  } catch (err) {
+    if (!isRetryableError(err)) throw err;
+    mutationError = err;
+  }
+  const observed = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}', {
+        owner: repository.owner,
+        repo: repository.name,
+      }),
+    'updateRepositorySettings:confirm',
+  )) as CreateRepoResponse;
+  if (observed.description !== description || observed.default_branch !== defaultBranch) {
+    if (mutationError) throw mutationError;
+    throw new Error('updateRepositorySettings: read-back mismatch');
+  }
+  return repositoryIdentity(observed);
+}
+
+// ---- seedMainViaContents --------------------------------------------------
+
+interface SeedContentsResponse {
+  commit: { sha: string };
+}
+
+/**
+ * D9: Write the final template.lock as the seed commit via the Contents API.
+ *
+ * GitHub does NOT allow creating a ref on an empty repository, so we must
+ * use the Contents API (which creates an implicit initial commit + main
+ * branch) to bootstrap. This is the ONLY valid way to establish main on a
+ * new empty repo.
+ *
+ * The commit message carries the operation_id for later resume detection.
+ */
+export async function seedMainViaContents(
+  octokit: OctokitMutate,
+  input: SeedInput,
+): Promise<CommitIdentity> {
+  const commitMessage = `sdd-init: seed template.lock [${input.operationId}]`;
+
+  let commitSha: string | undefined;
+  try {
+    const resp = (await octokit.request('PUT /repos/{owner}/{repo}/contents/{path}', {
+      owner: input.repository.owner,
+      repo: input.repository.name,
+      path: 'template.lock',
+      message: commitMessage,
+      content: Buffer.from(input.lockContent, 'utf8').toString('base64'),
+      branch: 'main',
+    })) as SeedContentsResponse;
+    commitSha = resp.commit?.sha;
+  } catch (err) {
+    if (![409, 422].includes(errorStatus(err) ?? -1) && !isRetryableError(err)) throw err;
+    // PUT may have succeeded despite a lost response. Confirm exact content
+    // before treating it as complete; never replay the mutation blindly.
+    let existing: unknown;
+    try {
+      existing = await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+            owner: input.repository.owner,
+            repo: input.repository.name,
+            path: 'template.lock',
+            ref: 'main',
+          }),
+        'seedMainViaContents:confirmContent',
+      );
+    } catch {
+      throw err;
+    }
+    if (decodeApiContent(existing) !== input.lockContent) throw err;
+    const ref = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+          owner: input.repository.owner,
+          repo: input.repository.name,
+          ref: 'heads/main',
+        }),
+      'seedMainViaContents:confirmRef',
+    )) as GetRefResponse;
+    const headCommit = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+          owner: input.repository.owner,
+          repo: input.repository.name,
+          commit_sha: ref.object.sha,
+        }),
+      'seedMainViaContents:confirmHead',
+    )) as { parents?: Array<{ sha: string }> };
+    // A concurrent invocation may already have published the direct-child
+    // snapshot. Recover the root seed rather than treating HEAD as the seed.
+    commitSha =
+      headCommit.parents?.length === 1 && headCommit.parents[0]?.sha
+        ? headCommit.parents[0].sha
+        : ref.object.sha;
+  }
+
+  if (!commitSha) {
+    throw new Error('seedMainViaContents: no commit SHA in response');
+  }
+
+  // Read back the commit to get the tree SHA.
+  const commitResp = await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+        owner: input.repository.owner,
+        repo: input.repository.name,
+        commit_sha: commitSha,
+      }) as Promise<{
+        sha: string;
+        message?: string;
+        tree: { sha: string };
+        parents?: Array<{ sha: string }>;
+      }>,
+    'seedMainViaContents:readCommit',
+  );
+
+  if (commitResp.message !== commitMessage || (commitResp.parents ?? []).length !== 0) {
+    throw new Error(
+      "seedMainViaContents: recovered commit is not this operation's root seed commit",
+    );
+  }
+
+  return {
+    sha: commitResp.sha,
+    treeSha: commitResp.tree.sha,
+  };
+}
+
+function decodeApiContent(value: unknown): string {
+  const response = value as { content?: string; encoding?: string };
+  if (response.encoding === 'base64' && response.content) {
+    return Buffer.from(response.content.replace(/\n/g, ''), 'base64').toString('utf8');
+  }
+  return response.content ?? '';
+}
+
+// ---- publishSnapshot ------------------------------------------------------
+
+interface CreateBlobResponse {
+  sha: string;
+}
+
+interface CreateTreeEntry {
+  path: string;
+  mode:
+    | '100644'
+    | '100755'
+    | '100640'
+    | '100664'
+    | '100666'
+    | '100775'
+    | '100777'
+    | '040000'
+    | '160000';
+  type: 'blob' | 'commit' | 'tree';
+  sha: string;
+}
+
+interface CreateTreeResponse {
+  sha: string;
+  tree?: CreateTreeEntry[];
+}
+
+interface CreateCommitResponse {
+  sha: string;
+  tree: { sha: string };
+}
+
+interface GetRefResponse {
+  object: { sha: string };
+}
+
+interface UpdateRefResponse {
+  object: { sha: string };
+}
+
+export interface SnapshotResult extends CommitIdentity {
+  disposition: 'create' | 'noop' | 'conflict';
+}
+
+/**
+ * D9: Publish the full snapshot via Git Data API.
+ *
+ * Steps:
+ *   1. Create blobs for each rendered file.
+ *   2. Create tree with base_tree=seedTree (merges seed tree + new blobs).
+ *   3. Create commit (parent = seed commit).
+ *   4. Non-force ref advance: only if main still points to seed.
+ *      - Already at snapshot SHA → noop.
+ *      - Points to something else → conflict, NEVER force.
+ *
+ * Pre-checks the current main ref to determine disposition before any writes.
+ */
+export async function publishSnapshot(
+  octokit: OctokitMutate,
+  input: SnapshotInput,
+): Promise<SnapshotResult> {
+  const { repository, seedCommit, seedTree, files } = input;
+  const owner = repository.owner;
+  const repo = repository.name;
+
+  // Validate the entire intended write set before creating any Git objects.
+  const paths = new Set<string>();
+  for (const file of files) {
+    if (file.path === 'template.lock') {
+      throw new Error('publishSnapshot: template.lock must only come from the seed tree');
+    }
+    if (paths.has(file.path)) {
+      throw new Error(`publishSnapshot: duplicate path '${file.path}'`);
+    }
+    paths.add(file.path);
+    if (file.path.startsWith('apps/') || file.path.includes('/apps/')) {
+      throw new Error(
+        `publishSnapshot: apps/* paths are not allowed in snapshot, got '${file.path}'`,
+      );
+    }
+  }
+
+  // Step 0: Check current main ref for safety.
+  const currentRef = await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        owner,
+        repo,
+        ref: 'heads/main',
+      }) as Promise<GetRefResponse>,
+    'publishSnapshot:checkRef',
+  );
+
+  const currentSha = currentRef.object.sha;
+
+  if (currentSha !== seedCommit) {
+    const existing = await verifySnapshotCommit(octokit, input, currentSha);
+    if (existing) return { ...existing, disposition: 'noop' };
+    return { sha: currentSha, treeSha: '', disposition: 'conflict' };
+  }
+
+  // Resolve seedTree if not provided (resume path).
+  let resolvedSeedTree = seedTree;
+  if (!resolvedSeedTree) {
+    const seedCommitResp = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+          owner,
+          repo,
+          commit_sha: seedCommit,
+        }),
+      'publishSnapshot:readSeedCommit',
+    )) as { tree: { sha: string } };
+    resolvedSeedTree = seedCommitResp.tree.sha;
+  }
+
+  // Step 1: Create blobs for each file (parallel, with concurrency limit).
+  const CONCURRENCY = 5;
+  const blobShas: Map<string, string> = new Map();
+
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const batch = files.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(
+      batch.map((file) =>
+        withRetry(
+          () =>
+            octokit.request('POST /repos/{owner}/{repo}/git/blobs', {
+              owner,
+              repo,
+              content: Buffer.from(file.content).toString('base64'),
+              encoding: 'base64',
+            }) as Promise<CreateBlobResponse>,
+          `publishSnapshot:createBlob:${file.path}`,
+        ).then((r) => ({ path: file.path, sha: r.sha })),
+      ),
+    );
+    for (const r of results) {
+      blobShas.set(r.path, r.sha);
+    }
+  }
+
+  // Step 2: Create tree with base_tree = seedTree.
+  const treeEntries: CreateTreeEntry[] = files.map((f) => {
+    const blobSha = blobShas.get(f.path);
+    if (blobSha === undefined) {
+      throw new Error(`publishSnapshot: blob SHA missing for ${f.path}`);
+    }
+    return {
+      path: f.path,
+      mode: f.mode,
+      type: 'blob' as const,
+      sha: blobSha,
+    };
+  });
+
+  const treeResp = await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/git/trees', {
+        owner,
+        repo,
+        base_tree: resolvedSeedTree,
+        tree: treeEntries,
+      }) as Promise<CreateTreeResponse>,
+    'publishSnapshot:createTree',
+  );
+
+  // Verify the tree was created correctly using a recursive read-back. The
+  // create-tree response may include base-tree entries or only submitted
+  // entries, so its array length is not a stable contract.
+  if (!treeResp.sha) {
+    throw new Error('publishSnapshot: tree creation returned no SHA');
+  }
+  await verifySnapshotTree(octokit, input, treeResp.sha);
+
+  // Step 3: Create commit with parent = seed commit.
+  const commitResp = (await octokit.request('POST /repos/{owner}/{repo}/git/commits', {
+    owner,
+    repo,
+    message: `sdd-init: publish snapshot [${owner}/${repo}]`,
+    tree: treeResp.sha,
+    parents: [seedCommit],
+  })) as CreateCommitResponse;
+
+  if (!commitResp.sha) {
+    throw new Error('publishSnapshot: commit creation returned no SHA');
+  }
+
+  // Step 4: Non-force ref advance (compare-and-set via conditional update).
+  // Use the update ref API with the current SHA as a condition.
+  try {
+    const updateResp = (await octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
+      owner,
+      repo,
+      ref: 'heads/main',
+      sha: commitResp.sha,
+      force: false,
+    })) as UpdateRefResponse;
+    return {
+      sha: updateResp.object.sha,
+      treeSha: commitResp.tree.sha,
+      disposition: 'create',
+    };
+  } catch (err) {
+    // PATCH is not replayed. Confirm whether it succeeded before surfacing a
+    // retryable failure; a later process run can safely converge.
+    if (errorStatus(err) !== 422 && !isRetryableError(err)) throw err;
+    const confirmed = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+          owner,
+          repo,
+          ref: 'heads/main',
+        }),
+      'publishSnapshot:confirmRef',
+    )) as GetRefResponse;
+    if (confirmed.object.sha === commitResp.sha) {
+      return { sha: commitResp.sha, treeSha: commitResp.tree.sha, disposition: 'create' };
+    }
+    if (confirmed.object.sha === seedCommit && isRetryableError(err)) throw err;
+    const concurrent = await verifySnapshotCommit(octokit, input, confirmed.object.sha);
+    if (concurrent) return { ...concurrent, disposition: 'noop' };
+    return { sha: confirmed.object.sha, treeSha: '', disposition: 'conflict' };
+  }
+}
+
+function gitBlobSha(content: Uint8Array | string): string {
+  const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+async function verifySnapshotTree(
+  octokit: OctokitMutate,
+  input: SnapshotInput,
+  treeSha: string,
+): Promise<void> {
+  const response = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+        owner: input.repository.owner,
+        repo: input.repository.name,
+        tree_sha: treeSha,
+        recursive: '1',
+      }),
+    'publishSnapshot:verifyTree',
+  )) as { truncated?: boolean; tree?: CreateTreeEntry[] };
+  if (response.truncated) throw new Error('publishSnapshot: recursive tree response was truncated');
+  const leaves = (response.tree ?? []).filter((entry) => entry.type !== 'tree');
+  const expected = new Map<string, { mode: string; sha: string }>([
+    ['template.lock', { mode: '100644', sha: gitBlobSha(input.lockContent) }],
+    ...input.files.map(
+      (file) =>
+        [file.path, { mode: file.mode, sha: gitBlobSha(file.content) }] as [
+          string,
+          { mode: string; sha: string },
+        ],
+    ),
+  ]);
+  if (leaves.length !== expected.size) {
+    throw new Error(
+      `publishSnapshot: leaf count mismatch: expected ${expected.size}, got ${leaves.length}`,
+    );
+  }
+  for (const entry of leaves) {
+    const wanted = expected.get(entry.path);
+    if (
+      entry.type !== 'blob' ||
+      !wanted ||
+      wanted.mode !== entry.mode ||
+      wanted.sha !== entry.sha
+    ) {
+      throw new Error(`publishSnapshot: tree verification mismatch at '${entry.path}'`);
+    }
+    expected.delete(entry.path);
+  }
+  if (expected.size > 0) {
+    throw new Error(`publishSnapshot: tree missing '${expected.keys().next().value as string}'`);
+  }
+}
+
+async function verifySnapshotCommit(
+  octokit: OctokitMutate,
+  input: SnapshotInput,
+  commitSha: string,
+): Promise<CommitIdentity | null> {
+  const commit = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+        owner: input.repository.owner,
+        repo: input.repository.name,
+        commit_sha: commitSha,
+      }),
+    'publishSnapshot:verifyCommit',
+  )) as { tree: { sha: string }; parents?: Array<{ sha: string }> };
+  if (commit.parents?.length !== 1 || commit.parents[0]?.sha !== input.seedCommit) return null;
+  try {
+    await verifySnapshotTree(octokit, input, commit.tree.sha);
+    return { sha: commitSha, treeSha: commit.tree.sha };
+  } catch (err) {
+    if (errorStatus(err) !== undefined) throw err;
+    return null;
+  }
+}
+
+// ---- reconcileLabels (§3.1) -----------------------------------------------
+
+interface LabelResponse {
+  id: number;
+  name: string;
+  color: string;
+  description: string | null;
+}
+
+interface ListLabelsResponse extends Array<LabelResponse> {}
+
+/**
+ * Reconcile labels on a repository: create missing, update drifted, noop
+ * already-correct. Unknown labels (not in desired set) are preserved (§2.3
+ * step 6: "不删未知配置").
+ *
+ * Reads full pagination; upserts by stable key (name); writes then read-back.
+ */
+export async function reconcileLabels(
+  octokit: OctokitMutate,
+  input: LabelsInput,
+): Promise<ReconcileResult> {
+  const owner = input.repository.owner;
+  const repo = input.repository.name;
+  const result: ReconcileResult = { created: [], updated: [], noop: [] };
+
+  // Read all existing labels via pagination.
+  const existing = await paginateAll<LabelResponse>(
+    octokit,
+    'GET /repos/{owner}/{repo}/labels',
+    { owner, repo, per_page: 100 },
+    'reconcileLabels:list',
+  );
+
+  const existingByName = new Map<string, LabelResponse>();
+  for (const label of existing) {
+    existingByName.set(label.name.toLowerCase(), label);
+  }
+
+  for (const desired of input.desired) {
+    const key = desired.name.toLowerCase();
+    const found = existingByName.get(key);
+
+    if (!found) {
+      // Create new label.
+      await withRetry(
+        () =>
+          octokit.request('POST /repos/{owner}/{repo}/labels', {
+            owner,
+            repo,
+            name: desired.name,
+            color: desired.color.replace(/^#/, ''),
+            description: desired.description,
+          }),
+        `reconcileLabels:create:${desired.name}`,
+      );
+      result.created.push(desired.name);
+    } else if (
+      found.color.toLowerCase() !== desired.color.replace(/^#/, '').toLowerCase() ||
+      (found.description ?? '') !== desired.description
+    ) {
+      // Update drifted label.
+      await withRetry(
+        () =>
+          octokit.request('PATCH /repos/{owner}/{repo}/labels/{name}', {
+            owner,
+            repo,
+            name: found.name,
+            color: desired.color.replace(/^#/, ''),
+            description: desired.description,
+          }),
+        `reconcileLabels:update:${desired.name}`,
+      );
+      result.updated.push(desired.name);
+    } else {
+      result.noop.push(desired.name);
+    }
+  }
+
+  // Read-back verification: fetch labels again to confirm.
+  const after = await paginateAll<LabelResponse>(
+    octokit,
+    'GET /repos/{owner}/{repo}/labels',
+    { owner, repo, per_page: 100 },
+    'reconcileLabels:readback',
+  );
+  const afterNames = new Set(after.map((l) => l.name.toLowerCase()));
+  for (const desired of input.desired) {
+    if (!afterNames.has(desired.name.toLowerCase())) {
+      throw new Error(
+        `reconcileLabels: read-back verification failed — label '${desired.name}' not found after write`,
+      );
+    }
+  }
+
+  return result;
+}
+
+// ---- grantTeamPermissions (§D13: validate-only + assign) -------------------
+
+interface TeamResponse {
+  id: number;
+  slug: string;
+  name: string | null;
+  members_count: number;
+}
+
+interface ListTeamsResponse extends Array<TeamResponse> {}
+
+/**
+ * Grant team repository permissions. D13: does NOT create teams or modify
+ * membership — only validates teams exist with ≥1 active member and assigns
+ * repository permission. Missing team → error (caller maps to 'blocked').
+ *
+ * Reads full org team pagination; upserts by stable key (team slug).
+ */
+export async function grantTeamPermissions(
+  octokit: OctokitMutate,
+  input: TeamsInput,
+): Promise<ReconcileResult> {
+  const owner = input.repository.owner;
+  const repo = input.repository.name;
+  const result: ReconcileResult = { created: [], updated: [], noop: [] };
+
+  // Read all org teams via pagination to validate existence.
+  const teams = await paginateAll<TeamResponse>(
+    octokit,
+    'GET /orgs/{org}/teams',
+    { org: owner, per_page: 100 },
+    'grantTeamPermissions:listTeams',
+  );
+
+  const teamBySlug = new Map<string, TeamResponse>();
+  for (const team of teams) {
+    teamBySlug.set(team.slug, team);
+  }
+
+  for (const requiredTeam of input.requiredTeams ?? []) {
+    const team = teamBySlug.get(requiredTeam);
+    if (!team) {
+      throw new Error(
+        `grantTeamPermissions: referenced team '${requiredTeam}' does not exist in org '${owner}'`,
+      );
+    }
+    if (team.members_count < 1) {
+      throw new Error(
+        `grantTeamPermissions: referenced team '${requiredTeam}' has 0 active members`,
+      );
+    }
+  }
+
+  for (const assignment of input.assignments) {
+    const team = teamBySlug.get(assignment.team);
+
+    if (!team) {
+      throw new Error(
+        `grantTeamPermissions: team '${assignment.team}' does not exist in org '${owner}'`,
+      );
+    }
+
+    if (team.members_count < 1) {
+      throw new Error(
+        `grantTeamPermissions: team '${assignment.team}' has 0 active members (D13 requires ≥1)`,
+      );
+    }
+
+    // Validate permission value.
+    const validPerms = new Set(['pull', 'triage', 'push', 'maintain', 'admin']);
+    if (!validPerms.has(assignment.permission)) {
+      throw new Error(
+        `grantTeamPermissions: invalid permission '${assignment.permission}' for team '${assignment.team}'`,
+      );
+    }
+
+    // Assign repository permission (idempotent PUT).
+    await withRetry(
+      () =>
+        octokit.request('PUT /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}', {
+          org: owner,
+          team_slug: team.slug,
+          owner,
+          repo,
+          permission: assignment.permission,
+        }),
+      `grantTeamPermissions:assign:${assignment.team}`,
+    );
+
+    // We can't easily determine noop vs update without reading current
+    // permission first. For idempotency, treat all assignments as 'created'
+    // (the PUT is idempotent).
+    result.created.push(assignment.team);
+  }
+
+  return result;
+}
+
+// ---- reconcileEnvironments -------------------------------------------------
+
+interface EnvironmentResponse {
+  id: number;
+  name: string;
+}
+
+interface EnvironmentDetail extends EnvironmentResponse {
+  protection_rules?: Array<{
+    type: string;
+    prevent_self_review?: boolean;
+    reviewers?: Array<{ type: string; reviewer: { id: number } }>;
+  }>;
+}
+
+/**
+ * Reconcile environments on a repository: create missing, noop already
+ * existing. M2 does not configure secrets (→ M7). Reviewer configuration is
+ * best-effort via the environment API.
+ *
+ * Unknown environments are preserved (§2.3 step 6).
+ */
+export async function reconcileEnvironments(
+  octokit: OctokitMutate,
+  input: EnvironmentsInput,
+): Promise<ReconcileResult> {
+  const owner = input.repository.owner;
+  const repo = input.repository.name;
+  const result: ReconcileResult = { created: [], updated: [], noop: [] };
+
+  // Read existing environments via pagination.
+  const envResp = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/environments', {
+        owner,
+        repo,
+        per_page: 100,
+      }),
+    'reconcileEnvironments:list',
+  )) as { environments: EnvironmentResponse[] };
+
+  const existingNames = new Set(envResp.environments.map((e) => e.name.toLowerCase()));
+
+  for (const desired of input.desired) {
+    const reviewerIds: Array<{ type: 'Team'; id: number }> = [];
+    for (const teamSlug of desired.reviewers) {
+      const teamResp = (await withRetry(
+        () =>
+          octokit.request('GET /orgs/{org}/teams/{team_slug}', {
+            org: owner,
+            team_slug: teamSlug,
+          }),
+        `reconcileEnvironments:resolve-team:${teamSlug}`,
+      )) as { id?: number };
+      if (!teamResp.id) {
+        throw new Error(`reconcileEnvironments: reviewer team '${teamSlug}' has no id`);
+      }
+      reviewerIds.push({ type: 'Team', id: teamResp.id });
+    }
+
+    await withRetry(
+      () =>
+        octokit.request('PUT /repos/{owner}/{repo}/environments/{environment_name}', {
+          owner,
+          repo,
+          environment_name: desired.name,
+          reviewers: reviewerIds,
+          prevent_self_review: desired.preventSelfReview,
+        }),
+      `reconcileEnvironments:upsert:${desired.name}`,
+    );
+    if (existingNames.has(desired.name.toLowerCase())) result.updated.push(desired.name);
+    else result.created.push(desired.name);
+
+    const after = (await withRetry(
+      () =>
+        octokit.request('GET /repos/{owner}/{repo}/environments/{environment_name}', {
+          owner,
+          repo,
+          environment_name: desired.name,
+        }),
+      `reconcileEnvironments:readback:${desired.name}`,
+    )) as EnvironmentDetail;
+    const reviewerRule = (after.protection_rules ?? []).find(
+      (rule) => rule.type === 'required_reviewers',
+    );
+    const actualIds = (reviewerRule?.reviewers ?? [])
+      .filter((reviewer) => reviewer.type === 'Team')
+      .map((reviewer) => reviewer.reviewer.id)
+      .sort((a, b) => a - b);
+    const expectedIds = reviewerIds.map((reviewer) => reviewer.id).sort((a, b) => a - b);
+    if (
+      after.name.toLowerCase() !== desired.name.toLowerCase() ||
+      canonicalJson(actualIds) !== canonicalJson(expectedIds) ||
+      (reviewerRule?.prevent_self_review ?? false) !== desired.preventSelfReview
+    ) {
+      throw new Error(`reconcileEnvironments: read-back mismatch for '${desired.name}'`);
+    }
+  }
+
+  return result;
+}
+
+// ---- reconcileRepositoryRuleset (§3.2: sdd-main, two-stage) ------------------
+
+interface RulesetResponse {
+  id: number;
+  name: string;
+  enforcement: string;
+  target?: string;
+  conditions?: Record<string, unknown>;
+  rules?: Array<Record<string, unknown>>;
+  bypass_actors?: Array<Record<string, unknown>>;
+}
+
+/**
+ * Create or update the product repository ruleset `sdd-main`.
+ *
+ * Two-stage design (§3.2):
+ *   - `hardened: false` (init): initial ruleset with PR + approval + CODEOWNER
+ *     + stale dismissal, but NO required status checks yet (the contexts
+ *     don't exist until the Bootstrap PR runs the platform workflows).
+ *   - `hardened: { requiredCheckContexts, integrationId? }` (finalize): adds
+ *     required status checks bound to the GitHub Actions integration_id so
+ *     only runs produced by the trusted platform workflow satisfy them (D10).
+ *
+ * Does not modify shared/unknown rulesets.
+ */
+export async function reconcileRepositoryRuleset(
+  octokit: OctokitMutate,
+  input: RulesetInput,
+): Promise<ReconcileResult> {
+  const owner = input.repository.owner;
+  const repo = input.repository.name;
+  const result: ReconcileResult = { created: [], updated: [], noop: [] };
+  const rulesetName = 'sdd-main';
+
+  // Check for existing rulesets on this repo.
+  const existing = await paginateAll<RulesetResponse>(
+    octokit,
+    'GET /repos/{owner}/{repo}/rulesets',
+    { owner, repo, per_page: 100 },
+    'reconcileRepositoryRuleset:list',
+  );
+
+  const foundSummary = existing.find((r) => r.name === rulesetName);
+  const found = foundSummary
+    ? ((await withRetry(
+        () =>
+          octokit.request('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+            owner,
+            repo,
+            ruleset_id: foundSummary.id,
+          }),
+        'reconcileRepositoryRuleset:readExisting',
+      )) as RulesetResponse)
+    : undefined;
+
+  // Common base rules (§3.2 table, both stages): no push / no force push /
+  // no deletion; requires PR + ≥1 human approval; requires CODEOWNER
+  // approval; stale review dismissal; review threads resolved.
+  const baseRules: Array<Record<string, unknown>> = [
+    { type: 'deletion' },
+    { type: 'non_fast_forward' },
+    {
+      type: 'pull_request',
+      parameters: {
+        required_approving_review_count: 1,
+        dismiss_stale_reviews_on_push: true,
+        require_code_owner_review: true,
+        require_last_push_approval: false,
+        required_review_thread_resolution: true,
+        automatic_copilot_code_review: false,
+      },
+    },
+  ];
+
+  // Hardened stage appends required status checks with integration_id
+  // binding (D10). The well-known GitHub Actions app id is 15368.
+  const desiredRules: Array<Record<string, unknown>> = [...baseRules];
+  if (input.hardened !== false) {
+    const integrationId = input.hardened.integrationId ?? 15368; // GitHub Actions
+    desiredRules.push({
+      type: 'required_status_checks',
+      parameters: {
+        required_status_checks: input.hardened.requiredCheckContexts.map((context) => ({
+          context,
+          integration_id: integrationId,
+        })),
+        strict_required_status_checks: true,
+      },
+    });
+  }
+
+  const desiredConditions = {
+    ref_name: {
+      include: ['refs/heads/main'],
+      exclude: [],
+    },
+  };
+
+  let readbackId: number;
+  if (!found) {
+    // Create the ruleset.
+    const resp = (await withRetry(
+      () =>
+        octokit.request('POST /repos/{owner}/{repo}/rulesets', {
+          owner,
+          repo,
+          name: rulesetName,
+          enforcement: 'active',
+          target: 'branch',
+          conditions: desiredConditions,
+          rules: desiredRules,
+          bypass_actors: [],
+        }),
+      'reconcileRepositoryRuleset:create',
+    )) as RulesetResponse;
+
+    if (!resp.id) {
+      throw new Error('reconcileRepositoryRuleset: create returned no id');
+    }
+    readbackId = resp.id;
+    result.created.push(rulesetName);
+  } else {
+    readbackId = found.id;
+    // Check if update is needed. For the initial ruleset, we compare rules.
+    // If already correct → noop. Otherwise → update.
+    const needsUpdate = checkRulesetNeedsUpdate(found, desiredRules, desiredConditions);
+
+    if (needsUpdate) {
+      await withRetry(
+        () =>
+          octokit.request('PUT /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+            owner,
+            repo,
+            ruleset_id: found.id,
+            name: rulesetName,
+            enforcement: 'active',
+            target: 'branch',
+            conditions: desiredConditions,
+            rules: desiredRules,
+            bypass_actors: [],
+          }),
+        'reconcileRepositoryRuleset:update',
+      );
+      result.updated.push(rulesetName);
+    } else {
+      result.noop.push(rulesetName);
+    }
+  }
+
+  // Read-back verification against the complete desired state.
+  const after = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/rulesets/{ruleset_id}', {
+        owner,
+        repo,
+        ruleset_id: readbackId,
+      }),
+    'reconcileRepositoryRuleset:readback',
+  )) as RulesetResponse;
+
+  if (
+    after.name !== rulesetName ||
+    checkRulesetNeedsUpdate(after, desiredRules, desiredConditions)
+  ) {
+    throw new Error('reconcileRepositoryRuleset: read-back does not match desired state');
+  }
+
+  return result;
+}
+
+function checkRulesetNeedsUpdate(
+  existing: RulesetResponse,
+  desiredRules: Array<Record<string, unknown>>,
+  desiredConditions: Record<string, unknown>,
+): boolean {
+  // Compare enforcement mode.
+  if (existing.enforcement !== 'active') return true;
+  if (existing.target !== 'branch') return true;
+  if ((existing.bypass_actors?.length ?? 0) !== 0) return true;
+  if (canonicalJson(existing.conditions ?? {}) !== canonicalJson(desiredConditions)) return true;
+
+  // Compare rule count.
+  if (!existing.rules || existing.rules.length !== desiredRules.length) return true;
+
+  // Compare actual rule content (type + parameters).
+  // Build a map of desired rules by type for comparison.
+  const desiredByType = new Map<string, Record<string, unknown>>();
+  for (const rule of desiredRules) {
+    const type = rule.type as string;
+    desiredByType.set(type, rule);
+  }
+
+  for (const existingRule of existing.rules) {
+    const type = existingRule.type as string;
+    const desired = desiredByType.get(type);
+    if (!desired) return true; // Existing rule type not in desired set
+
+    // For required_status_checks, compare the actual contexts and integration_ids.
+    if (type === 'required_status_checks') {
+      const existingParams = existingRule.parameters as {
+        required_status_checks?: Array<{ context: string; integration_id?: number }>;
+      };
+      const desiredParams = desired.parameters as {
+        required_status_checks: Array<{ context: string; integration_id: number }>;
+      };
+      const existingChecks = existingParams.required_status_checks ?? [];
+      const desiredChecks = desiredParams.required_status_checks;
+
+      if (existingChecks.length !== desiredChecks.length) return true;
+
+      // Compare each check (context + integration_id).
+      const existingMap = new Map(existingChecks.map((c) => [c.context, c.integration_id]));
+      for (const desiredCheck of desiredChecks) {
+        const existingId = existingMap.get(desiredCheck.context);
+        if (existingId !== desiredCheck.integration_id) return true;
+      }
+    } else {
+      // For other rule types, do a shallow comparison of parameters.
+      // This is a simplification; deep comparison would be more robust.
+      const existingParams = JSON.stringify(existingRule.parameters ?? {});
+      const desiredParams = JSON.stringify(desired.parameters ?? {});
+      if (existingParams !== desiredParams) return true;
+    }
+  }
+
+  return false;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+// ---- reconcileOrgWorkflowRuleset (§3.2: sdd-workflows-<id>) ----------------
+
+interface OrgRulesetResponse {
+  id: number;
+  name: string;
+  enforcement: string;
+  target?: string;
+  conditions?: Record<string, unknown>;
+  rules?: Array<Record<string, unknown>>;
+}
+
+/**
+ * Create or update the dedicated organization workflow ruleset.
+ *
+ * Stable name: `sdd-workflows-<repository-id>`.
+ * Repository condition: exact match on target repo name.
+ * Branch condition: `refs/heads/main` only.
+ * Workflow source: platform repo id + path + pinned SHA.
+ * Enforcement: `evaluate` on init, `active` on finalize.
+ *
+ * Does not modify shared/unknown org rulesets. If a ruleset with the same
+ * name but different target/source exists → conflict.
+ */
+export async function reconcileOrgWorkflowRuleset(
+  octokit: OctokitMutate,
+  input: OrgWorkflowRulesetInput,
+): Promise<ReconcileResult> {
+  const owner = input.repository.owner;
+  const repoId = input.repository.id;
+  const _repoName = input.repository.name;
+  const result: ReconcileResult = { created: [], updated: [], noop: [] };
+  const rulesetName = `sdd-workflows-${repoId}`;
+
+  // List org rulesets to find ours.
+  const existing = await paginateAll<OrgRulesetResponse>(
+    octokit,
+    'GET /orgs/{org}/rulesets',
+    { org: owner, per_page: 100 },
+    'reconcileOrgWorkflowRuleset:list',
+  );
+
+  const foundSummary = existing.find((r) => r.name === rulesetName);
+  const found = foundSummary
+    ? ((await withRetry(
+        () =>
+          octokit.request('GET /orgs/{org}/rulesets/{ruleset_id}', {
+            org: owner,
+            ruleset_id: foundSummary.id,
+          }),
+        'reconcileOrgWorkflowRuleset:readExisting',
+      )) as OrgRulesetResponse)
+    : undefined;
+
+  // GitHub REST API (organization ruleset): `conditions` is an object whose
+  // keys name each condition. The repository condition uses the key
+  // `repository_id` (singular) with a nested `repository_ids` array, per
+  // the GitHub official schema. Putting `repository_ids` at the top level
+  // of conditions produces a 422 from the API.
+  const desiredConditions = {
+    repository_id: {
+      repository_ids: [repoId],
+    },
+    ref_name: {
+      include: ['refs/heads/main'],
+      exclude: [],
+    },
+  };
+
+  // Workflow source: fix the platform `repository_id + path + sha`. Per the
+  // required-workflows REST schema the pinned commit is carried in `sha`,
+  // not `ref` — `ref` is reserved for mutable branches/tags and would let
+  // the pin drift silently.
+  const desiredRules = [
+    {
+      type: 'workflows',
+      parameters: {
+        workflows: [
+          {
+            repository_id: input.platformRepoId,
+            path: '.github/workflows/ci-gate.yml',
+            sha: input.pinnedSha,
+          },
+          {
+            repository_id: input.platformRepoId,
+            path: '.github/workflows/pr-hygiene.yml',
+            sha: input.pinnedSha,
+          },
+        ],
+      },
+    },
+  ];
+
+  let rulesetId: number;
+  if (!found) {
+    // Create org ruleset.
+    const resp = (await withRetry(
+      () =>
+        octokit.request('POST /orgs/{org}/rulesets', {
+          org: owner,
+          name: rulesetName,
+          enforcement: input.enforcement,
+          target: 'branch',
+          conditions: desiredConditions,
+          rules: desiredRules,
+          bypass_actors: [],
+        }),
+      'reconcileOrgWorkflowRuleset:create',
+    )) as OrgRulesetResponse;
+
+    if (!resp.id) {
+      throw new Error('reconcileOrgWorkflowRuleset: create returned no id');
+    }
+    rulesetId = resp.id;
+    result.created.push(rulesetName);
+  } else {
+    rulesetId = found.id;
+    // Check if the existing ruleset matches our target/source.
+    // If name matches but target/source differs → conflict (D10/§3.6).
+    const hasConflict = checkOrgRulesetConflict(
+      found,
+      repoId,
+      input.platformRepoId,
+      input.pinnedSha,
+    );
+    if (hasConflict) {
+      throw new Error(
+        `reconcileOrgWorkflowRuleset: conflict — ruleset '${rulesetName}' exists but targets ` +
+          `different repo/source. Refusing to modify shared/unknown ruleset.`,
+      );
+    }
+
+    // Check if enforcement needs update.
+    if (found.enforcement !== input.enforcement) {
+      await withRetry(
+        () =>
+          octokit.request('PUT /orgs/{org}/rulesets/{ruleset_id}', {
+            org: owner,
+            ruleset_id: found.id,
+            name: rulesetName,
+            enforcement: input.enforcement,
+            target: 'branch',
+            conditions: desiredConditions,
+            rules: desiredRules,
+            bypass_actors: [],
+          }),
+        'reconcileOrgWorkflowRuleset:update',
+      );
+      result.updated.push(rulesetName);
+    } else {
+      result.noop.push(rulesetName);
+    }
+  }
+
+  const after = (await withRetry(
+    () =>
+      octokit.request('GET /orgs/{org}/rulesets/{ruleset_id}', {
+        org: owner,
+        ruleset_id: rulesetId,
+      }),
+    'reconcileOrgWorkflowRuleset:readback',
+  )) as OrgRulesetResponse;
+  if (
+    after.name !== rulesetName ||
+    after.target !== 'branch' ||
+    after.enforcement !== input.enforcement ||
+    checkOrgRulesetConflict(after, repoId, input.platformRepoId, input.pinnedSha)
+  ) {
+    throw new Error('reconcileOrgWorkflowRuleset: read-back does not match desired state');
+  }
+
+  return result;
+}
+
+function checkOrgRulesetConflict(
+  existing: OrgRulesetResponse,
+  targetRepoId: number,
+  platformRepoId: number,
+  pinnedSha: string,
+): boolean {
+  // Match the corrected conditions shape: { repository_id: { repository_ids: number[] }, ref_name: ... }.
+  const conditions = existing.conditions ?? {};
+  const repositoryIdCond = conditions.repository_id as { repository_ids?: number[] } | undefined;
+  const repositoryIds = repositoryIdCond?.repository_ids ?? [];
+  if (repositoryIds.length !== 1 || repositoryIds[0] !== targetRepoId) return true;
+  const refName = conditions.ref_name as { include?: string[]; exclude?: string[] } | undefined;
+  if (
+    refName?.include?.length !== 1 ||
+    refName.include[0] !== 'refs/heads/main' ||
+    (refName.exclude?.length ?? 0) !== 0
+  ) {
+    return true;
+  }
+
+  // Check rules for workflow source match. Required workflows carry the
+  // pinned commit in `sha` (not `ref`).
+  const workflowRules = (existing.rules ?? []).filter((rule) => rule.type === 'workflows');
+  if (workflowRules.length !== 1) return true;
+  const params = workflowRules[0]?.parameters as {
+    workflows?: Array<{ repository_id: number; path: string; sha: string }>;
+  };
+  const workflows = params.workflows ?? [];
+  const expectedPaths = new Set([
+    '.github/workflows/ci-gate.yml',
+    '.github/workflows/pr-hygiene.yml',
+  ]);
+  if (workflows.length !== expectedPaths.size) return true;
+  for (const wf of workflows) {
+    if (
+      !expectedPaths.delete(wf.path) ||
+      wf.repository_id !== platformRepoId ||
+      wf.sha.toLowerCase() !== pinnedSha.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+  return expectedPaths.size !== 0;
+}
+
+// ---- upsertBootstrapPull (§3.3: Bootstrap PR with CODEOWNERS) --------------
+
+interface PullResponse {
+  number: number;
+  head: { sha: string; ref: string };
+  html_url: string;
+  state: string;
+}
+
+interface RefResponse {
+  object: { sha: string };
+  ref: string;
+}
+
+/**
+ * Create or update the Bootstrap PR.
+ *
+ * Creates a `sdd/bootstrap` branch from `main`, writes the partitioned
+ * CODEOWNERS mapping (§3.3), and creates a PR targeting `main`.
+ *
+ * If the PR already exists, this is a noop (does not force-push or close).
+ */
+export async function upsertBootstrapPull(
+  octokit: OctokitMutate,
+  input: BootstrapPullInput,
+): Promise<BootstrapPull> {
+  const owner = input.repository.owner;
+  const repo = input.repository.name;
+  const headBranch = input.headBranch; // e.g. 'sdd/bootstrap'
+  const baseBranch = input.baseBranch; // 'main'
+
+  // Check if PR already exists for this head branch.
+  const existingPrs = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/pulls', {
+        owner,
+        repo,
+        head: `${owner}:${headBranch}`,
+        state: 'open',
+        per_page: 10,
+      }),
+    'upsertBootstrapPull:listPRs',
+  )) as PullResponse[];
+
+  if (existingPrs.length > 0) {
+    // PR already exists — noop.
+    const pr = existingPrs[0]!;
+    await requestBootstrapTeamReviewers(octokit, owner, repo, pr.number, input.reviewers);
+    return {
+      number: pr.number,
+      headSha: pr.head.sha,
+      htmlUrl: pr.html_url,
+    };
+  }
+
+  // Read current main HEAD to create branch from.
+  const mainRef = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+        owner,
+        repo,
+        ref: `heads/${baseBranch}`,
+      }),
+    'upsertBootstrapPull:getMainRef',
+  )) as RefResponse;
+
+  const mainSha = mainRef.object.sha;
+
+  // Generate CODEOWNERS content (§3.3).
+  const codeownersContent = generateCodeowners(input.owners, owner);
+
+  // Create blob for CODEOWNERS.
+  const blobResp = (await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/git/blobs', {
+        owner,
+        repo,
+        content: Buffer.from(codeownersContent, 'utf8').toString('base64'),
+        encoding: 'base64',
+      }),
+    'upsertBootstrapPull:createBlob',
+  )) as { sha: string };
+
+  // Get the tree of main HEAD.
+  const commitResp = (await withRetry(
+    () =>
+      octokit.request('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+        owner,
+        repo,
+        commit_sha: mainSha,
+      }),
+    'upsertBootstrapPull:getCommit',
+  )) as { sha: string; tree: { sha: string } };
+
+  // Create new tree with CODEOWNERS update.
+  const treeResp = (await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/git/trees', {
+        owner,
+        repo,
+        base_tree: commitResp.tree.sha,
+        tree: [
+          {
+            path: '.github/CODEOWNERS',
+            mode: '100644',
+            type: 'blob',
+            sha: blobResp.sha,
+          },
+        ],
+      }),
+    'upsertBootstrapPull:createTree',
+  )) as { sha: string };
+
+  // Create commit.
+  const newCommitResp = (await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/git/commits', {
+        owner,
+        repo,
+        message: `sdd-init: bootstrap CODEOWNERS partition [${owner}/${repo}]`,
+        tree: treeResp.sha,
+        parents: [mainSha],
+      }),
+    'upsertBootstrapPull:createCommit',
+  )) as { sha: string };
+
+  // Create or update the branch ref.
+  let _branchCreated = false;
+  try {
+    await withRetry(
+      () =>
+        octokit.request('POST /repos/{owner}/{repo}/git/refs', {
+          owner,
+          repo,
+          ref: `refs/heads/${headBranch}`,
+          sha: newCommitResp.sha,
+        }),
+      'upsertBootstrapPull:createRef',
+    );
+    _branchCreated = true;
+  } catch (err) {
+    const httpErr = err as { status?: number };
+    if (httpErr.status === 422) {
+      // Branch already exists — update it (non-force).
+      await withRetry(
+        () =>
+          octokit.request('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
+            owner,
+            repo,
+            ref: `heads/${headBranch}`,
+            sha: newCommitResp.sha,
+            force: false,
+          }),
+        'upsertBootstrapPull:updateRef',
+      );
+    } else {
+      throw err;
+    }
+  }
+
+  // Create the PR.
+  const prResp = (await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/pulls', {
+        owner,
+        repo,
+        title: input.title,
+        body: input.body,
+        head: headBranch,
+        base: baseBranch,
+        draft: false,
+      }),
+    'upsertBootstrapPull:createPR',
+  )) as PullResponse;
+
+  await requestBootstrapTeamReviewers(octokit, owner, repo, prResp.number, input.reviewers);
+
+  return {
+    number: prResp.number,
+    headSha: prResp.head.sha,
+    htmlUrl: prResp.html_url,
+  };
+}
+
+async function requestBootstrapTeamReviewers(
+  octokit: OctokitMutate,
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  teamReviewers: string[],
+): Promise<void> {
+  if (teamReviewers.length === 0) return;
+  await withRetry(
+    () =>
+      octokit.request('POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers', {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        team_reviewers: [...new Set(teamReviewers)].sort(),
+      }),
+    'upsertBootstrapPull:requestTeamReviewers',
+  );
+}
+
+/**
+ * Generate CODEOWNERS content from the owner mapping (§3.3).
+ *
+ * Uses the full `owners` config to populate each partition; the admins team
+ * covers the wildcard fallback plus `.github/` and `template.lock`. Apps/*
+ * owners fall back to admins when the config does not declare them (the
+ * directories themselves are not created until M3, but the rules are
+ * pre-positioned per §3.3).
+ */
+function generateCodeowners(owners: BootstrapPullInput['owners'], org: string): string {
+  const admins = owners.admins || 'platform-admins';
+  const product = owners.product || admins;
+  const api = owners.api || admins;
+  const design = owners.design || admins;
+  const backend = owners.backend || admins;
+  const web = owners.web || admins;
+  const ios = owners.ios || admins;
+  const android = owners.android || admins;
+
+  const lines = [
+    '# CODEOWNERS — bootstrap partition (§3.3)',
+    '# Each line: path pattern → owner(s)',
+    '',
+    `*               @${org}/${admins}`,
+    `/specs/         @${org}/${product}`,
+    `/projects.yaml  @${org}/${product}`,
+    `/contracts/     @${org}/${api}`,
+    `/design/        @${org}/${design}`,
+    `/AGENTS.md      @${org}/${product}`,
+    `/.github/       @${org}/${admins}`,
+    `/template.lock  @${org}/${admins}`,
+    `/apps/backend/  @${org}/${backend}`,
+    `/apps/web/      @${org}/${web}`,
+    `/apps/ios/      @${org}/${ios}`,
+    `/apps/android/  @${org}/${android}`,
+    '',
+  ];
+  return lines.join('\n');
+}
+
+// ---- Pagination helper -----------------------------------------------------
+
+/**
+ * Paginate through all pages of a GitHub list endpoint. Follows Link headers
+ * up to a budget limit (default 1000 objects) to prevent runaway pagination.
+ */
+async function paginateAll<T>(
+  octokit: OctokitMutate,
+  route: string,
+  params: Record<string, unknown>,
+  label: string,
+  budget = 1000,
+): Promise<T[]> {
+  const results: T[] = [];
+  let page = 1;
+  const perPage = (params.per_page as number) ?? 100;
+
+  while (results.length < budget) {
+    const resp = (await withRetry(
+      () =>
+        octokit.request(route, {
+          ...params,
+          page,
+          per_page: perPage,
+        }),
+      `${label}:page${page}`,
+    )) as T[];
+
+    if (!Array.isArray(resp) || resp.length === 0) break;
+
+    results.push(...resp);
+    if (resp.length < perPage) break; // Last page.
+    page++;
+  }
+
+  return results;
+}
+
+// ---- Factory: build a GitHubWritePort from an OctokitMutate ---------------
+
+/**
+ * Build a `GitHubWritePort` backed by an octokit-like mutation client.
+ *
+ * M2c: all reconcilers are now implemented.
+ */
+export function createWriteGitHubPort(octokit: OctokitMutate): GitHubWritePort {
+  return {
+    createRepository: (input: CreateRepoInput) => createRepository(octokit, input),
+    updateRepositorySettings: (input: RepositorySettingsInput) =>
+      updateRepositorySettings(octokit, input),
+    seedMainViaContents: (input: SeedInput) => seedMainViaContents(octokit, input),
+    publishSnapshot: (input: SnapshotInput) => publishSnapshot(octokit, input),
+    reconcileLabels: (input: LabelsInput) => reconcileLabels(octokit, input),
+    grantTeamPermissions: (input: TeamsInput) => grantTeamPermissions(octokit, input),
+    reconcileEnvironments: (input: EnvironmentsInput) => reconcileEnvironments(octokit, input),
+    reconcileRepositoryRuleset: (input: RulesetInput) => reconcileRepositoryRuleset(octokit, input),
+    reconcileOrgWorkflowRuleset: (input: OrgWorkflowRulesetInput) =>
+      reconcileOrgWorkflowRuleset(octokit, input),
+    upsertBootstrapPull: (input: BootstrapPullInput) => upsertBootstrapPull(octokit, input),
+  };
+}

@@ -179,10 +179,11 @@ sdd product init <product> --mode monorepo --owner <org> \
 # 真建仓（第 1–5 步）
 sdd product init <product> --mode monorepo --owner <org> --platform-ref <tag|sha> [--config ...]
 # 合并 Bootstrap PR 且 check 变绿后，加固 ruleset（第 6 步，幂等）
-sdd product init <product> --owner <org> --finalize-protection
+sdd product init <product> --owner <org> --config product-init.yaml --finalize-protection
 ```
 
-`--config` 给出 `product-init.yaml`（schema 见 §2.8：owner→区域映射、team permission、environment）。
+`--config` 给出 `product-init.yaml`（schema 见 §2.8：owner→区域映射、team permission、environment）；
+init 与 finalize 均必填，finalize 用其中的 `bootstrap.approvers` 验证批准者 team membership。
 **`--platform-ref` 在真实/生产模式必填**（release tag 或完整 commit），统一解析为完整 40 位 commit 并
 钉死；**禁止默认到可移动的 default HEAD**。仅 `--dry-run` 探索可缺省，但报告必须显式标注"未固定 ref，
 仅供预览"。`product` 与 M1 `projects.schema.json` 同 pattern；repo/owner/team slug/路径在任何网络调用前
