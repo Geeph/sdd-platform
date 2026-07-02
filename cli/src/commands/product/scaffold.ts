@@ -561,6 +561,7 @@ export default class ProductScaffold extends Command {
       const mainTreeSha = mainCommitResp.tree.sha;
 
       // D18: main freshness — verify remote projects.yaml matches local.
+      // Fail-closed: missing sha → cannot verify freshness → reject.
       const remoteBlobResp = (await rawClient.request('GET /repos/{owner}/{repo}/contents/{path}', {
         owner: remoteOwner,
         repo: remoteRepo,
@@ -568,8 +569,14 @@ export default class ProductScaffold extends Command {
         ref: mainCommitSha,
         mediaType: { format: 'raw' },
       })) as { content?: string; sha?: string };
+      if (!remoteBlobResp.sha) {
+        this.error('Main freshness check failed: remote projects.yaml has no sha (cannot verify)', {
+          exit: 7,
+        });
+        return;
+      }
       const localBlobSha = await gitReader.blobWorktree(flags.projects);
-      if (remoteBlobResp.sha && remoteBlobResp.sha !== localBlobSha) {
+      if (remoteBlobResp.sha !== localBlobSha) {
         authorization.main_fresh = false;
         authorization.verified = false;
         authorization.reason =
@@ -756,8 +763,11 @@ export default class ProductScaffold extends Command {
           ref: `heads/${branchName}`,
         });
         branchExists = true;
-      } catch {
-        // Branch doesn't exist — we'll create it.
+      } catch (err) {
+        // Only HTTP 404 means branch doesn't exist. Any other error
+        // (network, 403, 500) is a real failure — surface it.
+        const httpStatus = (err as { status?: number }).status;
+        if (httpStatus !== 404) throw err;
       }
 
       if (!branchExists) {
@@ -792,6 +802,9 @@ export default class ProductScaffold extends Command {
       this.exit(4);
       return;
     } catch (err) {
+      // Re-throw oclif exit/error signals so exit codes propagate correctly.
+      const cliErr = err as { oclif?: { exit?: number }; code?: string; exitCode?: number };
+      if (cliErr.oclif?.exit !== undefined || cliErr.code === 'EEXIT') throw err;
       this.error(`scaffold failed: ${(err as Error).message}`, { exit: 6 });
     }
   }

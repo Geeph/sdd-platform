@@ -411,10 +411,12 @@ function parseGateMarker(body: string): GateMarker | null {
  *      that a matching component exists (id/path/template/template_ref).
  *      Mismatch means hygiene fail (the Scaffold PR is stale: main has been
  *      rewritten by a subsequent Architecture Gate).
- *   2. (Layer 2) Full D25 re-rendering against current main component and
- *      pinned template commit. Deferred to a later iteration (requires
- *      additional infrastructure to read platform repo at historical
- *      template_ref commits).
+ *   2. (Layer 2) D25 subtree verification: build expectedFiles[] from the
+ *      lock's files[], fetch the PR head tree SHA, and call
+ *      verifyComponentSubtree to confirm that every file under the
+ *      component path in the PR matches the lock's output_sha256.
+ *      Detects tampered component files even if the lock's own fields
+ *      were also modified.
  *
  * Both layers must pass for Scaffold PR hygiene to be ok.
  */
@@ -509,6 +511,7 @@ async function checkScaffoldPrHygiene(
         component?: { id: string; path: string };
         template?: { name: string };
         source?: { resolved_commit: string };
+        files?: Array<{ path: string; mode: '100644' | '100755'; output_sha256: string }>;
       };
       try {
         const { parse: parseYaml } = await import('yaml');
@@ -543,6 +546,111 @@ async function checkScaffoldPrHygiene(
         violations.push(
           `Scaffold PR stale: '${componentPath}' template_ref changed (lock=${lock.source.resolved_commit}, main=${mainComp.template_ref})`,
         );
+      }
+
+      // Layer 2: D25 subtree verification.
+      // Fetch PR head commit to get its tree SHA, then verify that the
+      // component subtree in the PR matches the lock file's expected files.
+      if (lock.files && lock.files.length > 0) {
+        const headCommit = (await input.octokit.request(
+          'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+          {
+            owner: input.repo.owner,
+            repo: input.repo.repo,
+            commit_sha: prHeadSha,
+          },
+        )) as { sha: string; tree: { sha: string } };
+        const prHeadTreeSha = headCommit.tree.sha;
+
+        // Build a ScaffoldReadPort backed by the octokit.
+        const scaffoldReader: {
+          resolveCommit: (
+            repo: { owner: string; repo: string },
+            ref: string,
+          ) => Promise<{ commit: string; requestedRef: string; peeled: boolean }>;
+          readTemplateTree: () => Promise<never>;
+          observeProduct: () => Promise<never>;
+          readBlobContent: (
+            repo: { owner: string; repo: string },
+            blobSha: string,
+          ) => Promise<Uint8Array>;
+          readTreeRecursive: (
+            repo: { owner: string; repo: string },
+            treeSha: string,
+          ) => Promise<
+            Array<{
+              path: string;
+              mode: '100644' | '100755' | '040000';
+              type: 'blob' | 'tree';
+              sha: string;
+            }>
+          >;
+          findPullByHead: () => Promise<null>;
+        } = {
+          async resolveCommit(_repo, ref) {
+            return { commit: ref, requestedRef: ref, peeled: false };
+          },
+          async readTemplateTree() {
+            throw new Error('not used');
+          },
+          async observeProduct() {
+            throw new Error('not used');
+          },
+          async readBlobContent(repo, blobSha) {
+            const resp = (await input.octokit.request(
+              'GET /repos/{owner}/{repo}/git/blobs/{blob_sha}',
+              { owner: repo.owner, repo: repo.repo, blob_sha: blobSha },
+            )) as { content?: string; encoding?: string };
+            if (!resp.content) throw new Error(`blob not found: ${blobSha}`);
+            if (resp.encoding === 'base64') {
+              return new Uint8Array(Buffer.from(resp.content, 'base64'));
+            }
+            return new Uint8Array(Buffer.from(resp.content, 'utf8'));
+          },
+          async readTreeRecursive(repo, treeSha) {
+            const resp = (await input.octokit.request(
+              'GET /repos/{owner}/{repo}/git/trees/{tree_sha}',
+              { owner: repo.owner, repo: repo.repo, tree_sha: treeSha, recursive: '1' },
+            )) as { tree: Array<{ path: string; mode: string; type: string; sha: string }> };
+            return resp.tree.map((t) => ({
+              path: t.path,
+              mode: t.mode as '100644' | '100755' | '040000',
+              type: t.type as 'blob' | 'tree',
+              sha: t.sha,
+            }));
+          },
+          async findPullByHead() {
+            return null;
+          },
+        };
+
+        // Build expected files from the lock.
+        const expectedFiles = lock.files.map((f) => ({
+          path: f.path,
+          mode: f.mode,
+          output_sha256: f.output_sha256,
+        }));
+
+        // Import verifyComponentSubtree dynamically.
+        try {
+          const { verifyComponentSubtree } = await import('./scaffold/subtree.js');
+          const result = await verifyComponentSubtree({
+            componentPath: lock.component.path,
+            expectedFiles,
+            targetTreeSha: prHeadTreeSha,
+            reader: scaffoldReader,
+            repo: input.repo,
+          });
+          if (!result.ok) {
+            violations.push(
+              `Scaffold PR integrity: '${lock.component.path}' subtree verification failed — ${result.reason}`,
+            );
+          }
+        } catch (err) {
+          violations.push(
+            `Scaffold PR integrity: subtree verification for '${lock.component.path}' threw: ${(err as Error).message}`,
+          );
+        }
       }
     }
 
