@@ -45,62 +45,98 @@ import { createGitHubRequestClient } from '../../github-client.js';
 
 /**
  * Adapter: wrap a raw GitHubRequestClient to match provenance's OctokitLike
- * interface. Only implements the endpoints verifyGateApproval actually uses.
+ * interface. The raw client returns bare JSON; Octokit wraps in { data }.
+ * Each method below wraps the raw response accordingly.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function createOctokitAdapter(owner: string, repo: string): Promise<any> {
   const client = createGitHubRequestClient(process.env.GITHUB_TOKEN as string);
-  const req = client.request.bind(client);
+  async function r<T>(route: string, params: Record<string, unknown> = {}): Promise<{ data: T }> {
+    const body = (await client.request(route, { owner, repo, ...params })) as T;
+    return { data: body };
+  }
   return {
     rest: {
       pulls: {
-        get: (params: { pull_number: number }) =>
-          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}`, {
-            owner,
-            repo,
-            pull_number: params.pull_number,
-          }) as Promise<{ data: unknown }>,
-        listReviews: (params: { pull_number: number; per_page?: number; page?: number }) =>
-          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews`, {
-            owner,
-            repo,
-            pull_number: params.pull_number,
-            per_page: params.per_page,
-            page: params.page,
-          }) as Promise<{ data: unknown }>,
-        listFiles: (params: { pull_number: number; per_page?: number; page?: number }) =>
-          req(`GET /repos/{owner}/{repo}/pulls/{pull_number}/files`, {
-            owner,
-            repo,
-            pull_number: params.pull_number,
-            per_page: params.per_page,
-            page: params.page,
-          }) as Promise<{ data: unknown }>,
+        get: (p: { pull_number: number }) => r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}`),
+        listReviews: (p: { pull_number: number; per_page?: number; page?: number }) =>
+          r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}/reviews`, {
+            per_page: p.per_page,
+            page: p.page,
+          }),
+        listFiles: (p: { pull_number: number; per_page?: number; page?: number }) =>
+          r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}/files`, {
+            per_page: p.per_page,
+            page: p.page,
+          }),
       },
       repos: {
-        getBranch: (params: { branch: string }) =>
-          req(`GET /repos/{owner}/{repo}/branches/{branch}`, {
-            owner,
-            repo,
-            branch: params.branch,
-          }) as Promise<{ data: unknown }>,
+        getBranch: (p: { branch: string }) => r(`GET /repos/{owner}/{repo}/branches/${p.branch}`),
+        listPullRequestsAssociatedWithCommit: (p: {
+          commit_sha: string;
+          per_page?: number;
+          page?: number;
+        }) =>
+          r(`GET /repos/{owner}/{repo}/commits/${p.commit_sha}/pulls`, {
+            per_page: p.per_page,
+            page: p.page,
+          }),
+        getCollaboratorPermissionLevel: (p: { username: string }) =>
+          r(`GET /repos/{owner}/{repo}/collaborators/${p.username}/permission`),
       },
       checks: {
-        listForRef: (params: { ref: string; check_name?: string }) =>
-          req(`GET /repos/{owner}/{repo}/commits/{ref}/check-runs`, {
-            owner,
-            repo,
-            ref: params.ref,
-            check_name: params.check_name,
-          }) as Promise<{ data: unknown }>,
+        listForRef: (p: { ref: string; per_page?: number; page?: number }) =>
+          r(`GET /repos/{owner}/{repo}/commits/${p.ref}/check-runs`, {
+            per_page: p.per_page,
+            page: p.page,
+          }),
       },
       teams: {
-        listMembersInOrg: (params: { org: string; team_slug: string; per_page?: number }) =>
-          req(`GET /orgs/{org}/teams/{team_slug}/members`, {
-            org: params.org,
-            team_slug: params.team_slug,
-            per_page: params.per_page,
-          }) as Promise<{ data: unknown }>,
+        getByName: (p: { org: string; team_slug: string }) =>
+          (async () => {
+            const body = (await client.request(`GET /orgs/${p.org}/teams/${p.team_slug}`)) as {
+              id: number;
+              slug: string;
+              privacy?: string;
+            };
+            return { data: body };
+          })(),
+        checkPermissionsForRepoInOrg: (p: {
+          org: string;
+          team_slug: string;
+          owner: string;
+          repo: string;
+          headers?: { accept: string };
+        }) =>
+          (async () => {
+            const body = (await client.request(
+              `GET /orgs/${p.org}/teams/${p.team_slug}/repos/${p.owner}/${p.repo}`,
+              p.headers ? { headers: p.headers } : undefined,
+            )) as {
+              permissions?: {
+                admin: boolean;
+                pull: boolean;
+                push: boolean;
+                triage?: boolean;
+                maintain?: boolean;
+              };
+              role_name?: string;
+            };
+            return { data: body };
+          })(),
+        listMembersInOrg: (p: {
+          org: string;
+          team_slug: string;
+          per_page?: number;
+          page?: number;
+        }) =>
+          (async () => {
+            const body = (await client.request(`GET /orgs/${p.org}/teams/${p.team_slug}/members`, {
+              per_page: p.per_page,
+              page: p.page,
+            })) as Array<{ login: string }>;
+            return { data: body };
+          })(),
       },
     },
   };
@@ -504,9 +540,6 @@ export default class ProductScaffold extends Command {
 
       authorization.verified = true;
       authorization.reason = null;
-      if (verifyResult.ok && 'pr' in verifyResult) {
-        // The verifyResult has provenance data.
-      }
 
       this.log('Authorization verified. Resolving templates from platform repo...');
 
@@ -558,7 +591,31 @@ export default class ProductScaffold extends Command {
         existingPaths.add(entry.path);
       }
 
-      // Resolve templates from platform repo.
+      // D23: verify owner teams exist and have members.
+      const teamSlugs = new Set(projects.components.map((c) => c.owner));
+      for (const slug of teamSlugs) {
+        try {
+          const membersResp = (await octokit.rest.teams.listMembersInOrg({
+            org: remoteOwner,
+            team_slug: slug,
+            per_page: 1,
+          })) as { data: Array<{ login: string }> };
+          if (!membersResp.data || membersResp.data.length === 0) {
+            this.error(`Team '${slug}' has no active members — cannot assign as reviewer (D23).`, {
+              exit: 3,
+            });
+            return;
+          }
+        } catch (err) {
+          this.error(
+            `Team '${slug}' does not exist or is inaccessible (D23): ${(err as Error).message}`,
+            { exit: 3 },
+          );
+          return;
+        }
+      }
+
+      // Resolve templates from platform repo, verifying checksums.
       const sourceTemplates = new Map<string, ResolvedTemplate>();
       for (const comp of projects.components) {
         const tmplName = comp.template;
@@ -571,15 +628,17 @@ export default class ProductScaffold extends Command {
           mediaType: { format: 'raw' },
         })) as { content?: string };
         if (!manifestResp.content) {
-          this.warn(
+          this.error(
             `Component '${comp.id}': manifest not found for ${tmplName} at ${comp.template_ref}`,
+            { exit: 5 },
           );
-          continue;
+          return;
         }
         const manifest = parseManifest(
           JSON.parse(Buffer.from(manifestResp.content, 'base64').toString('utf8')),
         );
         const entries: Array<{ path: string; mode: '100644' | '100755'; content: Uint8Array }> = [];
+        const errors: string[] = [];
         for (const mf of manifest.files) {
           const fileResp = (await rawClient.request('GET /repos/{owner}/{repo}/contents/{path}', {
             owner: platformParts[0]!,
@@ -591,11 +650,19 @@ export default class ProductScaffold extends Command {
           if (!fileResp.content) {
             throw new Error(`file ${mf.path} not found in ${tmplName} at ${comp.template_ref}`);
           }
-          entries.push({
-            path: mf.path,
-            mode: mf.mode,
-            content: Buffer.from(fileResp.content, 'base64'),
-          });
+          const content = Buffer.from(fileResp.content, 'base64');
+          const actual = sha256Hex(content);
+          if (actual !== mf.sha256) {
+            errors.push(`checksum mismatch on ${mf.path}: expected ${mf.sha256}, got ${actual}`);
+          }
+          entries.push({ path: mf.path, mode: mf.mode, content: new Uint8Array(content) });
+        }
+        if (errors.length > 0) {
+          this.error(
+            `Component '${comp.id}' template checksum verification failed:\n${errors.join('\n')}`,
+            { exit: 5 },
+          );
+          return;
         }
         sourceTemplates.set(comp.id, {
           componentId: comp.id,
@@ -635,13 +702,7 @@ export default class ProductScaffold extends Command {
         ...(flags['architecture-version'] ? { version: flags['architecture-version'] } : {}),
         ...(verifyResult.ok
           ? {
-              provenance: {
-                pr: (verifyResult as { pr?: number }).pr ?? 0,
-                approved_head_sha: '',
-                merge_commit_sha: '',
-                approved_at: '',
-                authorization_policy: 'current-codeowners',
-              },
+              provenance: verifyResult.provenance,
             }
           : {}),
         generator: {
@@ -686,18 +747,35 @@ export default class ProductScaffold extends Command {
         });
       }
 
-      this.log(`Publishing branch ${branchName}...`);
-      const publishResult = await publishComponentBranch(rawClient, {
-        target: { owner: remoteOwner, repo: remoteRepo },
-        baseTreeSha: mainTreeSha,
-        baseCommitSha: mainCommitSha,
-        branchName,
-        files,
-        commitMessage: `sdd-scaffold: ${pendingComponents.map((c) => c.id).join(', ')}`,
-        allowedPaths,
-      });
+      // D20: check if branch already exists before creating it.
+      let branchExists = false;
+      try {
+        await rawClient.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
+          owner: remoteOwner,
+          repo: remoteRepo,
+          ref: `heads/${branchName}`,
+        });
+        branchExists = true;
+      } catch {
+        // Branch doesn't exist — we'll create it.
+      }
 
-      // Open PR.
+      if (!branchExists) {
+        this.log(`Publishing branch ${branchName}...`);
+        await publishComponentBranch(rawClient, {
+          target: { owner: remoteOwner, repo: remoteRepo },
+          baseTreeSha: mainTreeSha,
+          baseCommitSha: mainCommitSha,
+          branchName,
+          files,
+          commitMessage: `sdd-scaffold: ${pendingComponents.map((c) => c.id).join(', ')}`,
+          allowedPaths,
+        });
+      } else {
+        this.log(`Branch ${branchName} already exists — skipping branch creation (D20).`);
+      }
+
+      // Open PR (idempotent — upsertScaffoldPull checks for existing).
       const prResult = await upsertScaffoldPull(rawClient, {
         target: { owner: remoteOwner, repo: remoteRepo },
         headBranch: branchName,
