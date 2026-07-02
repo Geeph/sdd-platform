@@ -1,0 +1,61 @@
+# iOS platform reusable workflow (M4, §1).
+#
+# Called by ci-gate.yml for each iOS component. Checks out the product
+# repo at the head SHA and runs the iOS command contract from M3.
+#
+# Tool versions locked to M3: Xcode 16.x, Tuist, SwiftLint.
+# runs-on: macos-14 (D14: only allocated when ios=true).
+
+on:
+  workflow_call:
+    inputs:
+      product_repo:
+        description: 'Product repository (owner/name)'
+        type: string
+        required: true
+      head_sha:
+        description: 'PR head commit SHA'
+        type: string
+        required: true
+      paths:
+        description: 'JSON array of component paths to build'
+        type: string
+        required: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        path: ${{ fromJSON(inputs.paths) }}
+      fail-fast: false
+    runs-on: macos-14   # D14: 外层 if 保证只有 ios=true 时才调度
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - name: checkout product repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.product_repo }}
+          ref: ${{ inputs.head_sha }}
+          # D24: default GITHUB_TOKEN (前提: 隔离环境 spike 验证通过)
+
+      - name: select xcode (D23)
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: install tuist (D23)
+        run: |
+          curl -Ls https://install.tuist.io | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: install swiftlint (D23)
+        run: brew install swiftlint
+
+      - name: lint (swiftlint)
+        run: swiftlint
+
+      - name: build (tuist build)
+        run: tuist build
+
+      - name: test (tuist test)
+        run: tuist test

@@ -1,0 +1,65 @@
+# Android platform reusable workflow (M4, §1).
+#
+# Called by ci-gate.yml for each Android component. Checks out the product
+# repo at the head SHA and runs the Android command contract from M3.
+#
+# Tool versions locked to M3: Java 21, Android SDK (compileSdk 35, AGP 8.5.2).
+
+on:
+  workflow_call:
+    inputs:
+      product_repo:
+        description: 'Product repository (owner/name)'
+        type: string
+        required: true
+      head_sha:
+        description: 'PR head commit SHA'
+        type: string
+        required: true
+      paths:
+        description: 'JSON array of component paths to build'
+        type: string
+        required: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        path: ${{ fromJSON(inputs.paths) }}
+      fail-fast: false
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - name: checkout product repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.product_repo }}
+          ref: ${{ inputs.head_sha }}
+          # D24: default GITHUB_TOKEN (前提: 隔离环境 spike 验证通过)
+
+      - name: setup java (D23)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'   # M3 §0 D1: Java 21 LTS
+
+      - name: cache gradle wrapper
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: gradle-android-${{ runner.os }}-${{ hashFiles(format('{0}/gradle/wrapper/gradle-wrapper.properties', matrix.path)) }}
+          restore-keys: |
+            gradle-android-${{ runner.os }}-
+
+      - name: lint (./gradlew lint)
+        run: ./gradlew lint
+
+      - name: test (./gradlew testDebugUnitTest)
+        run: ./gradlew testDebugUnitTest
+
+      - name: build (./gradlew assembleDebug)
+        run: ./gradlew assembleDebug

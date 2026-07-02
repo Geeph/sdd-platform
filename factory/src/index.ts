@@ -10,8 +10,26 @@
  *      publishSnapshot) + applyInitPlan state machine.
  */
 
+// Detect platforms (M4)
+export type { DetectInput, DetectResult } from './detect.js';
+export { detectPlatforms } from './detect.js';
 // Gate hygiene (M2c)
 export { checkPrHygiene } from './gate-hygiene.js';
+// GitHub minimal client (M4, D16)
+export type {
+  ChangedFileEntry,
+  MinimalOctokit,
+  PullRequestInfo,
+} from './github-minimal-client.js';
+export {
+  fetchBlobAtRef,
+  fetchChangedFiles,
+  fetchPullRequest,
+  fetchRecursiveTree,
+  OPERATION_ID_RE,
+  REQ_ID_RE,
+  SCR_ID_RE,
+} from './github-minimal-client.js';
 // Read port
 export type { OctokitReadOnly } from './github-read.js';
 export { createReadonlyGitHubPort } from './github-read.js';
@@ -30,6 +48,16 @@ export {
   updateRepositorySettings,
   upsertBootstrapPull,
 } from './github-write.js';
+// Impact analysis (M4)
+export type { ChangedPath, ComputeImpactInput, ImpactReader } from './impact.js';
+export {
+  computeImpact,
+  createApiImpactReader,
+  createLocalGitImpactReader,
+  diffDesignScreens,
+  diffOpenApiOperationsAsync,
+  diffRequirementSections,
+} from './impact.js';
 // Init orchestrator (M2b + M2c)
 export type { ApplyInitPlanDeps, FinalizeConfig } from './init.js';
 export { applyInitPlan, finalizeProtection } from './init.js';

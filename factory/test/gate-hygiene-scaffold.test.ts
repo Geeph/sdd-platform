@@ -147,11 +147,12 @@ components:
           merged: false,
           merge_commit_sha: null,
           head: { sha: SCAFFOLD_HEAD, ref: 'sdd/scaffold' },
-          base: { sha: GATE_MERGE, ref: 'main' },
+          base: { sha: GATE_MERGE, ref: 'main', repo: { full_name: 'acme/demo' } },
           labels: [],
           body: null,
           user: { login: 'author' },
           merged_at: null,
+          changed_files: 1,
         };
       }
       return {
@@ -159,10 +160,11 @@ components:
         state: 'closed',
         merged: true,
         merge_commit_sha: GATE_MERGE,
-        head: { sha: GATE_HEAD, ref: 'architecture' },
-        base: { sha: GATE_BASE, ref: 'main' },
+        head: { sha: GATE_HEAD, ref: 'architecture', repo: { full_name: 'acme/demo' } },
+        base: { sha: GATE_BASE, ref: 'main', repo: { full_name: 'acme/demo' } },
         labels: [{ name: 'gate:architecture' }, { name: 'version:v1' }],
         merged_at: provenance.approved_at,
+        changed_files: 1,
       };
     }
     if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}/files') {
