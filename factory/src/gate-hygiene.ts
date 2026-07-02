@@ -449,6 +449,7 @@ async function checkScaffoldPrHygiene(
 
     // Parse main's projects.yaml (use YAML parser).
     let mainProjects: {
+      product?: string;
       components?: Array<{ id: string; path: string; template: string; template_ref: string }>;
     };
     try {
@@ -508,9 +509,9 @@ async function checkScaffoldPrHygiene(
 
       // Parse lock YAML.
       let lock: {
-        component?: { id: string; path: string };
+        component?: { id: string; path: string; owner: string };
         template?: { name: string };
-        source?: { resolved_commit: string };
+        source?: { repository: string; resolved_commit: string };
         files?: Array<{ path: string; mode: '100644' | '100755'; output_sha256: string }>;
       };
       try {
@@ -548,109 +549,211 @@ async function checkScaffoldPrHygiene(
         );
       }
 
-      // Layer 2: D25 subtree verification.
-      // Fetch PR head commit to get its tree SHA, then verify that the
-      // component subtree in the PR matches the lock file's expected files.
-      if (lock.files && lock.files.length > 0) {
-        const headCommit = (await input.octokit.request(
-          'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
-          {
-            owner: input.repo.owner,
-            repo: input.repo.repo,
-            commit_sha: prHeadSha,
-          },
-        )) as { sha: string; tree: { sha: string } };
-        const prHeadTreeSha = headCommit.tree.sha;
+      // Verify lock.component.path matches the directory where template.lock lives.
+      if (lock.component.path !== componentPath) {
+        violations.push(
+          `Scaffold PR integrity: '${lockFile.filename}' claims component.path='${lock.component.path}' but lives under '${componentPath}'`,
+        );
+        continue;
+      }
 
-        // Build a ScaffoldReadPort backed by the octokit.
-        const scaffoldReader: {
-          resolveCommit: (
-            repo: { owner: string; repo: string },
-            ref: string,
-          ) => Promise<{ commit: string; requestedRef: string; peeled: boolean }>;
-          readTemplateTree: () => Promise<never>;
-          observeProduct: () => Promise<never>;
-          readBlobContent: (
-            repo: { owner: string; repo: string },
-            blobSha: string,
-          ) => Promise<Uint8Array>;
-          readTreeRecursive: (
-            repo: { owner: string; repo: string },
-            treeSha: string,
-          ) => Promise<
-            Array<{
-              path: string;
-              mode: '100644' | '100755' | '040000';
-              type: 'blob' | 'tree';
-              sha: string;
-            }>
-          >;
-          findPullByHead: () => Promise<null>;
-        } = {
-          async resolveCommit(_repo, ref) {
-            return { commit: ref, requestedRef: ref, peeled: false };
+      // Layer 2: Independent re-rendering.
+      // Fetch the template manifest from the platform repo at template_ref,
+      // render the template with the component context, then verify that the
+      // PR subtree matches the independently computed expected files.
+      //
+      // This is NOT self-proving: we re-derive expected files from the platform
+      // repo (trusted source), not from the lock (untrusted PR content).
+      const platformRepo = lock.source.repository;
+      const [platformOwner, platformRepoName] = platformRepo.split('/');
+      if (!platformOwner || !platformRepoName) {
+        violations.push(`${lockFile.filename} has invalid source.repository '${platformRepo}'`);
+        continue;
+      }
+
+      // Fetch template manifest from platform repo at template_ref.
+      const templateName = lock.template.name;
+      const templateManifestPath = `templates/${templateName}.manifest.json`;
+      let manifestContent: string;
+      try {
+        const manifestResp = (await input.octokit.request(
+          'GET /repos/{owner}/{repo}/contents/{path}',
+          {
+            owner: platformOwner,
+            repo: platformRepoName,
+            path: templateManifestPath,
+            ref: lock.source.resolved_commit,
+            mediaType: { format: 'raw' },
           },
-          async readTemplateTree() {
-            throw new Error('not used');
-          },
-          async observeProduct() {
-            throw new Error('not used');
-          },
-          async readBlobContent(repo, blobSha) {
-            const resp = (await input.octokit.request(
-              'GET /repos/{owner}/{repo}/git/blobs/{blob_sha}',
-              { owner: repo.owner, repo: repo.repo, blob_sha: blobSha },
-            )) as { content?: string; encoding?: string };
-            if (!resp.content) throw new Error(`blob not found: ${blobSha}`);
-            if (resp.encoding === 'base64') {
-              return new Uint8Array(Buffer.from(resp.content, 'base64'));
-            }
-            return new Uint8Array(Buffer.from(resp.content, 'utf8'));
-          },
-          async readTreeRecursive(repo, treeSha) {
-            const resp = (await input.octokit.request(
-              'GET /repos/{owner}/{repo}/git/trees/{tree_sha}',
-              { owner: repo.owner, repo: repo.repo, tree_sha: treeSha, recursive: '1' },
-            )) as { tree: Array<{ path: string; mode: string; type: string; sha: string }> };
-            return resp.tree.map((t) => ({
-              path: t.path,
-              mode: t.mode as '100644' | '100755' | '040000',
-              type: t.type as 'blob' | 'tree',
-              sha: t.sha,
-            }));
-          },
-          async findPullByHead() {
-            return null;
-          },
+        )) as { content?: string; encoding?: string };
+        if (!manifestResp.content) {
+          violations.push(
+            `Scaffold PR integrity: cannot read template manifest '${templateManifestPath}' at ${lock.source.resolved_commit}`,
+          );
+          continue;
+        }
+        manifestContent =
+          manifestResp.encoding === 'base64'
+            ? Buffer.from(manifestResp.content, 'base64').toString('utf8')
+            : manifestResp.content;
+      } catch (err) {
+        violations.push(
+          `Scaffold PR integrity: template manifest fetch failed: ${(err as Error).message}`,
+        );
+        continue;
+      }
+
+      let templateManifest: {
+        template: string;
+        path: string;
+        tree_sha256: string;
+        files: Array<{ path: string; mode: '100644' | '100755'; render: boolean; sha256: string }>;
+      };
+      try {
+        const { parse: parseYaml } = await import('yaml');
+        // Parse manifest as JSON (manifests are stored as JSON).
+        templateManifest = JSON.parse(manifestContent) as typeof templateManifest;
+      } catch {
+        violations.push(`Scaffold PR integrity: cannot parse template manifest`);
+        continue;
+      }
+
+      // Fetch each template file from platform repo.
+      const templateFiles: Array<{
+        path: string;
+        mode: '100644' | '100755';
+        content: Uint8Array;
+        render: boolean;
+      }> = [];
+      for (const mf of templateManifest.files) {
+        try {
+          const fileResp = (await input.octokit.request(
+            'GET /repos/{owner}/{repo}/contents/{path}',
+            {
+              owner: platformOwner,
+              repo: platformRepoName,
+              path: `${templateManifest.path}/${mf.path}`,
+              ref: lock.source.resolved_commit,
+              mediaType: { format: 'raw' },
+            },
+          )) as { content?: string; encoding?: string };
+          if (!fileResp.content) {
+            violations.push(
+              `Scaffold PR integrity: template file '${mf.path}' not found at ${lock.source.resolved_commit}`,
+            );
+            continue;
+          }
+          const raw =
+            fileResp.encoding === 'base64'
+              ? Buffer.from(fileResp.content, 'base64')
+              : Buffer.from(fileResp.content, 'utf8');
+          templateFiles.push({
+            path: mf.path,
+            mode: mf.mode,
+            content: new Uint8Array(raw),
+            render: mf.render,
+          });
+        } catch {
+          violations.push(`Scaffold PR integrity: template file '${mf.path}' fetch failed`);
+        }
+      }
+
+      // Render the template with the component context.
+      try {
+        const { renderComponent } = await import('./scaffold/render.js');
+        const { TEMPLATE_NAMES } = await import('./types.js');
+
+        // Validate template name is in the closed set
+        const templateName = lock.template.name;
+        if (!TEMPLATE_NAMES.includes(templateName as any)) {
+          violations.push(`Scaffold PR integrity: invalid template name '${templateName}'`);
+          continue;
+        }
+
+        // Validate template manifest structure
+        const templateManifestTyped = {
+          template: templateManifest.template as any,
+          path: templateManifest.path,
+          tree_sha256: templateManifest.tree_sha256,
+          files: templateManifest.files.map((f) => ({
+            ...f,
+            mode: f.mode as '100644' | '100755',
+          })),
         };
 
-        // Build expected files from the lock.
-        const expectedFiles = lock.files.map((f) => ({
+        const rendered = renderComponent({
+          product: (mainProjects as any).product ?? '',
+          repo: input.repo.owner,
+          platformRepo,
+          component: {
+            id: lock.component.id,
+            path: lock.component.path,
+            template: templateName as any,
+            template_ref: lock.source.resolved_commit,
+            owner: lock.component.owner,
+            ci: 'java', // We don't have ci in the lock; render doesn't use it.
+          },
+          resolvedTemplate: {
+            componentId: lock.component.id,
+            commit: lock.source.resolved_commit,
+            manifest: templateManifestTyped as any,
+            tree: templateFiles.map((f) => ({
+              path: f.path,
+              mode: f.mode,
+              content: f.content,
+            })),
+            sourceTreeSha256: templateManifestTyped.tree_sha256,
+          },
+          generator: {
+            package: '@sdd/factory',
+            version: '0.1.0',
+          },
+          approval: { pr: 0 },
+          version: 'v1',
+        });
+
+        // Build expected files from the independent render (including template.lock).
+        const expectedFiles = rendered.files.map((f) => ({
           path: f.path,
           mode: f.mode,
           output_sha256: f.output_sha256,
         }));
 
-        // Import verifyComponentSubtree dynamically.
-        try {
-          const { verifyComponentSubtree } = await import('./scaffold/subtree.js');
-          const result = await verifyComponentSubtree({
-            componentPath: lock.component.path,
-            expectedFiles,
-            targetTreeSha: prHeadTreeSha,
-            reader: scaffoldReader,
-            repo: input.repo,
-          });
-          if (!result.ok) {
-            violations.push(
-              `Scaffold PR integrity: '${lock.component.path}' subtree verification failed — ${result.reason}`,
-            );
-          }
-        } catch (err) {
+        // Compute lock file sha256 from the rendered lock YAML.
+        const { sha256Hex } = await import('./resolve.js');
+        const lockSha256 = sha256Hex(new TextEncoder().encode(rendered.lockYaml));
+        expectedFiles.push({
+          path: 'template.lock',
+          mode: '100644' as const,
+          output_sha256: lockSha256,
+        });
+
+        // Fetch PR head commit tree.
+        const headCommit = (await input.octokit.request(
+          'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+          { owner: input.repo.owner, repo: input.repo.repo, commit_sha: prHeadSha },
+        )) as { sha: string; tree: { sha: string } };
+
+        const scaffoldReader = buildOctokitScaffoldReader(input);
+
+        const { verifyComponentSubtree } = await import('./scaffold/subtree.js');
+        const result = await verifyComponentSubtree({
+          componentPath: lock.component.path,
+          expectedFiles,
+          targetTreeSha: headCommit.tree.sha,
+          reader: scaffoldReader,
+          repo: input.repo,
+        });
+
+        if (!result.ok) {
           violations.push(
-            `Scaffold PR integrity: subtree verification for '${lock.component.path}' threw: ${(err as Error).message}`,
+            `Scaffold PR integrity: '${lock.component.path}' subtree verification failed — ${result.reason}`,
           );
         }
+      } catch (err) {
+        violations.push(
+          `Scaffold PR integrity: re-rendering for '${lock.component.path}' threw: ${(err as Error).message}`,
+        );
       }
     }
 
@@ -662,6 +765,72 @@ async function checkScaffoldPrHygiene(
     violations.push(`Scaffold PR hygiene failed: ${(err as Error).message}`);
     return { ok: false, violations };
   }
+}
+
+/**
+ * Build a ScaffoldReadPort backed by octokit for the product repo.
+ */
+function buildOctokitScaffoldReader(input: HygieneInput): {
+  resolveCommit: (
+    repo: { owner: string; repo: string },
+    ref: string,
+  ) => Promise<{ commit: string; requestedRef: string; peeled: boolean }>;
+  readTemplateTree: () => Promise<never>;
+  observeProduct: () => Promise<never>;
+  readBlobContent: (repo: { owner: string; repo: string }, blobSha: string) => Promise<Uint8Array>;
+  readTreeRecursive: (
+    repo: { owner: string; repo: string },
+    treeSha: string,
+  ) => Promise<
+    Array<{
+      path: string;
+      mode: '100644' | '100755' | '040000';
+      type: 'blob' | 'tree';
+      sha: string;
+    }>
+  >;
+  findPullByHead: () => Promise<null>;
+} {
+  return {
+    async resolveCommit(_repo, ref) {
+      return { commit: ref, requestedRef: ref, peeled: false };
+    },
+    async readTemplateTree() {
+      throw new Error('not used');
+    },
+    async observeProduct() {
+      throw new Error('not used');
+    },
+    async readBlobContent(repo, blobSha) {
+      const resp = (await input.octokit.request('GET /repos/{owner}/{repo}/git/blobs/{blob_sha}', {
+        owner: repo.owner,
+        repo: repo.repo,
+        blob_sha: blobSha,
+      })) as { content?: string; encoding?: string };
+      if (!resp.content) throw new Error(`blob not found: ${blobSha}`);
+      if (resp.encoding === 'base64') {
+        return new Uint8Array(Buffer.from(resp.content, 'base64'));
+      }
+      return new Uint8Array(Buffer.from(resp.content, 'utf8'));
+    },
+    async readTreeRecursive(repo, treeSha) {
+      const resp = (await input.octokit.request('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
+        owner: repo.owner,
+        repo: repo.repo,
+        tree_sha: treeSha,
+        recursive: '1',
+      })) as { tree: Array<{ path: string; mode: string; type: string; sha: string }> };
+      return resp.tree.map((t) => ({
+        path: t.path,
+        mode: t.mode as '100644' | '100755' | '040000',
+        type: t.type as 'blob' | 'tree',
+        sha: t.sha,
+      }));
+    },
+    async findPullByHead() {
+      return null;
+    },
+  };
 }
 
 interface ChangedFile {
