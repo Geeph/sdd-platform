@@ -64,6 +64,20 @@ describe('projects.schema.json', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('rejects template_ref that is not a 40-hex commit SHA (D19)', async () => {
+    const data = await loadFixture('projects-bad-template-ref.yaml');
+    const result = await validateProjectsDocument(data);
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.path.includes('template_ref'))).toBe(true);
+  });
+
+  it('rejects owner that is not a lowercase kebab team slug (D23)', async () => {
+    const data = await loadFixture('projects-bad-owner.yaml');
+    const result = await validateProjectsDocument(data);
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.path.includes('owner'))).toBe(true);
+  });
+
   it('rejects extra properties', async () => {
     const data = {
       schema_version: 1,

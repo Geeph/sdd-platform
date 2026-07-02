@@ -1,0 +1,79 @@
+{
+  "template": "spring-boot",
+  "path": "templates/spring-boot",
+  "tree_sha256": "sha256:8f8b59b6b13b5d09bfe4f787de8d0360a442909ba2f3ce9f970a35584909e8b6",
+  "files": [
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:daf246429cb65ea65715a524f747d1c3e8e096142172881c20da95cab965d2ae"
+    },
+    {
+      "path": "build.gradle.kts",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:c8a7486c23ede98250f41225e3e68db85347d68f302c11528bcdf1a317d35b22"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.jar",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
+    },
+    {
+      "path": "gradle/wrapper/gradle-wrapper.properties",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:f0b2060d483a15e115abfa1f99bc271a9a5e09be5c33f2714eda59a3d2e9d7cf"
+    },
+    {
+      "path": "gradlew",
+      "mode": "100755",
+      "render": false,
+      "sha256": "sha256:6381155bb1621e2d11a5371aa94efe9e1b12d0066520da424d847a816d69f240"
+    },
+    {
+      "path": "gradlew.bat",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:0e13ac7f2e81a6b90b249dc0598d693d0e9a50dba9b56183afd2574cb03da690"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:2f2d181b56e2cd3adcb529686216beaf6e884023f05da8bef4f4fb42aea18fe3"
+    },
+    {
+      "path": "settings.gradle.kts",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:62fc003ca87af41d86a36abb061b21292bb1757ce228ead2959f3dfb229c3ff6"
+    },
+    {
+      "path": "src/main/java/dev/sdd/Application.java",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:b4832d696234984715d02020f9b7daa002676abc349f1bf815fc850c3abe2cca"
+    },
+    {
+      "path": "src/main/java/dev/sdd/HealthController.java",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:c8c9af5e7b590373bd7f31c78a48bb23d1a09fbd2d90f2c5e9d680b7dd397fd2"
+    },
+    {
+      "path": "src/main/resources/application.yml",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:661d544ea56c895ca4e86af9b80e66d94171d98770619e7e54df9ea535147542"
+    },
+    {
+      "path": "src/test/java/dev/sdd/HealthControllerTest.java",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:a0a080015e7958336975f29a21ace78584a3bae67b2a5eaa36460e2afc4527e5"
+    }
+  ]
+}

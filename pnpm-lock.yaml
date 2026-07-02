@@ -44,6 +44,9 @@ importers:
       '@sdd/factory':
         specifier: workspace:*
         version: link:../factory
+      '@sdd/provenance':
+        specifier: workspace:*
+        version: link:../provenance
       '@sdd/schemas':
         specifier: workspace:*
         version: link:../schemas
@@ -66,6 +69,9 @@ importers:
 
   factory:
     dependencies:
+      '@sdd/provenance':
+        specifier: workspace:*
+        version: link:../provenance
       '@sdd/schemas':
         specifier: workspace:*
         version: link:../schemas

@@ -1,0 +1,97 @@
+{
+  "template": "web",
+  "path": "templates/web",
+  "tree_sha256": "sha256:5d896a67dc0c72a725dc47ce380644c680b8a9e5bfbad12d36a0ad644be386fb",
+  "files": [
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:dd70969fb0e63258af71d960052e6de9ff66ef389bf584e52e8b52dd6d85b1a6"
+    },
+    {
+      "path": ".nvmrc",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:68ca3fba3b7e864770cb61aeb306d4bd4354b68ab4dd38450860c5d823e42a53"
+    },
+    {
+      "path": "biome.json",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:75efa3256a4bc2ad51b39a33a34cd5e1fa4ebc9a80e18249f43d52a182cf84c0"
+    },
+    {
+      "path": "index.html",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:3fea09470c64c7ca362e92856e07d26ed89c16b6f8d3013f5711dbafd7dd904a"
+    },
+    {
+      "path": "package.json",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:cbad8949385a04b6b433a4cc6628e8d61ff56926f7cfbb62425a17ad06d5baaa"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:7683d75eb923139127057ad2781f72b47cca4e7c1bab1dfad28a1c82c0dfce26"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:fd3a67dfb939a0495e1ae17626e7037b21c3ec793fa44b8b79ce9eec27b109aa"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:175aaae6656448c0ba642582c969e6bf7c1bf36d66ee22521c6d3b14844e8590"
+    },
+    {
+      "path": "src/App.test.tsx",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:701ba11c8aa8f7c4d7de92557bbdcf6730892966b2db224e2426ea051dfbe342"
+    },
+    {
+      "path": "src/App.tsx",
+      "mode": "100644",
+      "render": true,
+      "sha256": "sha256:763b832b72b5fdd97692d3357ba95078d736282d9d90e36ac74c0329e432f5bf"
+    },
+    {
+      "path": "src/main.tsx",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:29bd5da272c2b718254776a80ecf707fec44d1cedd2a4f11a48bcbbebeea379f"
+    },
+    {
+      "path": "src/test-setup.ts",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:a46d66851af2c056e805fdd574bf5ec3adb1181c43c5e41f0a1c592e338afe64"
+    },
+    {
+      "path": "tsconfig.json",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:8baef6f72d5ad0f799a0a688474f70cc4c04d7e8e4b9d0fc31f9ffe7e3e3a8a4"
+    },
+    {
+      "path": "vite.config.ts",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:efd5952d59c7b239a390fb094d525430ccb9a1b4f4f229b5e891bac32315f642"
+    },
+    {
+      "path": "vitest.config.ts",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:6dad9785399b5fee01864c7b0d9d066fbc625b1701c3ba682271d7aed2313fca"
+    }
+  ]
+}

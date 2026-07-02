@@ -15,9 +15,13 @@ import type {
   TemplateManifest,
   TemplateTreeEntry,
 } from './types.js';
+import { TEMPLATE_NAMES, type TemplateName } from './types.js';
 
 const SHA256_HEX_RE = /^sha256:[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
+
+/** Known binary files permitted in templates (e.g. Gradle wrapper JAR). */
+const ALLOWED_BINARY_FILES = new Set(['gradle/wrapper/gradle-wrapper.jar']);
 
 export function isSha256(s: string): boolean {
   return SHA256_HEX_RE.test(s);
@@ -60,8 +64,10 @@ export async function resolveRef(
  *  - tree_sha256 matches recomputed digest of the sorted file list
  */
 export function validateManifest(manifest: TemplateManifest): void {
-  if (manifest.template !== 'monorepo-root') {
-    throw new Error(`manifest.template must be 'monorepo-root', got '${manifest.template}'`);
+  if (!(TEMPLATE_NAMES as readonly string[]).includes(manifest.template)) {
+    throw new Error(
+      `manifest.template must be one of [${TEMPLATE_NAMES.join(', ')}], got '${manifest.template}'`,
+    );
   }
   if (!isSha256(manifest.tree_sha256)) {
     throw new Error(`manifest.tree_sha256 is malformed: ${manifest.tree_sha256}`);
@@ -134,11 +140,17 @@ export function assembleTree(
         `source blob checksum mismatch on ${mf.path}: manifest=${mf.sha256}, actual=${actual}`,
       );
     }
-    // Reject binary / CRLF content.
-    if (entry.content instanceof Uint8Array && entry.content.includes(0)) {
-      throw new Error(`binary content rejected on ${mf.path}`);
+    // Reject binary / CRLF content. Binary files are only allowed when
+    // they are explicitly declared in the manifest (e.g. gradle-wrapper.jar).
+    const isBinary = entry.content instanceof Uint8Array && entry.content.includes(0);
+    const hasCRLF = entry.content instanceof Uint8Array && entry.content.includes(0x0d);
+    if (isBinary) {
+      // Permit known binary files: gradle-wrapper.jar (Gradle wrapper).
+      if (!ALLOWED_BINARY_FILES.has(mf.path)) {
+        throw new Error(`binary content rejected on ${mf.path}`);
+      }
     }
-    if (entry.content instanceof Uint8Array && entry.content.includes(0x0d)) {
+    if (hasCRLF && !isBinary) {
       throw new Error(`CRLF rejected on ${mf.path}`);
     }
   }
@@ -175,8 +187,13 @@ export function parseManifest(json: unknown): TemplateManifest {
     throw new Error('manifest must be an object');
   }
   const obj = json as Record<string, unknown>;
-  if (obj.template !== 'monorepo-root') {
-    throw new Error(`manifest.template must be 'monorepo-root'`);
+  if (
+    typeof obj.template !== 'string' ||
+    !(TEMPLATE_NAMES as readonly string[]).includes(obj.template)
+  ) {
+    throw new Error(
+      `manifest.template must be one of [${TEMPLATE_NAMES.join(', ')}], got '${String(obj.template)}'`,
+    );
   }
   if (typeof obj.path !== 'string') throw new Error('manifest.path must be string');
   if (typeof obj.tree_sha256 !== 'string') {
@@ -216,7 +233,7 @@ export function parseManifest(json: unknown): TemplateManifest {
   });
 
   return Object.freeze({
-    template: 'monorepo-root',
+    template: obj.template as TemplateName,
     path: obj.path,
     tree_sha256: obj.tree_sha256,
     files,

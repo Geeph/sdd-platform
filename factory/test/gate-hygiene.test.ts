@@ -191,12 +191,17 @@ function okScenario(overrides: {
 
 describe('checkPrHygiene', () => {
   describe('non-gate PR', () => {
-    it('passes with no gate labels', async () => {
+    it('passes with no gate labels (not a Scaffold PR)', async () => {
       const { octokit } = createFakeOctokit({
         routes: [
           {
             route: 'GET /repos/{owner}/{repo}/pulls/{pull_number}',
             response: basePr({ labels: [{ name: 'type:task' }] }),
+          },
+          {
+            // Must mock changed files — Scaffold PR detection reads this.
+            route: 'GET /repos/{owner}/{repo}/pulls/{pull_number}/files',
+            response: changedFiles(['README.md']),
           },
         ],
       });

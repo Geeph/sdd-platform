@@ -373,7 +373,7 @@ function buildTemplatePlan(
   // manifest_sha256: sha256 of canonical manifest JSON (same as lock's).
   const manifestJson = JSON.stringify(
     {
-      template: 'monorepo-root',
+      template: manifest.template,
       path: manifest.path,
       tree_sha256: manifest.tree_sha256,
       files: manifest.files.map((f) => ({

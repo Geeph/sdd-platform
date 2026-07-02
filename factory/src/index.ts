@@ -33,9 +33,14 @@ export {
 // Init orchestrator (M2b + M2c)
 export type { ApplyInitPlanDeps, FinalizeConfig } from './init.js';
 export { applyInitPlan, finalizeProtection } from './init.js';
-
 // Core functions
 export { compileInitPlan, serializeInitPlan } from './plan.js';
+export type { ProvenanceGitHubClient } from './provenance-github.js';
+export {
+  createProvenanceOctokit,
+  createRemoteGitReader,
+  parseCodeowners,
+} from './provenance-github.js';
 export {
   computeOutputTreeDigest,
   parseLockYaml,
@@ -56,12 +61,57 @@ export {
   sha256Hex,
   validateManifest,
 } from './resolve.js';
+export type { ScaffoldGitHubClient } from './scaffold/github-reader.js';
+export { createOctokitScaffoldReadPort } from './scaffold/github-reader.js';
+export type { CompiledScaffoldPlan, CompileScaffoldPlanInput } from './scaffold/plan.js';
+// Scaffold (M3)
+export { compileScaffoldPlan } from './scaffold/plan.js';
+export type { OctokitMutate as ScaffoldOctokitMutate } from './scaffold/publish.js';
+export { publishComponentBranch, upsertScaffoldPull } from './scaffold/publish.js';
+export type { RenderComponentInput, RenderedComponent } from './scaffold/render.js';
+export { expectedFilesForComponent, renderComponent } from './scaffold/render.js';
+export type {
+  ExpectedComponentSubtree,
+  ScaffoldReuseClient,
+  ScaffoldReuseState,
+} from './scaffold/reuse.js';
+export { inspectScaffoldReuse } from './scaffold/reuse.js';
+export type {
+  ExpectedFile,
+  SubtreeVerificationInput,
+  SubtreeVerificationResult,
+} from './scaffold/subtree.js';
+export { verifyComponentSubtree } from './scaffold/subtree.js';
+export type {
+  ComponentLock,
+  PublishComponentBranchInput,
+  PublishResult,
+  ResolvedTemplate,
+  ScaffoldApproval,
+  ScaffoldAuthorization,
+  ScaffoldComponent,
+  ScaffoldComponentPlan,
+  ScaffoldDisposition,
+  ScaffoldInput,
+  ScaffoldNextAction,
+  ScaffoldPlan,
+  ScaffoldPlannedOperation,
+  ScaffoldProductObservation,
+  ScaffoldProjects,
+  ScaffoldPull,
+  ScaffoldReadPort,
+  ScaffoldResult,
+  ScaffoldWritePort,
+  TreeEntry,
+  UpsertScaffoldPullInput,
+} from './scaffold/types.js';
 // Types
 export type {
   AppliedOperation,
   BootstrapPull,
   BootstrapPullInput,
   CommitIdentity,
+  ComponentRenderContext,
   CreateRepoInput,
   Disposition,
   EnvironmentsInput,
@@ -96,6 +146,14 @@ export type {
   TargetPlan,
   TeamsInput,
   TemplateManifest,
+  TemplateName,
   TemplatePlan,
   TemplateTreeEntry,
 } from './types.js';
+export { TEMPLATE_NAMES } from './types.js';
+export type {
+  VerifiedWorkflowPin,
+  VerifyRequiredWorkflowPinInput,
+  WorkflowPinOctokit,
+} from './workflow-pin.js';
+export { PR_HYGIENE_WORKFLOW_PATH, verifyRequiredWorkflowPin } from './workflow-pin.js';

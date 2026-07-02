@@ -19,7 +19,7 @@
  */
 
 import { Command, Flags } from '@oclif/core';
-import { checkPrHygiene } from '@sdd/factory';
+import { checkPrHygiene, PR_HYGIENE_WORKFLOW_PATH } from '@sdd/factory';
 
 export default class GateHygiene extends Command {
   static override description = 'Check PR hygiene rules (§3.5)';
@@ -58,10 +58,12 @@ export default class GateHygiene extends Command {
     const octokit = createMinimalOctokit(token);
 
     try {
+      const trustedWorkflow = readTrustedWorkflowIdentity();
       const result = await checkPrHygiene({
         octokit,
         repo: { owner, repo },
         pr: flags.pr,
+        ...(trustedWorkflow ? { trustedWorkflow } : {}),
       });
 
       if (result.ok) {
@@ -80,6 +82,19 @@ export default class GateHygiene extends Command {
       this.error(`hygiene check failed: ${msg}`, { exit: 3 });
     }
   }
+}
+
+function readTrustedWorkflowIdentity(): { repository: string; commit: string } | undefined {
+  const workflowRef = process.env.GITHUB_WORKFLOW_REF;
+  const workflowSha = process.env.GITHUB_WORKFLOW_SHA;
+  if (!workflowRef || !workflowSha) return undefined;
+  const separator = `/${PR_HYGIENE_WORKFLOW_PATH}@`;
+  const separatorIndex = workflowRef.indexOf(separator);
+  const repository = separatorIndex > 0 ? workflowRef.slice(0, separatorIndex) : '';
+  if (!/^[^/]+\/[^/]+$/.test(repository) || !/^[0-9a-f]{40}$/i.test(workflowSha)) {
+    return undefined;
+  }
+  return { repository, commit: workflowSha.toLowerCase() };
 }
 
 /**

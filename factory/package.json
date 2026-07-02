@@ -22,6 +22,7 @@
     "clean": "rimraf dist"
   },
   "dependencies": {
+    "@sdd/provenance": "workspace:*",
     "@sdd/schemas": "workspace:*",
     "yaml": "^2.5.0"
   },

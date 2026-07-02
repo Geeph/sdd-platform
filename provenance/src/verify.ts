@@ -55,6 +55,14 @@ export async function verifyGateApproval(input: VerifyInput): Promise<VerifyResu
     const gateLabel = `gate:${gate}`;
     const versionLabel = `version:${version}`;
     const prLabels = pr.labels.map((l) => l.name);
+    // D22: gate:<gate> label is required (not just conflict-checked).
+    // version:<v> label remains "if present, must match" (M2 D5 semantics).
+    if (!prLabels.includes(gateLabel)) {
+      return {
+        ok: false,
+        reason: `PR does not have required label '${gateLabel}'`,
+      };
+    }
     for (const label of prLabels) {
       if (label.startsWith('gate:') && label !== gateLabel) {
         return {

@@ -865,11 +865,14 @@ describe('reconcileRepositoryRuleset', () => {
     expect(statusChecksRule).toBeDefined();
     const params = statusChecksRule!.parameters as {
       required_status_checks: Array<{ context: string; integration_id: number }>;
+      strict_required_status_checks_policy: boolean;
     };
     expect(params.required_status_checks).toEqual([
       { context: 'CI Gate', integration_id: 15368 },
       { context: 'PR hygiene', integration_id: 15368 },
     ]);
+    // D24: strict field must use the correct GitHub API name.
+    expect(params.strict_required_status_checks_policy).toBe(true);
   });
 
   it('hardened without explicit integration_id defaults to 15368 (GitHub Actions)', async () => {
