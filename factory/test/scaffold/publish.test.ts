@@ -99,10 +99,10 @@ describe('publishComponentBranch', () => {
     expect(result.treeSha).toBe('tree-sha');
     expect(result.created).toBe(true);
     expect(calls.length).toBe(5);
-    expect(calls[0]!.route).toBe('POST /repos/{owner}/{repo}/git/blobs');
-    expect(calls[2]!.route).toBe('POST /repos/{owner}/{repo}/git/trees');
-    expect(calls[3]!.route).toBe('POST /repos/{owner}/{repo}/git/commits');
-    expect(calls[4]!.route).toBe('POST /repos/{owner}/{repo}/git/refs');
+    expect(calls[0]?.route).toBe('POST /repos/{owner}/{repo}/git/blobs');
+    expect(calls[2]?.route).toBe('POST /repos/{owner}/{repo}/git/trees');
+    expect(calls[3]?.route).toBe('POST /repos/{owner}/{repo}/git/commits');
+    expect(calls[4]?.route).toBe('POST /repos/{owner}/{repo}/git/refs');
 
     const treeCall = calls[2]!;
     expect((treeCall.params as { base_tree: string }).base_tree).toBe('main-tree-sha');
@@ -153,10 +153,10 @@ describe('upsertScaffoldPull', () => {
     expect(result.number).toBe(42);
     expect(result.created).toBe(false);
     expect(calls.length).toBe(2);
-    expect(calls[1]!.route).toBe(
+    expect(calls[1]?.route).toBe(
       'POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers',
     );
-    const reviewersCall = calls[1]!.params as { team_reviewers: string[] };
+    const reviewersCall = calls[1]?.params as { team_reviewers: string[] };
     expect(reviewersCall.team_reviewers).toEqual(['backend-team', 'web-team']);
   });
 
@@ -210,6 +210,31 @@ describe('upsertScaffoldPull', () => {
     );
   });
 
+  it('D20: rejects PR where base repo does not match expected', async () => {
+    const { octokit } = createFakeOctokit({
+      'GET /repos/{owner}/{repo}/pulls': () => [
+        {
+          number: 42,
+          head: {
+            sha: 'existing-sha',
+            ref: 'sdd/scaffold-abc123',
+            repo: { owner: { login: 'acme' }, name: 'demo' },
+          },
+          base: {
+            sha: 'base-sha',
+            ref: 'main',
+            repo: { owner: { login: 'attacker' }, name: 'demo' },
+          },
+          html_url: 'https://example/42',
+        },
+      ],
+    });
+
+    await expect(upsertScaffoldPull(octokit, baseInput())).rejects.toThrow(
+      /base repo.*does not match expected/,
+    );
+  });
+
   it('D20: rejects PR where head ref is not the expected branch', async () => {
     const { octokit } = createFakeOctokit({
       'GET /repos/{owner}/{repo}/pulls': () => [
@@ -235,6 +260,32 @@ describe('upsertScaffoldPull', () => {
     );
   });
 
+  it('D20: rejects a head SHA that changed after subtree verification', async () => {
+    const { octokit } = createFakeOctokit({
+      'GET /repos/{owner}/{repo}/pulls': () => [
+        {
+          number: 42,
+          head: {
+            sha: 'raced-sha',
+            ref: 'sdd/scaffold-abc123',
+            repo: { owner: { login: 'acme' }, name: 'demo' },
+          },
+          base: {
+            sha: 'base-sha',
+            ref: 'main',
+            repo: { owner: { login: 'acme' }, name: 'demo' },
+          },
+          html_url: 'https://example/42',
+        },
+      ],
+    });
+    const input = baseInput();
+    input.expectedHeadSha = 'verified-sha';
+    await expect(upsertScaffoldPull(octokit, input)).rejects.toThrow(
+      /changed after D25 verification/,
+    );
+  });
+
   it('creates new PR when none exists', async () => {
     const { octokit, calls } = createFakeOctokit({
       'GET /repos/{owner}/{repo}/pulls': () => [],
@@ -251,6 +302,6 @@ describe('upsertScaffoldPull', () => {
     expect(result.number).toBe(99);
     expect(result.created).toBe(true);
     expect(calls.length).toBe(3);
-    expect(calls[1]!.route).toBe('POST /repos/{owner}/{repo}/pulls');
+    expect(calls[1]?.route).toBe('POST /repos/{owner}/{repo}/pulls');
   });
 });

@@ -22,11 +22,12 @@ export interface VerifiedWorkflowPin {
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
+export const PR_HYGIENE_WORKFLOW_PATH = '.github/workflows/pr-hygiene.yml';
 
 export async function verifyRequiredWorkflowPin(
   input: VerifyRequiredWorkflowPinInput,
 ): Promise<VerifiedWorkflowPin> {
-  const workflowPath = input.workflowPath ?? '.github/workflows/pr-hygiene.yml';
+  const workflowPath = input.workflowPath ?? PR_HYGIENE_WORKFLOW_PATH;
   if (!FULL_SHA_RE.test(input.generatorCommit)) {
     throw new Error('generator commit is missing or is not a full 40-hex SHA');
   }

@@ -175,6 +175,8 @@ export interface UpsertScaffoldPullInput {
    */
   expectedHeadRepo?: RepoRef;
   expectedBaseRef?: string;
+  /** Head commit already verified by D25; reject a raced PR/branch update. */
+  expectedHeadSha?: string;
 }
 
 export interface ScaffoldPull {

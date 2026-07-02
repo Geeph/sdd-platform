@@ -13,16 +13,10 @@
  * components' `path` prefixes.
  */
 
-import type { RepoRef } from '../types.js';
-import { expectedFilesForComponent, type RenderedComponent } from './render.js';
-import { verifyComponentSubtree } from './subtree.js';
 import type {
   PublishComponentBranchInput,
   PublishResult,
   ScaffoldPull,
-  ScaffoldReadPort,
-  ScaffoldWritePort,
-  TreeEntry,
   UpsertScaffoldPullInput,
 } from './types.js';
 
@@ -158,6 +152,7 @@ export async function upsertScaffoldPull(
     teamReviewers,
     expectedHeadRepo,
     expectedBaseRef,
+    expectedHeadSha,
   } = input;
 
   // Check for existing PR.
@@ -195,6 +190,18 @@ export async function upsertScaffoldPull(
             `(${expectedHeadRepo.owner}/${expectedHeadRepo.repo})`,
         );
       }
+      const baseRepoOwner = pr.base.repo?.owner?.login;
+      const baseRepoName = pr.base.repo?.name;
+      if (
+        baseRepoOwner?.toLowerCase() !== expectedHeadRepo.owner.toLowerCase() ||
+        baseRepoName?.toLowerCase() !== expectedHeadRepo.repo.toLowerCase()
+      ) {
+        throw new Error(
+          `upsertScaffoldPull: conflict — existing PR #${pr.number} base repo ` +
+            `(${baseRepoOwner}/${baseRepoName}) does not match expected ` +
+            `(${expectedHeadRepo.owner}/${expectedHeadRepo.repo})`,
+        );
+      }
     }
     if (expectedBaseRef && pr.base.ref !== expectedBaseRef) {
       throw new Error(
@@ -206,6 +213,12 @@ export async function upsertScaffoldPull(
       throw new Error(
         `upsertScaffoldPull: conflict — existing PR #${pr.number} head ref ` +
           `'${pr.head.ref}' does not match expected '${headBranch}'`,
+      );
+    }
+    if (expectedHeadSha && pr.head.sha !== expectedHeadSha) {
+      throw new Error(
+        `upsertScaffoldPull: conflict — existing PR #${pr.number} head SHA ` +
+          `'${pr.head.sha}' changed after D25 verification (expected '${expectedHeadSha}')`,
       );
     }
 
@@ -241,6 +254,13 @@ export async function upsertScaffoldPull(
       }),
     'upsertScaffoldPull:createPR',
   )) as { number: number; head: { sha: string }; html_url: string };
+
+  if (expectedHeadSha && prResp.head.sha !== expectedHeadSha) {
+    throw new Error(
+      `upsertScaffoldPull: conflict — created PR #${prResp.number} head SHA ` +
+        `'${prResp.head.sha}' changed after D25 verification (expected '${expectedHeadSha}')`,
+    );
+  }
 
   await withRetry(
     () =>

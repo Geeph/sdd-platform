@@ -28,6 +28,9 @@ import type {
 } from '@sdd/factory';
 import {
   compileScaffoldPlan,
+  createOctokitScaffoldReadPort,
+  createProvenanceOctokit,
+  inspectScaffoldReuse,
   parseManifest,
   publishComponentBranch,
   sha256Hex,
@@ -39,105 +42,6 @@ import { verifyGateApproval } from '@sdd/provenance';
 import { validateProjectsDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
 import { createGitHubRequestClient } from '../../github-client.js';
-
-/**
- * Adapter: wrap a raw GitHubRequestClient to match provenance's OctokitLike
- * interface. The raw client returns bare JSON; Octokit wraps in { data }.
- * Each method below wraps the raw response accordingly.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function createOctokitAdapter(owner: string, repo: string): Promise<any> {
-  const client = createGitHubRequestClient(process.env.GITHUB_TOKEN as string);
-  async function r<T>(route: string, params: Record<string, unknown> = {}): Promise<{ data: T }> {
-    const body = (await client.request(route, { owner, repo, ...params })) as T;
-    return { data: body };
-  }
-  return {
-    rest: {
-      pulls: {
-        get: (p: { pull_number: number }) => r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}`),
-        listReviews: (p: { pull_number: number; per_page?: number; page?: number }) =>
-          r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}/reviews`, {
-            per_page: p.per_page,
-            page: p.page,
-          }),
-        listFiles: (p: { pull_number: number; per_page?: number; page?: number }) =>
-          r(`GET /repos/{owner}/{repo}/pulls/${p.pull_number}/files`, {
-            per_page: p.per_page,
-            page: p.page,
-          }),
-      },
-      repos: {
-        getBranch: (p: { branch: string }) => r(`GET /repos/{owner}/{repo}/branches/${p.branch}`),
-        listPullRequestsAssociatedWithCommit: (p: {
-          commit_sha: string;
-          per_page?: number;
-          page?: number;
-        }) =>
-          r(`GET /repos/{owner}/{repo}/commits/${p.commit_sha}/pulls`, {
-            per_page: p.per_page,
-            page: p.page,
-          }),
-        getCollaboratorPermissionLevel: (p: { username: string }) =>
-          r(`GET /repos/{owner}/{repo}/collaborators/${p.username}/permission`),
-      },
-      checks: {
-        listForRef: (p: { ref: string; per_page?: number; page?: number }) =>
-          r(`GET /repos/{owner}/{repo}/commits/${p.ref}/check-runs`, {
-            per_page: p.per_page,
-            page: p.page,
-          }),
-      },
-      teams: {
-        getByName: (p: { org: string; team_slug: string }) =>
-          (async () => {
-            const body = (await client.request(`GET /orgs/${p.org}/teams/${p.team_slug}`)) as {
-              id: number;
-              slug: string;
-              privacy?: string;
-            };
-            return { data: body };
-          })(),
-        checkPermissionsForRepoInOrg: (p: {
-          org: string;
-          team_slug: string;
-          owner: string;
-          repo: string;
-          headers?: { accept: string };
-        }) =>
-          (async () => {
-            const body = (await client.request(
-              `GET /orgs/${p.org}/teams/${p.team_slug}/repos/${p.owner}/${p.repo}`,
-              p.headers ? { headers: p.headers } : undefined,
-            )) as {
-              permissions?: {
-                admin: boolean;
-                pull: boolean;
-                push: boolean;
-                triage?: boolean;
-                maintain?: boolean;
-              };
-              role_name?: string;
-            };
-            return { data: body };
-          })(),
-        listMembersInOrg: (p: {
-          org: string;
-          team_slug: string;
-          per_page?: number;
-          page?: number;
-        }) =>
-          (async () => {
-            const body = (await client.request(`GET /orgs/${p.org}/teams/${p.team_slug}/members`, {
-              per_page: p.per_page,
-              page: p.page,
-            })) as Array<{ login: string }>;
-            return { data: body };
-          })(),
-      },
-    },
-  };
-}
 
 const DEFAULT_PLATFORM_REPO_NAME = 'sdd-platform';
 
@@ -501,8 +405,8 @@ export default class ProductScaffold extends Command {
 
     // --- Real execution path ---
     try {
-      const octokit = await createOctokitAdapter(remoteOwner, remoteRepo);
       const rawClient = createGitHubRequestClient(process.env.GITHUB_TOKEN as string);
+      const octokit = createProvenanceOctokit(rawClient);
       const { createLocalGitReader } = await import('../../git-reader.js');
       const gitReader = createLocalGitReader({ repoRoot });
 
@@ -788,25 +692,33 @@ export default class ProductScaffold extends Command {
         });
       }
 
-      // D20: check if branch already exists before creating it.
-      let branchExists = false;
-      try {
-        await rawClient.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
-          owner: remoteOwner,
-          repo: remoteRepo,
-          ref: `heads/${branchName}`,
-        });
-        branchExists = true;
-      } catch (err) {
-        // Only HTTP 404 means branch doesn't exist. Any other error
-        // (network, 403, 500) is a real failure — surface it.
-        const httpStatus = (err as { status?: number }).status;
-        if (httpStatus !== 404) throw err;
+      const expectedComponents = pendingComponents.map((component) => {
+        const expectedFiles = compiled.expectedFiles.get(component.id);
+        if (!expectedFiles) {
+          throw new Error(`missing expected file set for pending component '${component.id}'`);
+        }
+        return { path: component.path, expectedFiles };
+      });
+      const reuseState = await inspectScaffoldReuse({
+        octokit: rawClient,
+        reader: createOctokitScaffoldReadPort(rawClient),
+        target: { owner: remoteOwner, repo: remoteRepo },
+        branchName,
+        components: expectedComponents,
+      });
+      if (reuseState.kind === 'conflict') {
+        this.error(`Scaffold branch conflict: ${reuseState.reason}`, { exit: 5 });
+        return;
+      }
+      if (reuseState.kind === 'blocked') {
+        this.error(`Scaffold branch blocked: ${reuseState.reason}`, { exit: 3 });
+        return;
       }
 
-      if (!branchExists) {
+      let verifiedHeadSha: string;
+      if (reuseState.kind === 'new') {
         this.log(`Publishing branch ${branchName}...`);
-        await publishComponentBranch(rawClient, {
+        const published = await publishComponentBranch(rawClient, {
           target: { owner: remoteOwner, repo: remoteRepo },
           baseTreeSha: mainTreeSha,
           baseCommitSha: mainCommitSha,
@@ -815,11 +727,17 @@ export default class ProductScaffold extends Command {
           commitMessage: `sdd-scaffold: ${pendingComponents.map((c) => c.id).join(', ')}`,
           allowedPaths,
         });
+        verifiedHeadSha = published.commitSha;
+      } else if (reuseState.kind === 'resume-without-pr') {
+        verifiedHeadSha = reuseState.headSha;
+        this.log(`Branch ${branchName} passed D25; resuming PR creation.`);
       } else {
-        this.log(`Branch ${branchName} already exists — skipping branch creation (D20).`);
+        this.log(`Scaffold PR #${reuseState.pull.number} passed D25 and is already open.`);
+        this.log('Awaiting human review and merge.');
+        this.exit(4);
+        return;
       }
 
-      // Open PR (idempotent — upsertScaffoldPull checks for existing).
       const prResult = await upsertScaffoldPull(rawClient, {
         target: { owner: remoteOwner, repo: remoteRepo },
         headBranch: branchName,
@@ -829,6 +747,7 @@ export default class ProductScaffold extends Command {
         teamReviewers: [...new Set(pendingComponents.map((c) => c.owner))],
         expectedHeadRepo: { owner: remoteOwner, repo: remoteRepo },
         expectedBaseRef: 'main',
+        expectedHeadSha: verifiedHeadSha,
       });
 
       this.log(`Scaffold PR #${prResult.number} created: ${prResult.htmlUrl}`);

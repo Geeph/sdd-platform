@@ -15,7 +15,6 @@ import type {
   ScaffoldAuthorization,
   ScaffoldComponent,
   ScaffoldComponentPlan,
-  ScaffoldDisposition,
   ScaffoldPlan,
   ScaffoldPlannedOperation,
   ScaffoldProductObservation,
@@ -192,15 +191,17 @@ export function compileScaffoldPlan(input: CompileScaffoldPlanInput): CompiledSc
   // Step 2: build operations.
   const operations: ScaffoldPlannedOperation[] = [];
   const hasPending = pendingComponents.length > 0;
+  const operationId = hasPending
+    ? computeOperationId({
+        target,
+        source,
+        authorization,
+        components: componentPlans.filter((c) => c.disposition === 'create'),
+      })
+    : sha256Hex('no-pending-components');
 
   if (hasPending) {
-    const opId = computeOperationId({
-      target,
-      source,
-      authorization,
-      components: componentPlans.filter((c) => c.disposition === 'create'),
-    });
-    const branchName = `sdd/scaffold-${opId.slice(7, 19)}`; // first 12 hex chars
+    const branchName = `sdd/scaffold-${operationId.slice(7, 19)}`; // first 12 hex chars
 
     operations.push({
       order: 10,
@@ -221,14 +222,7 @@ export function compileScaffoldPlan(input: CompileScaffoldPlanInput): CompiledSc
   // Step 3: assemble the plan.
   const plan: ScaffoldPlan = {
     plan_version: 1,
-    operation_id: hasPending
-      ? computeOperationId({
-          target,
-          source,
-          authorization,
-          components: componentPlans.filter((c) => c.disposition === 'create'),
-        })
-      : sha256Hex('no-pending-components'),
+    operation_id: operationId,
     target: {
       owner: target.owner,
       repository: target.name,

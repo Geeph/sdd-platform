@@ -35,6 +35,12 @@ export type { ApplyInitPlanDeps, FinalizeConfig } from './init.js';
 export { applyInitPlan, finalizeProtection } from './init.js';
 // Core functions
 export { compileInitPlan, serializeInitPlan } from './plan.js';
+export type { ProvenanceGitHubClient } from './provenance-github.js';
+export {
+  createProvenanceOctokit,
+  createRemoteGitReader,
+  parseCodeowners,
+} from './provenance-github.js';
 export {
   computeOutputTreeDigest,
   parseLockYaml,
@@ -55,6 +61,8 @@ export {
   sha256Hex,
   validateManifest,
 } from './resolve.js';
+export type { ScaffoldGitHubClient } from './scaffold/github-reader.js';
+export { createOctokitScaffoldReadPort } from './scaffold/github-reader.js';
 export type { CompiledScaffoldPlan, CompileScaffoldPlanInput } from './scaffold/plan.js';
 // Scaffold (M3)
 export { compileScaffoldPlan } from './scaffold/plan.js';
@@ -62,6 +70,12 @@ export type { OctokitMutate as ScaffoldOctokitMutate } from './scaffold/publish.
 export { publishComponentBranch, upsertScaffoldPull } from './scaffold/publish.js';
 export type { RenderComponentInput, RenderedComponent } from './scaffold/render.js';
 export { expectedFilesForComponent, renderComponent } from './scaffold/render.js';
+export type {
+  ExpectedComponentSubtree,
+  ScaffoldReuseClient,
+  ScaffoldReuseState,
+} from './scaffold/reuse.js';
+export { inspectScaffoldReuse } from './scaffold/reuse.js';
 export type {
   ExpectedFile,
   SubtreeVerificationInput,
@@ -142,4 +156,4 @@ export type {
   VerifyRequiredWorkflowPinInput,
   WorkflowPinOctokit,
 } from './workflow-pin.js';
-export { verifyRequiredWorkflowPin } from './workflow-pin.js';
+export { PR_HYGIENE_WORKFLOW_PATH, verifyRequiredWorkflowPin } from './workflow-pin.js';

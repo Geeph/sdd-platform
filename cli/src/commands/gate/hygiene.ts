@@ -19,7 +19,7 @@
  */
 
 import { Command, Flags } from '@oclif/core';
-import { checkPrHygiene } from '@sdd/factory';
+import { checkPrHygiene, PR_HYGIENE_WORKFLOW_PATH } from '@sdd/factory';
 
 export default class GateHygiene extends Command {
   static override description = 'Check PR hygiene rules (§3.5)';
@@ -88,9 +88,13 @@ function readTrustedWorkflowIdentity(): { repository: string; commit: string } |
   const workflowRef = process.env.GITHUB_WORKFLOW_REF;
   const workflowSha = process.env.GITHUB_WORKFLOW_SHA;
   if (!workflowRef || !workflowSha) return undefined;
-  const match = workflowRef.match(/^([^/]+\/[^/]+)\/\.github\/workflows\/pr-hygiene\.yml@.+$/);
-  if (!match?.[1] || !/^[0-9a-f]{40}$/i.test(workflowSha)) return undefined;
-  return { repository: match[1], commit: workflowSha.toLowerCase() };
+  const separator = `/${PR_HYGIENE_WORKFLOW_PATH}@`;
+  const separatorIndex = workflowRef.indexOf(separator);
+  const repository = separatorIndex > 0 ? workflowRef.slice(0, separatorIndex) : '';
+  if (!/^[^/]+\/[^/]+$/.test(repository) || !/^[0-9a-f]{40}$/i.test(workflowSha)) {
+    return undefined;
+  }
+  return { repository, commit: workflowSha.toLowerCase() };
 }
 
 /**

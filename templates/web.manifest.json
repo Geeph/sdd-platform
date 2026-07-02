@@ -1,7 +1,7 @@
 {
   "template": "web",
   "path": "templates/web",
-  "tree_sha256": "sha256:f529abceb36175a97d7915e551741994d80f1ee24f116c6d8a62bf0f16bba57d",
+  "tree_sha256": "sha256:5d896a67dc0c72a725dc47ce380644c680b8a9e5bfbad12d36a0ad644be386fb",
   "files": [
     {
       "path": ".gitignore",
@@ -43,7 +43,7 @@
       "path": "pnpm-workspace.yaml",
       "mode": "100644",
       "render": false,
-      "sha256": "sha256:d67ba335a28f38c47f593ad063e8979c63b70eebb13550eaf29723853d29ff4d"
+      "sha256": "sha256:fd3a67dfb939a0495e1ae17626e7037b21c3ec793fa44b8b79ce9eec27b109aa"
     },
     {
       "path": "README.md",

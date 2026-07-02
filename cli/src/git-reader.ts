@@ -16,9 +16,9 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import type { CodeownersEntry, GitReader } from '@sdd/provenance';
+import { parseCodeowners } from '@sdd/factory';
+import type { GitReader } from '@sdd/provenance';
 
 export interface LocalGitReaderOptions {
   /** Absolute path to the product repo root. */
@@ -73,7 +73,7 @@ export function createLocalGitReader(options: LocalGitReaderOptions): GitReader 
       return out.length === 0;
     },
 
-    async codeownersAt(commit: string): Promise<CodeownersEntry[]> {
+    async codeownersAt(commit: string) {
       // `git show <commit>:.github/CODEOWNERS` returns the file content.
       // Parse it into CodeownersEntry[] using the same simple line format
       // as provenance/src/verify.ts (pattern + owners per line).
@@ -86,22 +86,4 @@ export function createLocalGitReader(options: LocalGitReaderOptions): GitReader 
       return parseCodeowners(content);
     },
   };
-}
-
-/**
- * Parse CODEOWNERS content into a list of pattern+owners entries.
- * Lines starting with `#` are comments; blank lines are skipped.
- * Each non-comment line: `<pattern> <owner1> <owner2> ...`.
- */
-export function parseCodeowners(content: string): CodeownersEntry[] {
-  const entries: CodeownersEntry[] = [];
-  for (const raw of content.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const parts = line.split(/\s+/);
-    if (parts.length < 2) continue;
-    const [pattern, ...owners] = parts;
-    entries.push({ pattern: pattern as string, owners: owners as string[] });
-  }
-  return entries;
 }
