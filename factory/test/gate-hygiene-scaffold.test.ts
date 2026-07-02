@@ -1,44 +1,38 @@
-/**
- * gate-hygiene-scaffold.test.ts — D24 Scaffold PR hygiene tests.
- *
- * Tests both Layer 1 (lock metadata vs main projects.yaml) and
- * Layer 2 (D25 subtree verification against PR head tree).
- */
-
+import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import type { HygieneOctokit, HygieneResult } from '../src/gate-hygiene.js';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import type { HygieneOctokit } from '../src/gate-hygiene.js';
 import { checkPrHygiene } from '../src/gate-hygiene.js';
+import { assembleTree, parseManifest, sha256Hex } from '../src/resolve.js';
+import { renderComponent } from '../src/scaffold/render.js';
+import type { ComponentLock } from '../src/scaffold/types.js';
 
-/**
- * Build a minimal fake octokit for scaffold PR hygiene testing.
- */
-function createFakeOctokit(routes: Map<string, unknown>): HygieneOctokit {
-  return {
-    async request(route: string, params: Record<string, unknown> = {}): Promise<unknown> {
-      // Try exact match first.
-      const resp = routes.get(route);
-      if (resp !== undefined) {
-        if (typeof resp === 'function') return (resp as (p: unknown) => unknown)(params);
-        return resp;
-      }
-      // Try prefix match for parameterized routes.
-      for (const [key, value] of routes) {
-        if (route.startsWith(key.replace(/\{[^}]+\}/g, '*'))) {
-          if (typeof value === 'function') return (value as (p: unknown) => unknown)(params);
-          return value;
-        }
-      }
-      throw new Error(`unexpected route: ${route} ${JSON.stringify(params)}`);
-    },
-  };
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const TARGET = { owner: 'acme', repo: 'demo' };
+const PLATFORM = { owner: 'acme', repo: 'sdd-platform' };
+const WORKFLOW_COMMIT = 'd'.repeat(40);
+const TEMPLATE_COMMIT = 'c'.repeat(40);
+const SCAFFOLD_HEAD = 'a'.repeat(40);
+const GATE_HEAD = 'e'.repeat(40);
+const GATE_BASE = 'b'.repeat(40);
+const GATE_MERGE = 'f'.repeat(40);
+
+interface FixtureOptions {
+  mutateLock?: (lock: ComponentLock) => void;
+  mutateFiles?: (files: Map<string, Uint8Array>) => void;
+  trustedWorkflow?: boolean;
+  workflowPin?: string;
 }
 
-describe('Scaffold PR hygiene (D24)', () => {
-  const repo = { owner: 'acme', repo: 'demo' };
-  const prNumber = 42;
-  const prHeadSha = 'a'.repeat(40);
-  const prBaseSha = 'b'.repeat(40);
+function fakeOctokit(
+  handler: (route: string, params: Record<string, unknown>) => unknown | Promise<unknown>,
+): HygieneOctokit {
+  return { request: async (route, params = {}) => handler(route, params) };
+}
 
+async function createFixture(options: FixtureOptions = {}) {
   const projectsYaml = `schema_version: 1
 product: demo
 repository_mode: monorepo
@@ -46,200 +40,274 @@ components:
   - id: backend
     path: apps/backend
     template: spring-boot
-    template_ref: ${'c'.repeat(40)}
+    template_ref: ${TEMPLATE_COMMIT}
     owner: backend-team
     ci: java
 `;
-
-  const templateLock = `schema_version: 1
-generator:
-  package: '@sdd/factory'
-  version: 0.1.0
-source:
-  repository: acme/sdd-platform
-  resolved_commit: ${'c'.repeat(40)}
-template:
-  name: spring-boot
-  path: templates/spring-boot
-  manifest_sha256: sha256:${'d'.repeat(64)}
-  source_tree_sha256: sha256:${'e'.repeat(64)}
-  output_tree_sha256: sha256:${'f'.repeat(64)}
-component:
-  id: backend
-  path: apps/backend
-  owner: backend-team
-approved_by:
-  gate: architecture
-  version: v1
-  pr: 1
-  approved_head_sha: ${'a'.repeat(40)}
-  merge_commit_sha: ${'b'.repeat(40)}
-  approved_at: '2026-01-01T00:00:00Z'
-  authorization_policy: current-codeowners
-  required_checks: []
-files:
-  - path: build.gradle.kts
-    mode: '100644'
-    source_sha256: sha256:${'1'.repeat(64)}
-    output_sha256: sha256:${'2'.repeat(64)}
-`;
-
-  const baseRoutes = (overrides: Record<string, unknown> = {}): Map<string, unknown> => {
-    const routes = new Map<string, unknown>();
-    routes.set('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-      head: { sha: prHeadSha },
-      base: { sha: prBaseSha, ref: 'main' },
-      labels: [],
-      body: null,
-      user: { login: 'author' },
-    });
-    routes.set('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', [
-      { filename: 'apps/backend/template.lock', status: 'added', additions: 50, deletions: 0 },
-    ]);
-    routes.set('GET /repos/{owner}/{repo}/contents/{path}', (p: { path: string; ref: string }) => {
-      if (p.path === 'projects.yaml' && p.ref === 'main') {
-        return {
-          content: Buffer.from(projectsYaml, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      if (p.path === 'apps/backend/template.lock' && p.ref === prHeadSha) {
-        return {
-          content: Buffer.from(templateLock, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      throw new Error(`unexpected contents request: ${JSON.stringify(p)}`);
-    });
-    return routes;
+  const manifestBytes = await readFile(resolve(ROOT, 'templates/spring-boot.manifest.json'));
+  const manifest = parseManifest(JSON.parse(manifestBytes.toString('utf8')));
+  const entries = await Promise.all(
+    manifest.files.map(async (file) => ({
+      path: file.path,
+      mode: file.mode,
+      content: new Uint8Array(await readFile(resolve(ROOT, manifest.path, file.path))),
+    })),
+  );
+  const tree = assembleTree(manifest, entries);
+  const provenance = {
+    gate: 'architecture' as const,
+    version: 'v1',
+    pr: 1,
+    approved_head_sha: GATE_HEAD,
+    merge_commit_sha: GATE_MERGE,
+    approved_at: '2026-01-01T00:00:00Z',
+    authorization_policy: 'current-codeowners' as const,
+    required_checks: [],
   };
-
-  it('detects Scaffold PR and passes Layer 1 + Layer 2', async () => {
-    const routes = baseRoutes();
-    // Layer 2: fetch PR head commit tree.
-    routes.set('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
-      sha: prHeadSha,
-      tree: { sha: 'tree123' },
-    });
-    // Layer 2: read PR head tree (recursive).
-    routes.set('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', {
-      tree: [
-        { path: 'apps/backend/build.gradle.kts', mode: '100644', type: 'blob', sha: 'blob123' },
-        { path: 'apps/backend/template.lock', mode: '100644', type: 'blob', sha: 'blob456' },
-        { path: 'README.md', mode: '100644', type: 'blob', sha: 'blob789' },
-      ],
-    });
-    // Layer 2: fetch blob content for each file.
-    routes.set('GET /repos/{owner}/{repo}/git/blobs/{blob_sha}', (p: { blob_sha: string }) => {
-      // Return a buffer whose sha256 matches the lock's output_sha256.
-      // We use a fixed string and compute its sha256 in advance.
-      // For this test, we just need any valid response — the sha256
-      // comparison will intentionally fail since we don't have the
-      // real file content. That's fine for verifying the flow runs.
-      return { content: Buffer.from('content', 'utf8').toString('base64'), encoding: 'base64' };
-    });
-
-    const octokit = createFakeOctokit(routes);
-    const result = await checkPrHygiene({ octokit, repo, pr: prNumber });
-
-    // Layer 1 should pass (main has matching component).
-    // Layer 2 will fail because the blob sha256 doesn't match — but
-    // this test verifies the flow executes and reports the violation.
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      // Either Layer 2 fails on checksum, or no failure — both acceptable.
-      // The important thing is the scaffold PR detection fires and
-      // Layer 1 validation runs.
-      expect(result.violations.length).toBeGreaterThan(0);
-    }
+  const rendered = renderComponent({
+    product: 'demo',
+    repo: TARGET.repo,
+    platformRepo: `${PLATFORM.owner}/${PLATFORM.repo}`,
+    component: {
+      id: 'backend',
+      path: 'apps/backend',
+      template: 'spring-boot',
+      template_ref: TEMPLATE_COMMIT,
+      owner: 'backend-team',
+      ci: 'java',
+    },
+    resolvedTemplate: {
+      componentId: 'backend',
+      commit: TEMPLATE_COMMIT,
+      manifest,
+      tree: tree.entries,
+      sourceTreeSha256: tree.sourceTreeSha256,
+    },
+    generator: {
+      package: '@sdd/factory',
+      version: '0.1.0',
+      resolved_commit: WORKFLOW_COMMIT,
+    },
+    version: 'v1',
+    provenance,
   });
 
-  it('Layer 1 fails when component removed from main', async () => {
-    const emptyProjectsYaml = `schema_version: 1
-product: demo
-repository_mode: monorepo
-components: []
-`;
-    const routes = baseRoutes();
-    routes.set('GET /repos/{owner}/{repo}/contents/{path}', (p: { path: string; ref: string }) => {
-      if (p.path === 'projects.yaml' && p.ref === 'main') {
-        return {
-          content: Buffer.from(emptyProjectsYaml, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      if (p.path === 'apps/backend/template.lock' && p.ref === prHeadSha) {
-        return {
-          content: Buffer.from(templateLock, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      throw new Error(`unexpected contents request: ${JSON.stringify(p)}`);
-    });
+  const lock = parseYaml(rendered.lockYaml) as ComponentLock;
+  options.mutateLock?.(lock);
+  const lockYaml = stringifyYaml(lock, { lineWidth: 0, sortMapEntries: false });
+  const files = new Map<string, Uint8Array>(
+    rendered.files.map((file) => [`apps/backend/${file.path}`, file.content]),
+  );
+  files.set('apps/backend/template.lock', new TextEncoder().encode(lockYaml));
+  options.mutateFiles?.(files);
 
-    const octokit = createFakeOctokit(routes);
-    const result = await checkPrHygiene({ octokit, repo, pr: prNumber });
+  const blobs = new Map<string, Uint8Array>();
+  const treeEntries = [...files].map(([path, content], index) => {
+    const sha = `blob-${index}`;
+    blobs.set(sha, content);
+    return { path, mode: path.endsWith('gradlew') ? '100755' : '100644', type: 'blob', sha };
+  });
+  treeEntries.push({ path: 'README.md', mode: '100644', type: 'blob', sha: 'outside' });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.violations.some((v) => v.includes('no longer in main'))).toBe(true);
+  const octokit = fakeOctokit(async (route, p) => {
+    if (route === 'GET /repos/{owner}/{repo}') {
+      return p.repo === TARGET.repo ? { id: 101 } : { id: 202 };
     }
+    if (route === 'GET /orgs/{org}/rulesets') {
+      return [{ id: 303, name: 'sdd-workflows-101' }];
+    }
+    if (route === 'GET /orgs/{org}/rulesets/{ruleset_id}') {
+      return {
+        enforcement: 'active',
+        conditions: {
+          repository_id: { repository_ids: [101] },
+          ref_name: { include: ['refs/heads/main'], exclude: [] },
+        },
+        rules: [
+          {
+            type: 'workflows',
+            parameters: {
+              workflows: [
+                {
+                  repository_id: 202,
+                  path: '.github/workflows/pr-hygiene.yml',
+                  sha: options.workflowPin ?? WORKFLOW_COMMIT,
+                },
+              ],
+            },
+          },
+        ],
+      };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}') {
+      if (p.pull_number === 42) {
+        return {
+          number: 42,
+          state: 'open',
+          merged: false,
+          merge_commit_sha: null,
+          head: { sha: SCAFFOLD_HEAD, ref: 'sdd/scaffold' },
+          base: { sha: GATE_MERGE, ref: 'main' },
+          labels: [],
+          body: null,
+          user: { login: 'author' },
+          merged_at: null,
+        };
+      }
+      return {
+        number: 1,
+        state: 'closed',
+        merged: true,
+        merge_commit_sha: GATE_MERGE,
+        head: { sha: GATE_HEAD, ref: 'architecture' },
+        base: { sha: GATE_BASE, ref: 'main' },
+        labels: [{ name: 'gate:architecture' }, { name: 'version:v1' }],
+        merged_at: provenance.approved_at,
+      };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}/files') {
+      return p.pull_number === 42
+        ? [{ filename: 'apps/backend/template.lock', status: 'added', additions: 50, deletions: 0 }]
+        : [{ filename: 'projects.yaml', status: 'modified', sha: 'projects-blob' }];
+    }
+    if (route === 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews') {
+      return [
+        {
+          id: 1,
+          user: { login: 'alice' },
+          state: 'APPROVED',
+          commit_id: GATE_HEAD,
+          author_association: 'MEMBER',
+          submitted_at: provenance.approved_at,
+        },
+      ];
+    }
+    if (route === 'GET /repos/{owner}/{repo}/branches/{branch}') {
+      return { name: 'main', protected: true, commit: { sha: GATE_MERGE } };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/collaborators/{username}/permission') {
+      return { permission: 'write', role_name: 'write' };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}') {
+      return { sha: SCAFFOLD_HEAD, tree: { sha: 'scaffold-tree' } };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/git/trees/{tree_sha}') {
+      return { tree: treeEntries };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/git/blobs/{blob_sha}') {
+      const bytes = blobs.get(String(p.blob_sha));
+      if (!bytes) throw new Error(`unknown blob ${String(p.blob_sha)}`);
+      return { content: Buffer.from(bytes).toString('base64'), encoding: 'base64' };
+    }
+    if (route === 'GET /repos/{owner}/{repo}/contents/{path}') {
+      const path = String(p.path);
+      const ref = String(p.ref);
+      if (path === 'projects.yaml') {
+        return {
+          sha: 'projects-blob',
+          content: Buffer.from(projectsYaml).toString('base64'),
+          encoding: 'base64',
+        };
+      }
+      if (path === '.github/CODEOWNERS' && ref === GATE_BASE) {
+        return {
+          sha: 'codeowners-blob',
+          content: Buffer.from('projects.yaml @alice\n').toString('base64'),
+          encoding: 'base64',
+        };
+      }
+      if (path === 'apps/backend/template.lock' && ref === SCAFFOLD_HEAD) {
+        return { content: Buffer.from(lockYaml).toString('base64'), encoding: 'base64' };
+      }
+      if (path === 'templates/spring-boot.manifest.json' && ref === TEMPLATE_COMMIT) {
+        return { content: manifestBytes.toString('base64'), encoding: 'base64' };
+      }
+      const manifestFile = manifest.files.find((file) => `${manifest.path}/${file.path}` === path);
+      if (manifestFile && ref === TEMPLATE_COMMIT) {
+        const entry = entries.find((item) => item.path === manifestFile.path)!;
+        return { content: Buffer.from(entry.content).toString('base64'), encoding: 'base64' };
+      }
+    }
+    throw new Error(`unexpected request ${route} ${JSON.stringify(p)}`);
   });
 
-  it('Layer 1 fails when template_ref changed on main', async () => {
-    const changedProjectsYaml = `schema_version: 1
-product: demo
-repository_mode: monorepo
-components:
-  - id: backend
-    path: apps/backend
-    template: spring-boot
-    template_ref: ${'z'.repeat(40)}
-    owner: backend-team
-    ci: java
-`;
-    const routes = baseRoutes();
-    routes.set('GET /repos/{owner}/{repo}/contents/{path}', (p: { path: string; ref: string }) => {
-      if (p.path === 'projects.yaml' && p.ref === 'main') {
-        return {
-          content: Buffer.from(changedProjectsYaml, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      if (p.path === 'apps/backend/template.lock' && p.ref === prHeadSha) {
-        return {
-          content: Buffer.from(templateLock, 'utf8').toString('base64'),
-          encoding: 'base64',
-        };
-      }
-      throw new Error(`unexpected contents request: ${JSON.stringify(p)}`);
-    });
+  return {
+    octokit,
+    input: {
+      octokit,
+      repo: TARGET,
+      pr: 42,
+      ...(options.trustedWorkflow === false
+        ? {}
+        : {
+            trustedWorkflow: {
+              repository: `${PLATFORM.owner}/${PLATFORM.repo}`,
+              commit: WORKFLOW_COMMIT,
+            },
+          }),
+    },
+  };
+}
 
-    const octokit = createFakeOctokit(routes);
-    const result = await checkPrHygiene({ octokit, repo, pr: prNumber });
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.violations.some((v) => v.includes('template_ref changed'))).toBe(true);
-    }
+describe('Scaffold PR hygiene (D24/D26)', () => {
+  it('accepts an untampered independently re-rendered Scaffold PR', async () => {
+    const fixture = await createFixture();
+    await expect(checkPrHygiene(fixture.input)).resolves.toEqual({ ok: true });
   });
 
-  it('does not trigger on PR without new template.lock files', async () => {
-    const routes = new Map<string, unknown>();
-    routes.set('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-      head: { sha: prHeadSha },
-      base: { sha: prBaseSha, ref: 'main' },
-      labels: [],
-      body: null,
-      user: { login: 'author' },
+  it('rejects coordinated application and lock digest tampering', async () => {
+    const fixture = await createFixture({
+      mutateLock(lock) {
+        const file = lock.files.find((entry) => entry.path === 'build.gradle.kts')!;
+        (file as { output_sha256: string }).output_sha256 = sha256Hex(
+          new TextEncoder().encode('tampered'),
+        );
+      },
+      mutateFiles(files) {
+        files.set('apps/backend/build.gradle.kts', new TextEncoder().encode('tampered'));
+      },
     });
-    routes.set('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', [
-      { filename: 'README.md', status: 'modified', additions: 1, deletions: 1 },
-    ]);
+    const result = await checkPrHygiene(fixture.input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.violations.join('\n')).toContain('subtree verification failed');
+  });
 
-    const octokit = createFakeOctokit(routes);
-    const result = await checkPrHygiene({ octokit, repo, pr: prNumber });
+  it('rejects an owner copied from the untrusted lock instead of current main', async () => {
+    const fixture = await createFixture({
+      mutateLock(lock) {
+        lock.component.owner = 'attacker-team';
+      },
+    });
+    const result = await checkPrHygiene(fixture.input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.violations.join('\n')).toContain('component.owner differs');
+  });
 
-    expect(result.ok).toBe(true);
+  it('rejects a lock whose generator is not the required-workflow commit', async () => {
+    const fixture = await createFixture({
+      mutateLock(lock) {
+        lock.generator.resolved_commit = '9'.repeat(40);
+      },
+    });
+    const result = await checkPrHygiene(fixture.input);
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(result.violations.join('\n')).toContain('generator.resolved_commit differs');
+  });
+
+  it('fails closed without a trusted workflow identity', async () => {
+    const fixture = await createFixture({ trustedWorkflow: false });
+    const result = await checkPrHygiene(fixture.input);
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(result.violations.join('\n')).toContain('trusted required-workflow identity');
+  });
+
+  it('fails closed when the running generator differs from the managed workflow pin', async () => {
+    const fixture = await createFixture({ workflowPin: '8'.repeat(40) });
+    const result = await checkPrHygiene(fixture.input);
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(result.violations.join('\n')).toContain('does not match required workflow');
   });
 });

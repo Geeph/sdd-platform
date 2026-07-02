@@ -23,6 +23,18 @@
  * and pass.
  */
 
+import type { CodeownersEntry, GitReader, OctokitLike } from '@sdd/provenance';
+import { verifyGateApproval } from '@sdd/provenance';
+import type { SDDProjects } from '@sdd/schemas';
+import { validateProjectsDocument } from '@sdd/schemas';
+import { createReadonlyGitHubPort } from './github-read.js';
+import { sha256Hex } from './resolve.js';
+import { renderComponent } from './scaffold/render.js';
+import { verifyComponentSubtree } from './scaffold/subtree.js';
+import type { ComponentLock, ScaffoldComponent } from './scaffold/types.js';
+import { TEMPLATE_NAMES } from './types.js';
+import { verifyRequiredWorkflowPin } from './workflow-pin.js';
+
 // ---- Octokit-like interface for hygiene checks -----------------------------
 
 export interface HygieneOctokit {
@@ -33,6 +45,8 @@ export interface HygieneInput {
   octokit: HygieneOctokit;
   repo: { owner: string; repo: string };
   pr: number;
+  /** Trusted identity of the required workflow currently executing this code. */
+  trustedWorkflow?: { repository: string; commit: string };
 }
 
 export type HygieneResult = { ok: true } | { ok: false; violations: string[] };
@@ -115,7 +129,7 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       );
       if (newLockFiles.length > 0) {
         // Run Scaffold PR hygiene checks (D24 §3.6).
-        return await checkScaffoldPrHygiene(input, changedFiles, newLockFiles);
+        return await checkScaffoldPrHygiene(input, newLockFiles);
       }
       return { ok: true };
     }
@@ -401,6 +415,404 @@ function parseGateMarker(body: string): GateMarker | null {
   return marker;
 }
 
+/** D24/D26 Scaffold PR hygiene using only independently trusted inputs. */
+async function checkScaffoldPrHygiene(
+  input: HygieneInput,
+  newLockFiles: ChangedFile[],
+): Promise<HygieneResult> {
+  const violations: string[] = [];
+  try {
+    const trusted = parseTrustedWorkflow(input.trustedWorkflow);
+    await verifyRequiredWorkflowPin({
+      octokit: input.octokit,
+      target: input.repo,
+      platform: trusted.platform,
+      generatorCommit: trusted.commit,
+    });
+
+    const mainResp = (await input.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+      owner: input.repo.owner,
+      repo: input.repo.repo,
+      path: 'projects.yaml',
+      ref: 'main',
+      mediaType: { format: 'raw' },
+    })) as { content?: string; encoding?: string };
+    const mainContent = decodeGitHubContent(mainResp, 'projects.yaml on main').toString('utf8');
+    const { parse: parseYaml } = await import('yaml');
+    const parsedProjects = parseYaml(mainContent) as unknown;
+    const projectsValidation = await validateProjectsDocument(parsedProjects);
+    if (!projectsValidation.ok) {
+      return {
+        ok: false,
+        violations: projectsValidation.errors.map(
+          (error) => `projects.yaml on main${error.path}: ${error.message}`,
+        ),
+      };
+    }
+    const projects = parsedProjects as SDDProjects;
+    const mainComponents = new Map(
+      projects.components.map((component) => [component.path, component]),
+    );
+
+    const scaffoldPr = (await input.octokit.request(
+      'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+      { owner: input.repo.owner, repo: input.repo.repo, pull_number: input.pr },
+    )) as { head?: { sha?: string } };
+    const prHeadSha = scaffoldPr.head?.sha;
+    if (!prHeadSha || !/^[0-9a-f]{40}$/i.test(prHeadSha)) {
+      throw new Error('Scaffold PR head is missing a full commit SHA');
+    }
+    const headCommit = (await input.octokit.request(
+      'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+      { owner: input.repo.owner, repo: input.repo.repo, commit_sha: prHeadSha },
+    )) as { tree?: { sha?: string } };
+    if (!headCommit.tree?.sha) throw new Error('Scaffold PR head commit has no tree SHA');
+
+    const platformReader = createReadonlyGitHubPort(input.octokit);
+    const provenanceOctokit = createProvenanceOctokit(input.octokit);
+    const remoteGit = createRemoteGitReader(input.octokit, input.repo);
+    const scaffoldReader = buildOctokitScaffoldReader(input);
+    const provenanceCache = new Map<string, Awaited<ReturnType<typeof verifyGateApproval>>>();
+
+    for (const lockFile of newLockFiles) {
+      const componentPath = lockFile.filename.replace(/\/template\.lock$/, '');
+      const lockResp = (await input.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+        owner: input.repo.owner,
+        repo: input.repo.repo,
+        path: lockFile.filename,
+        ref: prHeadSha,
+        mediaType: { format: 'raw' },
+      })) as { content?: string; encoding?: string };
+
+      let lock: Partial<ComponentLock>;
+      try {
+        lock = parseYaml(
+          decodeGitHubContent(lockResp, `${lockFile.filename} at PR head`).toString('utf8'),
+        ) as Partial<ComponentLock>;
+      } catch (error) {
+        violations.push(`cannot parse ${lockFile.filename}: ${(error as Error).message}`);
+        continue;
+      }
+
+      const mainComponent = mainComponents.get(componentPath);
+      if (!mainComponent) {
+        violations.push(`Scaffold PR stale: '${componentPath}' no longer in main projects.yaml`);
+        continue;
+      }
+      const beforeLayerOne = violations.length;
+      compareLockField(
+        violations,
+        componentPath,
+        'component.id',
+        lock.component?.id,
+        mainComponent.id,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'component.path',
+        lock.component?.path,
+        mainComponent.path,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'component.owner',
+        lock.component?.owner,
+        mainComponent.owner,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'template.name',
+        lock.template?.name,
+        mainComponent.template,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'source.resolved_commit',
+        lock.source?.resolved_commit,
+        mainComponent.template_ref,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'source.repository',
+        lock.source?.repository,
+        trusted.repository,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'generator.resolved_commit',
+        lock.generator?.resolved_commit,
+        trusted.commit,
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'generator.package',
+        lock.generator?.package,
+        '@sdd/factory',
+      );
+      compareLockField(
+        violations,
+        componentPath,
+        'generator.version',
+        lock.generator?.version,
+        '0.1.0',
+      );
+      if (violations.length !== beforeLayerOne) continue;
+
+      if (!TEMPLATE_NAMES.includes(mainComponent.template as (typeof TEMPLATE_NAMES)[number])) {
+        violations.push(`Scaffold PR integrity: invalid template name '${mainComponent.template}'`);
+        continue;
+      }
+      const candidatePr = lock.approved_by?.pr;
+      const candidateVersion = lock.approved_by?.version;
+      if (!candidatePr || !candidateVersion) {
+        violations.push(
+          `Scaffold PR integrity: '${lockFile.filename}' lacks approved_by.pr or approved_by.version`,
+        );
+        continue;
+      }
+
+      const versionCheck = await readUniqueArchitectureVersion(
+        input.octokit,
+        input.repo,
+        candidatePr,
+      );
+      if (!versionCheck.ok || versionCheck.version !== candidateVersion) {
+        violations.push(
+          `Scaffold PR integrity: Architecture Gate PR #${candidatePr} version is not uniquely '${candidateVersion}'`,
+        );
+        continue;
+      }
+
+      const provenanceKey = `${candidatePr}:${candidateVersion}`;
+      let verified = provenanceCache.get(provenanceKey);
+      if (!verified) {
+        verified = await verifyGateApproval({
+          octokit: provenanceOctokit,
+          git: remoteGit,
+          repo: { owner: input.repo.owner, name: input.repo.repo },
+          gate: 'architecture',
+          version: candidateVersion,
+          approval: { pr: candidatePr },
+          artifactPath: 'projects.yaml',
+        });
+        provenanceCache.set(provenanceKey, verified);
+      }
+      if (!verified.ok) {
+        violations.push(
+          `Scaffold PR integrity: Architecture Gate PR #${candidatePr} failed re-verification — ${verified.reason}`,
+        );
+        continue;
+      }
+
+      try {
+        const tree = await platformReader.readTemplateTree(
+          trusted.platform,
+          mainComponent.template_ref,
+          `templates/${mainComponent.template}`,
+        );
+        const component = mainComponent as ScaffoldComponent;
+        const rendered = renderComponent({
+          product: projects.product,
+          repo: input.repo.repo,
+          platformRepo: trusted.repository,
+          component,
+          resolvedTemplate: {
+            componentId: component.id,
+            commit: component.template_ref,
+            manifest: tree.manifest,
+            tree: tree.entries,
+            sourceTreeSha256: tree.sourceTreeSha256,
+          },
+          generator: {
+            package: '@sdd/factory',
+            version: '0.1.0',
+            resolved_commit: trusted.commit,
+          },
+          version: candidateVersion,
+          provenance: verified.provenance,
+        });
+        const expectedFiles = rendered.files.map((file) => ({
+          path: file.path,
+          mode: file.mode,
+          output_sha256: file.output_sha256,
+        }));
+        expectedFiles.push({
+          path: 'template.lock',
+          mode: '100644',
+          output_sha256: sha256Hex(new TextEncoder().encode(rendered.lockYaml)),
+        });
+
+        const subtree = await verifyComponentSubtree({
+          componentPath,
+          expectedFiles,
+          targetTreeSha: headCommit.tree.sha,
+          reader: scaffoldReader,
+          repo: input.repo,
+        });
+        if (!subtree.ok) {
+          violations.push(
+            `Scaffold PR integrity: '${componentPath}' subtree verification failed — ${subtree.reason}`,
+          );
+        }
+      } catch (error) {
+        violations.push(
+          `Scaffold PR integrity: trusted re-render for '${componentPath}' failed — ${(error as Error).message}`,
+        );
+      }
+    }
+  } catch (error) {
+    violations.push(`Scaffold PR hygiene failed: ${(error as Error).message}`);
+  }
+  return violations.length === 0 ? { ok: true } : { ok: false, violations };
+}
+
+function parseTrustedWorkflow(trustedWorkflow: HygieneInput['trustedWorkflow']): {
+  repository: string;
+  platform: { owner: string; repo: string };
+  commit: string;
+} {
+  if (!trustedWorkflow || !/^[0-9a-f]{40}$/i.test(trustedWorkflow.commit)) {
+    throw new Error('trusted required-workflow identity is missing or invalid');
+  }
+  const match = trustedWorkflow.repository.match(/^([^/]+)\/([^/]+)$/);
+  if (!match) throw new Error('trusted required-workflow repository is invalid');
+  return {
+    repository: trustedWorkflow.repository,
+    platform: { owner: match[1]!, repo: match[2]! },
+    commit: trustedWorkflow.commit.toLowerCase(),
+  };
+}
+
+function decodeGitHubContent(
+  response: { content?: string; encoding?: string },
+  description: string,
+): Buffer {
+  if (response.content === undefined) throw new Error(`${description} was not found`);
+  return response.encoding === 'base64'
+    ? Buffer.from(response.content, 'base64')
+    : Buffer.from(response.content, 'utf8');
+}
+
+function compareLockField(
+  violations: string[],
+  componentPath: string,
+  field: string,
+  actual: unknown,
+  expected: unknown,
+): void {
+  if (actual !== expected) {
+    violations.push(
+      `Scaffold PR stale or invalid: '${componentPath}' ${field} differs (lock=${String(actual)}, trusted=${String(expected)})`,
+    );
+  }
+}
+
+async function readUniqueArchitectureVersion(
+  octokit: HygieneOctokit,
+  repo: HygieneInput['repo'],
+  pr: number,
+): Promise<{ ok: true; version: string } | { ok: false }> {
+  const candidate = (await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+    owner: repo.owner,
+    repo: repo.repo,
+    pull_number: pr,
+  })) as { labels?: Array<{ name?: string }> };
+  const versions = (candidate.labels ?? [])
+    .map((label) => label.name ?? '')
+    .filter((label) => label.startsWith('version:'));
+  const versionLabel = versions.length === 1 ? versions[0] : undefined;
+  if (!versionLabel) return { ok: false };
+  return { ok: true, version: versionLabel.slice('version:'.length) };
+}
+
+function createRemoteGitReader(octokit: HygieneOctokit, repo: HygieneInput['repo']): GitReader {
+  const contentAt = async (
+    ref: string,
+    path: string,
+  ): Promise<{ sha: string; content: Buffer }> => {
+    const response = (await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+      owner: repo.owner,
+      repo: repo.repo,
+      path,
+      ref,
+    })) as { sha?: string; content?: string; encoding?: string };
+    if (!response.sha) throw new Error(`GitHub content '${path}' at '${ref}' has no blob SHA`);
+    return { sha: response.sha, content: decodeGitHubContent(response, `${path} at ${ref}`) };
+  };
+  return {
+    async blobAt(commit, path) {
+      return (await contentAt(commit, path)).sha;
+    },
+    async blobWorktree(path) {
+      return (await contentAt('main', path)).sha;
+    },
+    async isClean() {
+      return true;
+    },
+    async codeownersAt(commit) {
+      try {
+        const content = (await contentAt(commit, '.github/CODEOWNERS')).content.toString('utf8');
+        return parseCodeownersForProvenance(content);
+      } catch (error) {
+        if ((error as { status?: number }).status === 404) return [];
+        throw error;
+      }
+    },
+  };
+}
+
+function parseCodeownersForProvenance(content: string): CodeownersEntry[] {
+  const entries: CodeownersEntry[] = [];
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const [pattern, ...owners] = line.split(/\s+/);
+    if (pattern && owners.length > 0) entries.push({ pattern, owners });
+  }
+  return entries;
+}
+
+function createProvenanceOctokit(octokit: HygieneOctokit): OctokitLike {
+  const wrapped = async <T>(
+    route: string,
+    parameters: Record<string, unknown>,
+  ): Promise<{ data: T }> => ({
+    data: (await octokit.request(route, parameters)) as T,
+  });
+  return {
+    rest: {
+      pulls: {
+        get: (p) => wrapped('GET /repos/{owner}/{repo}/pulls/{pull_number}', p),
+        listReviews: (p) => wrapped('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', p),
+        listFiles: (p) => wrapped('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', p),
+      },
+      repos: {
+        getBranch: (p) => wrapped('GET /repos/{owner}/{repo}/branches/{branch}', p),
+        listPullRequestsAssociatedWithCommit: (p) =>
+          wrapped('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', p),
+        getCollaboratorPermissionLevel: (p) =>
+          wrapped('GET /repos/{owner}/{repo}/collaborators/{username}/permission', p),
+      },
+      checks: {
+        listForRef: (p) => wrapped('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', p),
+      },
+      teams: {
+        getByName: (p) => wrapped('GET /orgs/{org}/teams/{team_slug}', p),
+        checkPermissionsForRepoInOrg: (p) =>
+          wrapped('GET /orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}', p),
+        listMembersInOrg: (p) => wrapped('GET /orgs/{org}/teams/{team_slug}/members', p),
+      },
+    },
+  };
+}
+
 /**
  * Scaffold PR hygiene (D24).
  *
@@ -420,9 +832,9 @@ function parseGateMarker(body: string): GateMarker | null {
  *
  * Both layers must pass for Scaffold PR hygiene to be ok.
  */
-async function checkScaffoldPrHygiene(
+async function _checkScaffoldPrHygieneLegacy(
   input: HygieneInput,
-  changedFiles: ChangedFile[],
+  _changedFiles: ChangedFile[],
   newLockFiles: ChangedFile[],
 ): Promise<HygieneResult> {
   const violations: string[] = [];

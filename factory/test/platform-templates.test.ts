@@ -5,9 +5,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { TemplateTreeEntry } from '../src/index.js';
@@ -253,7 +251,7 @@ describe('Template toolchain smoke test', () => {
     },
   };
 
-  it('web: rendered template passes tsc --noEmit', async () => {
+  it('web: rendered template passes typecheck, lint, and tests', async () => {
     const manifest = await loadManifest('web');
     const entries: TemplateTreeEntry[] = [];
     for (const mf of manifest.files) {
@@ -301,9 +299,24 @@ describe('Template toolchain smoke test', () => {
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 60_000,
       });
+      execFileSync('pnpm', ['lint'], {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+      });
+      execFileSync('pnpm', ['test'], {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+      });
     } catch (err) {
-      const msg = (err as { stderr?: string; message?: string }).stderr ?? (err as Error).message;
+      const failure = err as { stdout?: string; stderr?: string; message?: string };
+      const msg = [failure.message, failure.stdout, failure.stderr].filter(Boolean).join('\n');
       throw new Error(`web template toolchain check failed: ${msg}`);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
     }
     // Success proves the template is structurally sound.
   }, 180_000);

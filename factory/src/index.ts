@@ -137,3 +137,9 @@ export type {
   TemplateTreeEntry,
 } from './types.js';
 export { TEMPLATE_NAMES } from './types.js';
+export type {
+  VerifiedWorkflowPin,
+  VerifyRequiredWorkflowPinInput,
+  WorkflowPinOctokit,
+} from './workflow-pin.js';
+export { verifyRequiredWorkflowPin } from './workflow-pin.js';

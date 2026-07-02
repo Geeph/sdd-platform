@@ -58,10 +58,12 @@ export default class GateHygiene extends Command {
     const octokit = createMinimalOctokit(token);
 
     try {
+      const trustedWorkflow = readTrustedWorkflowIdentity();
       const result = await checkPrHygiene({
         octokit,
         repo: { owner, repo },
         pr: flags.pr,
+        ...(trustedWorkflow ? { trustedWorkflow } : {}),
       });
 
       if (result.ok) {
@@ -80,6 +82,15 @@ export default class GateHygiene extends Command {
       this.error(`hygiene check failed: ${msg}`, { exit: 3 });
     }
   }
+}
+
+function readTrustedWorkflowIdentity(): { repository: string; commit: string } | undefined {
+  const workflowRef = process.env.GITHUB_WORKFLOW_REF;
+  const workflowSha = process.env.GITHUB_WORKFLOW_SHA;
+  if (!workflowRef || !workflowSha) return undefined;
+  const match = workflowRef.match(/^([^/]+\/[^/]+)\/\.github\/workflows\/pr-hygiene\.yml@.+$/);
+  if (!match?.[1] || !/^[0-9a-f]{40}$/i.test(workflowSha)) return undefined;
+  return { repository: match[1], commit: workflowSha.toLowerCase() };
 }
 
 /**

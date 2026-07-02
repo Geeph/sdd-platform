@@ -16,7 +16,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Args, Command, Flags } from '@oclif/core';
+import { Command, Flags } from '@oclif/core';
 import type {
   RepoRef,
   ResolvedTemplate,
@@ -25,8 +25,6 @@ import type {
   ScaffoldProductObservation,
   ScaffoldProjects,
   ScaffoldReadPort,
-  TemplateManifest,
-  TemplateName,
 } from '@sdd/factory';
 import {
   compileScaffoldPlan,
@@ -35,12 +33,11 @@ import {
   sha256Hex,
   TEMPLATE_NAMES,
   upsertScaffoldPull,
+  verifyRequiredWorkflowPin,
 } from '@sdd/factory';
-import type { GitReader } from '@sdd/provenance';
 import { verifyGateApproval } from '@sdd/provenance';
 import { validateProjectsDocument } from '@sdd/schemas';
 import { parse as parseYaml } from 'yaml';
-import type { GitHubRequestClient } from '../../github-client.js';
 import { createGitHubRequestClient } from '../../github-client.js';
 
 /**
@@ -509,6 +506,26 @@ export default class ProductScaffold extends Command {
       const { createLocalGitReader } = await import('../../git-reader.js');
       const gitReader = createLocalGitReader({ repoRoot });
 
+      const generatorCommit = getPlatformHeadCommit();
+      if (!generatorCommit || !/^[0-9a-f]{40}$/i.test(generatorCommit)) {
+        this.error(
+          'Generator pin check failed: this build does not contain a full platform commit SHA.',
+          { exit: 7 },
+        );
+        return;
+      }
+      try {
+        await verifyRequiredWorkflowPin({
+          octokit: rawClient,
+          target: { owner: remoteOwner, repo: remoteRepo },
+          platform: { owner: platformParts[0]!, repo: platformParts[1]! },
+          generatorCommit,
+        });
+      } catch (error) {
+        this.error(`Generator pin check failed: ${(error as Error).message}`, { exit: 7 });
+        return;
+      }
+
       // Verify the ApprovalRef is correctly formed.
       let approvalRef: { pr: number } | { mergeCommitSha: string };
       if (flags['architecture-pr']) {
@@ -538,13 +555,30 @@ export default class ProductScaffold extends Command {
         return;
       }
 
+      const architecturePr = (await rawClient.request(
+        'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+        {
+          owner: remoteOwner,
+          repo: remoteRepo,
+          pull_number: verifyResult.provenance.pr,
+        },
+      )) as { labels?: Array<{ name?: string }> };
+      const versionLabels = (architecturePr.labels ?? [])
+        .map((label) => label.name ?? '')
+        .filter((label) => label.startsWith('version:'));
+      const expectedVersion = `version:${flags['architecture-version'] as string}`;
+      if (versionLabels.length !== 1 || versionLabels[0] !== expectedVersion) {
+        this.error(
+          `Authorization failed: Architecture Gate PR must have exactly one '${expectedVersion}' label.`,
+          { exit: 7 },
+        );
+        return;
+      }
+
       authorization.verified = true;
       authorization.reason = null;
 
       this.log('Authorization verified. Resolving templates from platform repo...');
-
-      // Build API-backed reader for the platform repo.
-      const platformRepoRef: RepoRef = { owner: platformParts[0]!, repo: platformParts[1]! };
 
       // Read main tree for existing path check (D18 main freshness).
       const mainResp = (await rawClient.request('GET /repos/{owner}/{repo}/git/ref/{ref}', {
@@ -715,7 +749,7 @@ export default class ProductScaffold extends Command {
         generator: {
           package: '@sdd/factory',
           version: '0.1.0',
-          ...(getPlatformHeadCommit() ? { resolved_commit: getPlatformHeadCommit()! } : {}),
+          resolved_commit: generatorCommit,
         },
       });
 

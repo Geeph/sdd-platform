@@ -1,7 +1,7 @@
 {
   "template": "web",
   "path": "templates/web",
-  "tree_sha256": "sha256:6d222af69248e08230a29764feb14c89483800da8e03259dabe7e2e6e53531a2",
+  "tree_sha256": "sha256:f529abceb36175a97d7915e551741994d80f1ee24f116c6d8a62bf0f16bba57d",
   "files": [
     {
       "path": ".gitignore",
@@ -19,7 +19,7 @@
       "path": "biome.json",
       "mode": "100644",
       "render": false,
-      "sha256": "sha256:5931923cb9e613cdc9beb0968301d7328f24a4937e061e093b171302e84b67bb"
+      "sha256": "sha256:75efa3256a4bc2ad51b39a33a34cd5e1fa4ebc9a80e18249f43d52a182cf84c0"
     },
     {
       "path": "index.html",
@@ -38,6 +38,12 @@
       "mode": "100644",
       "render": false,
       "sha256": "sha256:7683d75eb923139127057ad2781f72b47cca4e7c1bab1dfad28a1c82c0dfce26"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "mode": "100644",
+      "render": false,
+      "sha256": "sha256:d67ba335a28f38c47f593ad063e8979c63b70eebb13550eaf29723853d29ff4d"
     },
     {
       "path": "README.md",
@@ -79,7 +85,7 @@
       "path": "vite.config.ts",
       "mode": "100644",
       "render": false,
-      "sha256": "sha256:0709465427668ae85ef999f63762d7a06fd92962363fe8cc142ad656d3548115"
+      "sha256": "sha256:efd5952d59c7b239a390fb094d525430ccb9a1b4f4f229b5e891bac32315f642"
     },
     {
       "path": "vitest.config.ts",
