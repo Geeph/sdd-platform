@@ -121,6 +121,11 @@
 - **`sdd impact` 本里程碑只交付平台影响矩阵**：变更的 requirement/screen/operationId +
   受影响平台布尔（足够喂 detect / §9）。"受影响 Issues / 建议的 Change Issues"依赖
   stable task ID 与 marker，**移到 M5**。
+- **M4 阶段没有 task/Issue 级关联图（M5 才建立），`specs/**` 的平台归因因此是保守的**：
+  对 `specs/**`/`design/**`/`architecture.md`/`plan.md` 里任何无法精确归因到具体平台的
+  实质性变更，`sdd impact` 判定为影响全部已声明（且已 scaffold）的平台，不追求逐条精确
+  narrowing——§9"不默认运行所有重型 CI"在 M4 阶段的可执行含义是"零内容差异才不跑，任何
+  实质编辑保守全跑"，精确到平台的收窄是 M5 建立 task 图之后的能力，不是本里程碑的范围。
 - 依据：§9、§10.1（部分）。
 - 验收：12.4、12.5、12.7、12.8。
 
