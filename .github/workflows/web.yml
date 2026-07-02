@@ -1,0 +1,63 @@
+# Web platform reusable workflow (M4, §1).
+#
+# Called by ci-gate.yml for each web component. Checks out the product
+# repo at the head SHA and runs the web command contract from M3.
+#
+# Tool versions locked to M3: Node 24 LTS, pnpm via corepack.
+
+on:
+  workflow_call:
+    inputs:
+      product_repo:
+        description: 'Product repository (owner/name)'
+        type: string
+        required: true
+      head_sha:
+        description: 'PR head commit SHA'
+        type: string
+        required: true
+      paths:
+        description: 'JSON array of component paths to build'
+        type: string
+        required: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        path: ${{ fromJSON(inputs.paths) }}
+      fail-fast: false
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - name: checkout product repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.product_repo }}
+          ref: ${{ inputs.head_sha }}
+          # D24: default GITHUB_TOKEN (前提: 隔离环境 spike 验证通过)
+
+      - name: setup node (D23)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'   # M3: Node 24 LTS
+
+      - name: enable corepack (pnpm)
+        run: corepack enable
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: lint (biome check)
+        run: pnpm biome check .
+
+      - name: typecheck (tsc --noEmit)
+        run: pnpm tsc --noEmit
+
+      - name: test (vitest run)
+        run: pnpm vitest run
+
+      - name: build (vite build)
+        run: pnpm vite build

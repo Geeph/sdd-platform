@@ -87,6 +87,7 @@ function basePr(overrides: Record<string, unknown> = {}): Record<string, unknown
     labels: [{ name: 'gate:spec' }],
     body: gateMarkerBody({ gate: 'spec', version: 'v1' }),
     user: { login: 'author' },
+    changed_files: 1,
     ...overrides,
   };
 }
@@ -108,6 +109,8 @@ function okScenario(overrides: {
 }): FakeScenario {
   const pr = overrides.pr ?? basePr();
   const files = overrides.files ?? ['specs/v1/spec.md'];
+  // Ensure changed_files matches the number of files in the mock (D22).
+  (pr as Record<string, unknown>).changed_files = files.length;
   const codeownersBase =
     overrides.codeownersBase ??
     `*               @acme/platform-admins\n/specs/         @acme/product-team\n/projects.yaml  @acme/product-team\n`;

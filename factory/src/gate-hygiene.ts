@@ -27,6 +27,8 @@ import type { CodeownersEntry, GitReader, OctokitLike } from '@sdd/provenance';
 import { verifyGateApproval } from '@sdd/provenance';
 import type { SDDProjects } from '@sdd/schemas';
 import { validateProjectsDocument } from '@sdd/schemas';
+import type { ChangedFileEntry } from './github-minimal-client.js';
+import { fetchBlobAtRef, fetchChangedFiles } from './github-minimal-client.js';
 import { createReadonlyGitHubPort } from './github-read.js';
 import { sha256Hex } from './resolve.js';
 import { renderComponent } from './scaffold/render.js';
@@ -108,6 +110,7 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
       labels: Array<{ name: string }>;
       body: string | null;
       user: { login: string };
+      changed_files: number;
     };
 
     const headSha = pr.head.sha;
@@ -116,9 +119,14 @@ export async function checkPrHygiene(input: HygieneInput): Promise<HygieneResult
     // Extract gate labels.
     const gateLabels = pr.labels.map((l) => l.name).filter((name) => GATE_LABEL_RE.test(name));
 
-    // Fetch changed files (full pagination) — needed for both Gate and
-    // Scaffold PR detection.
-    const changedFiles = await fetchAllChangedFiles(input.octokit, input.repo, input.pr);
+    // Fetch changed files (full pagination, D22 count-verified) — needed for
+    // both Gate and Scaffold PR detection.
+    const changedFiles = await fetchAllChangedFilesSafe(
+      input.octokit,
+      input.repo,
+      input.pr,
+      pr.changed_files,
+    );
 
     // Non-Gate PR: check if this is a Scaffold PR (D24), else generic only.
     if (gateLabels.length === 0) {
@@ -1252,53 +1260,31 @@ interface ChangedFile {
   deletions: number;
 }
 
-async function fetchAllChangedFiles(
+/**
+ * Fetch all changed files for a PR using the shared helper (D22).
+ * Requires the PR's `changed_files` count to verify completeness — the
+ * shared helper throws if the paginated count doesn't match, fixing the
+ * old silent-truncation-at-1000 bug.
+ */
+async function fetchAllChangedFilesSafe(
   octokit: HygieneOctokit,
   repo: { owner: string; repo: string },
   pr: number,
+  expectedCount: number,
 ): Promise<ChangedFile[]> {
-  const files: ChangedFile[] = [];
-  let page = 1;
-  const perPage = 100;
-
-  // Paginate through all changed files.
-  while (files.length < 1000) {
-    const resp = (await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
-      owner: repo.owner,
-      repo: repo.repo,
-      pull_number: pr,
-      page,
-      per_page: perPage,
-    })) as Array<{
-      filename: string;
-      status: string;
-      additions: number;
-      deletions: number;
-    }>;
-
-    if (!Array.isArray(resp) || resp.length === 0) break;
-
-    for (const f of resp) {
-      files.push({
-        filename: f.filename,
-        status: f.status,
-        additions: f.additions,
-        deletions: f.deletions,
-      });
-    }
-
-    if (resp.length < perPage) break;
-    page++;
-  }
-
-  return files;
+  const entries = await fetchChangedFiles(octokit, repo, pr, expectedCount);
+  return entries.map((e: ChangedFileEntry) => ({
+    filename: e.filename,
+    status: e.status,
+    additions: e.additions,
+    deletions: e.deletions,
+  }));
 }
 
 /**
  * Fetch blob content strictly — any failure (404, network, parse) throws.
- * Used for all security-relevant reads (artifacts, CODEOWNERS at base SHA).
- * Callers wrap the entire checkPrHygiene in a try/catch that converts throws
- * to hygiene violations (fail-closed §3.5.7).
+ * Wraps the shared `fetchBlobAtRef` (which returns null for 404) so that
+ * hygiene callers always get an error when a required file is missing.
  */
 async function fetchBlobContentStrict(
   octokit: HygieneOctokit,
@@ -1306,21 +1292,11 @@ async function fetchBlobContentStrict(
   path: string,
   ref: string,
 ): Promise<string> {
-  const resp = (await octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
-    owner: repo.owner,
-    repo: repo.repo,
-    path,
-    ref,
-    mediaType: { format: 'raw' },
-  })) as { content?: string; encoding?: string };
-
-  if (!resp.content) {
+  const content = await fetchBlobAtRef(octokit, repo, path, ref);
+  if (content === null) {
     throw new Error(`blob '${path}' at ${ref.slice(0, 8)} is empty or missing`);
   }
-  if (resp.encoding === 'base64') {
-    return Buffer.from(resp.content.replace(/\n/g, ''), 'base64').toString('utf8');
-  }
-  return resp.content;
+  return content;
 }
 
 /**

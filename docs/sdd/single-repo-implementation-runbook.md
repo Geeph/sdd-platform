@@ -667,6 +667,12 @@ specs/**             -> sdd impact 决定，不默认运行所有重型 CI
 .github/workflows/** -> 所有 CI 或 workflow validation
 ```
 
+`specs/**` 的收窄程度取决于当时是否已有 task/Issue 级关联图（§4.4/§6.7 描述的、由
+`sdd backlog compile` 建立的图，在 M5 才存在）。该图建立前，`sdd impact` 对无法精确
+归因到具体平台的实质性变更，保守地判定为影响全部已声明（且已生成骨架的）平台——
+"不默认运行所有重型 CI"在这个阶段的可执行含义是"零内容差异的改动才不触发"，不是
+"每条改动都能被精确路由到受影响的那一两个平台"；后者要等 task 图建立后才具备条件。
+
 ## 10. Spec / Design / Contract 变更
 
 ### 10.1 生成影响报告
